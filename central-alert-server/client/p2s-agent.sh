@@ -135,10 +135,14 @@ post_alerts() { # các dòng JSON làm tham số -> 0 nếu server nhận
 }
 
 # Đọc dòng mới hoàn chỉnh từ $ALERT_FILE; aware-rotation theo inode.
+# An toàn khi file đang được ghi cùng lúc (scan append từng dòng): chỉ tiêu thụ
+# đúng số byte đã stat, và nếu dòng cuối chưa có \n thì bỏ cả dòng đó lại cho chu kỳ sau.
 # Sets: NEW_LINES (array), NEW_POS, NEW_INO.
 read_new() {
   NEW_LINES=()
-  [[ -r $ALERT_FILE ]] && [[ -f $ALERT_FILE ]] || return 0
+  NEW_POS=${NEW_POS:-0}
+  NEW_INO=${NEW_INO:-0}
+  [[ -r $ALERT_FILE && -f $ALERT_FILE ]] || return 0
   local ino size pos=0 oino opos
   ino=$(stat -c %i -- "$ALERT_FILE" 2>/dev/null) || return 0
   size=$(stat -c %s -- "$ALERT_FILE" 2>/dev/null) || return 0
@@ -146,25 +150,31 @@ read_new() {
     { IFS=$'\t' read -r oino opos || true; } <"$STATE_DIR/offset"
     [[ ${oino:-} == "$ino" ]] && pos=${opos:-0}
   fi
+  (( pos <= size )) || pos=0
   (( size > pos )) || { NEW_POS=$pos; NEW_INO=$ino; return 0; }
-  local tmp complete
+
+  local tmp chunk_len
   tmp=$(mktemp)
-  tail -c +"$((pos + 1))" -- "$ALERT_FILE" >"$tmp" 2>/dev/null
-  if [[ $(tail -c1 -- "$tmp" 2>/dev/null | wc -l) -eq 0 ]]; then
-    complete=$(awk '{n += length($0) + 1} END {print n - 1}' "$tmp" 2>/dev/null)
-    [[ ${complete:-0} -gt 0 ]] || { rm -f -- "$tmp"; NEW_POS=$pos; NEW_INO=$ino; return 0; }
-    head -c "$complete" -- "$tmp" >"$tmp.2" && mv -f -- "$tmp.2" "$tmp"
-  else
-    complete=$size
+  chunk_len=$((size - pos))
+  # head -c giới hạn đúng số byte đã stat: phần append SAU lúc stat chờ chu kỳ sau
+  tail -c +"$((pos + 1))" -- "$ALERT_FILE" 2>/dev/null | head -c "$chunk_len" >"$tmp"
+  mapfile -t _lines <"$tmp"
+  rm -f -- "$tmp"
+  if (( chunk_len > 0 )) && [[ $(tail -c1 -- "$ALERT_FILE" 2>/dev/null | wc -l) -eq 0 ]]; then
+    # file chưa kết thúc bằng \n = dòng cuối đang ghi dở -> để lại cho chu kỳ sau
+    if ((${#_lines[@]})); then
+      local last LC_ALL=C
+      last=${_lines[-1]}
+      chunk_len=$((chunk_len - ${#last}))   # ${#last} đếm BYTE vì LC_ALL=C
+      unset '_lines[${#_lines[@]}-1]'
+    fi
   fi
   local line
-  while IFS= read -r line; do
+  for line in "${_lines[@]}"; do
     line=${line%$'\r'}
-    [[ $line == \{* && $line == *\} ]] || continue   # chỉ nhận dòng JSON
-    NEW_LINES+=("$line")
-  done <"$tmp"
-  rm -f -- "$tmp"
-  NEW_POS=$((pos + complete))
+    [[ $line == \{* && $line == *\} ]] && NEW_LINES+=("$line")
+  done
+  NEW_POS=$((pos + chunk_len))
   NEW_INO=$ino
 }
 
