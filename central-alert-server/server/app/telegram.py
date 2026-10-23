@@ -17,7 +17,9 @@ log = logging.getLogger("alert-server.telegram")
 
 TG_API = "https://api.telegram.org/bot{token}/{method}"
 MSG_LIMIT = 3900  # giới hạn Telegram 4096, chừa buffer an toàn
-CODE_RE = re.compile(r"\bSEC-(\d{4})\b", re.IGNORECASE)
+CODE_RE = re.compile(
+    r"\bSEC-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
+)
 
 _SEV_EMOJI = {
     "CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "🟡", "LOW": "ℹ️", "INFO": "ℹ️",
@@ -203,8 +205,9 @@ class PairingBot:
             await self.tg.send_message(
                 chat_id,
                 "🤖 <b>Central Alert Bot</b>\n"
-                "Gửi mã ghép nối (dạng <code>SEC-1234</code>) hiển thị trên terminal server dự án"
-                " để nhận cảnh báo về chat này.",
+                "Gửi mã ghép nối (dạng <code>SEC-&lt;UUID&gt;</code>, ví dụ "
+                "<code>SEC-3F2504E0-4F89-41D3-9A0C-0305E82C3301</code>) hiển thị trên"
+                " terminal server dự án để nhận cảnh báo về chat này.",
             )
             return
         code = f"SEC-{m.group(1)}"

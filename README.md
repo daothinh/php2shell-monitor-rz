@@ -21,7 +21,7 @@ Bộ giải pháp **phòng thủ** phát hiện và cảnh báo khai thác **CVE
 | Thư mục | Là gì | Tài liệu |
 |---|---|---|
 | **[`php2shell-monitor/`](php2shell-monitor/)** | Engine phát hiện chạy **trên server web**: đọc access log/FPM/kernel/auditd/webroot//proc, 3 tầng phát hiện (T1 pre-exploit → T2 đang khai thác → T3 đã thành công), xuất alert JSONL SIEM-ready. Pure Bash + awk, read-only, zero-dependency cài thêm. | [php2shell-monitor/README.md](php2shell-monitor/README.md) · [ARCHITECTURE.md](php2shell-monitor/ARCHITECTURE.md) |
-| **[`central-alert-server/`](central-alert-server/)** | Server trung tâm nhận alert từ mọi server dự án, **pairing tự động qua Telegram** (mã `SEC-1234` in trên terminal → user nhắn cho bot → xong), bắn cảnh báo tức thì. FastAPI + SQLite + bot polling; client agent bash chỉ cần `curl`. | [central-alert-server/README.md](central-alert-server/README.md) |
+| **[`central-alert-server/`](central-alert-server/)** | Server trung tâm nhận alert từ mọi server dự án, **pairing tự động qua Telegram** (mã `SEC-<UUID>` in trên terminal → user nhắn cho bot → xong), bắn cảnh báo tức thì. FastAPI + SQLite + bot polling; client agent bash chỉ cần `curl`. | [central-alert-server/README.md](central-alert-server/README.md) |
 
 ## Bắt đầu nhanh
 
@@ -46,7 +46,7 @@ docker compose up -d
 ```bash
 cd central-alert-server/client
 sudo ./p2s-agent.sh pair --name khach-hang-A --server https://alert.example.com
-# → in mã SEC-1234 → user nhắn mã cho bot → bot trả lời "Ghép nối thành công"
+# → in mã SEC-<UUID> → user copy mã nhắn cho bot → bot trả lời "Ghép nối thành công"
 sudo ./p2s-agent.sh test    # alert thử phải hiện trên Telegram
 sudo ./p2s-agent.sh run     # chạy thường trực (systemd unit kèm sẵn)
 ```

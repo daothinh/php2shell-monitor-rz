@@ -25,10 +25,10 @@ Nhiều server dự án của khách hàng chạy php2shell-monitor (phát hiệ
         |                                       |                                |
  1. agent pair --name X --server URL            |                                |
         |---- POST /register-pairing ---------->|                                |
-        |<------ mã "SEC-1234" (10 phút) -------|                                |
+        |<------ mã "SEC-3F2504E0-4F89-41D3-9A0C-0305E82C3301" (10 phút) ---|                                |
  2. In mã ra terminal                           |                                |
-    "Gửi mã SEC-1234 tới @Bot"                  |     3. User nhắn mã cho bot    |
-        |                                       |<------- "SEC-1234" ------------|
+    "Gửi mã SEC-<UUID> tới @Bot"                  |     3. User nhắn mã cho bot    |
+        |                                       |<------- "SEC-3F2504E0-4F89-41D3-9A0C-0305E82C3301" ---|
         |                                       |  bot lấy chat_id, sinh api_key |
         |                                       |------ "Ghép nối thành công" -->|
  4. agent poll /pairing-status                  |                                |
@@ -157,7 +157,7 @@ projects (
 )
 
 pairing_codes (
-  code PK,                              -- SEC-1234
+  code PK,                              -- SEC-<UUID> (uuid4)
   project_id → projects.id,
   api_key_plain,                        -- tiết lộ cho agent 1 cửa sổ 10' rồi bị dọn
   revealed_at, created_at, expires_at, used_at
@@ -188,8 +188,8 @@ curl -s -X POST https://alert.example.com/api/v1/register-pairing \
 ```
 
 ```json
-{"code":"SEC-9406","expires_in":600,"expires_at":"2026-10-23T14:58:42Z",
- "instruction":"Gửi mã SEC-9406 cho bot Telegram để hoàn tất ghép nối"}
+{"code":"SEC-3F2504E0-4F89-41D3-9A0C-0305E82C3301","expires_in":600,"expires_at":"2026-10-23T14:58:42Z",
+ "instruction":"Gửi mã SEC-3F2504E0-4F89-41D3-9A0C-0305E82C3301 cho bot Telegram để hoàn tất ghép nối"}
 ```
 
 - `project_name`: 1-64 ký tự (chữ/số/._-@, tiếng Việt, khoảng trắng).
@@ -197,14 +197,14 @@ curl -s -X POST https://alert.example.com/api/v1/register-pairing \
 
 ### 5.2. Bot nhận mã (tự động, người dùng thao tác)
 
-User mở Telegram nhắn đúng `SEC-9406` cho bot. Bot xác thực (tồn tại – chưa dùng – chưa hết hạn) rồi:
+User mở Telegram nhắn đúng mã `SEC-3F2504E0-4F89-41D3-9A0C-0305E82C3301` cho bot (copy từ terminal). Bot xác thực (tồn tại – chưa dùng – chưa hết hạn) rồi:
 
 - lưu `chat_id` vào project, sinh `api_key` (hash + bản plaintext chờ agent lấy),
 - trả lời user: **"✅ Ghép nối thành công! 📦 Dự án: khach-hang-A ..."**.
 
 Sai mã → bot trả lời lý do (không tồn tại / đã dùng / hết hạn). Sai 5 lần trong 10 phút → chat bị khoá 10 phút.
 
-### 5.3. `GET /api/v1/pairing-status?code=SEC-1234` — agent poll
+### 5.3. `GET /api/v1/pairing-status?code=SEC-3F2504E0-4F89-41D3-9A0C-0305E82C3301` — agent poll
 
 ```json
 {"status":"pending","project_name":"khach-hang-A"}
@@ -271,7 +271,7 @@ Chỉ bật khi có `ALERT_ADMIN_TOKEN`. Dùng khi cần link chat_id mà không
 ```bash
 curl -s -X POST https://alert.example.com/api/v1/admin/link \
   -H "X-Admin-Token: $ALERT_ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"code":"SEC-9406","chat_id":"555000111"}'
+  -d '{"code":"SEC-3F2504E0-4F89-41D3-9A0C-0305E82C3301","chat_id":"555000111"}'
 # → {"status":"linked","project_id":1,"project_name":"khach-hang-A"}
 ```
 
@@ -330,7 +330,7 @@ journalctl -u p2s-agent -f
 | Lớp | Cơ chế |
 |---|---|
 | Auth client | API key 256-bit (`p2s_` + 43 ký tự); server chỉ lưu **SHA-256**; tra cứu theo hash |
-| Pairing | Mã 4 chữ số, TTL 10 phút, **single-use**; bot giới hạn 5 lần sai/10 phút/chat (khoá 10 phút) |
+| Pairing | Mã **UUID** (`SEC-<uuid4>`, 122-bit entropy — không thể dò), TTL 10 phút, **single-use**; bot giới hạn 5 lần sai/10 phút/chat (khoá 10 phút) |
 | Rate-limit | 30 register/giờ/IP · 120 ingest/phút/api_key (sliding window) |
 | Vận chuyển | HTTPS bắt buộc khi ra internet (TLS tại reverse proxy); Telegram API luôn TLS |
 | Tiết lộ key | `api_key_plain` chỉ tồn tại ≤10 phút sau reveal, dọn tự động; DB lộ cũng không suy ra key |
@@ -384,7 +384,7 @@ docker compose logs -f alert-server
 
 **E2E local (bot fake-token):** full API flow (register → pending → link → linked + api_key → ingest 2 alert gộp 1 tin → sai key 401); agent thật: pair in mã + lưu conf 0600; run đọc 3 alert JSONL, offset chuẩn; **mất mạng → spool 2 alert → hồi phục → tự drain**; bot sai token không làm chết server (retry 10s).
 
-**E2E bot thật (@php2shell_alert_bot):** user nhắn `SEC-0538` → bot lưu chat_id + trả lời thành công → agent lấy api_key → `test-alert` và alert `P2S-011 CRITICAL` mô phỏng **deliver thật** (`delivered:1` cho cả hai, xác nhận trên Telegram).
+**E2E bot thật (@php2shell_alert_bot):** user nhắn mã UUID → bot lưu chat_id + trả lời thành công → agent lấy api_key → `test-alert` và alert `P2S-011 CRITICAL` mô phỏng **deliver thật** (`delivered:1` cho cả hai, xác nhận trên Telegram).
 
 ---
 

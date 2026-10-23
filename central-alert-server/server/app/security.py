@@ -1,8 +1,8 @@
 """Sinh khóa, mã pairing, rate-limit trong bộ nhớ."""
 import hashlib
-import random
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from typing import Optional
 import secrets
@@ -18,8 +18,8 @@ def gen_api_key() -> str:
 
 
 def gen_pairing_code() -> str:
-    """Mã dạng SEC-1234 (4 chữ số) theo spec."""
-    return f"SEC-{random.randint(0, 9999):04d}"
+    """Mã ghép nối dạng UUID (SEC-<uuid4>, chữ hoa): 122-bit entropy, không thể dò tăng dần."""
+    return f"SEC-{uuid.uuid4()!s}".upper()
 
 
 class RateLimiter:

@@ -21,12 +21,15 @@ _limiter = RateLimiter()
 _NAME_RE = re.compile(r"^[A-Za-z0-9À-ỹ._@\- ]{1,64}$")
 
 
+UUID_CODE_RE = r"^SEC-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+
+
 class RegisterBody(BaseModel):
     project_name: str = Field(min_length=1, max_length=64)
 
 
 class AdminLinkBody(BaseModel):
-    code: str = Field(pattern=r"^SEC-\d{4}$", to_upper=True)
+    code: str = Field(pattern=UUID_CODE_RE, to_upper=True)
     chat_id: str = Field(min_length=1, max_length=32)
 
 
@@ -72,8 +75,8 @@ def pairing_status(code: str, request: Request):
     """Client poll: pending | linked (kèm api_key, tiết lộ trong cửa sổ reveal)."""
     cfg = _cfg(request)
     code = code.strip().upper()
-    if not re.match(r"^SEC-\d{4}$", code):
-        raise HTTPException(422, "code phải có dạng SEC-1234")
+    if not re.match(UUID_CODE_RE, code):
+        raise HTTPException(422, "code phải có dạng SEC-<UUID>")
     st = db.pairing_status(cfg.database_path, code)
     if st is None:
         raise HTTPException(404, "Mã không tồn tại")

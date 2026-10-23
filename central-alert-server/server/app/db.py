@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 
 CREATE TABLE IF NOT EXISTS pairing_codes (
-    code TEXT PRIMARY KEY,                 -- SEC-1234
+    code TEXT PRIMARY KEY,                 -- SEC-<UUID>
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     api_key_plain TEXT,                    -- tiết lộ 1 lần cho client, dọn sau
     revealed_at TEXT,
