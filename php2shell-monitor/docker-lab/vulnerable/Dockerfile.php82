@@ -1,0 +1,111 @@
+# PHP2SHELL LAB - Vulnerable PHP 8.2 (pre-8.2.35)
+# CVE-2026-109618 / CVE-2026-109619 test target
+
+FROM php:8.2.34-fpm-bookworm
+
+LABEL maintainer="php2shell-monitor-lab"
+LABEL vulnerability="CVE-2026-109618,CVE-2026-109619"
+LABEL php_version="8.2.34"
+LABEL description="Vulnerable PHP-FPM for detection testing"
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    nginx \
+    procps \
+    net-tools \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure PHP-FPM for detailed logging
+RUN echo "error_log = /var/log/php-fpm/error.log" >> /usr/local/etc/php-fpm.conf \
+    && mkdir -p /var/log/php-fpm \
+    && chown www-data:www-data /var/log/php-fpm
+
+# Configure FPM pool with verbose settings
+RUN { \
+    echo "[www]"; \
+    echo "user = www-data"; \
+    echo "group = www-data"; \
+    echo "listen = 127.0.0.1:9000"; \
+    echo "pm = dynamic"; \
+    echo "pm.max_children = 5"; \
+    echo "pm.start_servers = 2"; \
+    echo "pm.min_spare_servers = 1"; \
+    echo "pm.max_spare_servers = 3"; \
+    echo ""; \
+    echo "; Detailed logging for attack detection"; \
+    echo "catch_workers_output = yes"; \
+    echo "php_admin_flag[log_errors] = on"; \
+    echo "php_admin_value[error_log] = /var/log/php-fpm/www-error.log"; \
+    echo "php_admin_value[memory_limit] = 128M"; \
+    echo ""; \
+    echo "; Session configuration for exploitation"; \
+    echo "php_value[session.save_path] = /var/lib/php/sessions"; \
+    echo "php_value[session.upload_progress.enabled] = 1"; \
+    echo "php_value[session.upload_progress.cleanup] = 1"; \
+    echo "php_value[session.upload_progress.name] = PHP_SESSION_UPLOAD_PROGRESS"; \
+} > /usr/local/etc/php-fpm.d/www.conf
+
+# Configure PHP for exploitation testing
+RUN { \
+    echo "file_uploads = On"; \
+    echo "upload_max_filesize = 20M"; \
+    echo "post_max_size = 20M"; \
+    echo "max_execution_time = 30"; \
+    echo "memory_limit = 128M"; \
+    echo "display_errors = Off"; \
+    echo "log_errors = On"; \
+    echo "error_reporting = E_ALL"; \
+    echo "session.save_handler = files"; \
+} > /usr/local/etc/php/conf.d/php2shell-lab.ini
+
+# Create session directory
+RUN mkdir -p /var/lib/php/sessions \
+    && chown -R www-data:www-data /var/lib/php/sessions \
+    && chmod 0700 /var/lib/php/sessions
+
+# Simple test application
+RUN mkdir -p /var/www/html && { \
+    echo '<?php'; \
+    echo 'phpinfo();'; \
+    echo '?>'; \
+} > /var/www/html/index.php
+
+# Upload test endpoint
+RUN { \
+    echo '<?php'; \
+    echo 'if ($_SERVER["REQUEST_METHOD"] === "POST") {'; \
+    echo '    if (isset($_FILES["file"])) {'; \
+    echo '        echo json_encode(["status" => "ok", "size" => $_FILES["file"]["size"]]);'; \
+    echo '    } else {'; \
+    echo '        echo json_encode(["status" => "ok", "message" => "POST received"]);'; \
+    echo '    }'; \
+    echo '} else {'; \
+    echo '    echo "<h1>Upload Test</h1><form method=\"post\" enctype=\"multipart/form-data\">";'; \
+    echo '    echo "<input type=\"file\" name=\"file\"><input type=\"submit\" value=\"Upload\"></form>";'; \
+    echo '}'; \
+    echo '?>'; \
+} > /var/www/html/upload.php
+
+RUN chown -R www-data:www-data /var/www/html
+
+# Configure Nginx
+COPY nginx.conf /etc/nginx/nginx.conf
+
+# Expose ports
+EXPOSE 80
+
+# Create startup script
+RUN { \
+    echo '#!/bin/bash'; \
+    echo 'set -e'; \
+    echo 'mkdir -p /var/log/nginx /var/log/php-fpm'; \
+    echo '# Fixed: mkdir already done /var/lib/php/sessions'; \
+    echo 'echo "Starting PHP-FPM 8.2.34 (VULNERABLE to CVE-2026-109618/109619)..."'; \
+    echo 'php-fpm -v'; \
+    echo 'php-fpm -D'; \
+    echo 'echo "Starting Nginx..."'; \
+    echo 'nginx -g "daemon off;"'; \
+} > /entrypoint.sh && chmod +x /entrypoint.sh
+
+CMD ["/entrypoint.sh"]

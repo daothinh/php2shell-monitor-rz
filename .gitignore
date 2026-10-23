@@ -1,0 +1,28 @@
+# ---- secrets & runtime (KHÔNG BAO GIỜ commit) ----
+.env
+*.env
+!.env.example
+
+# ---- central alert server ----
+central-alert-server/server/.venv/
+central-alert-server/server/data/
+*.db
+*.db-wal
+*.db-shm
+
+# ---- python ----
+__pycache__/
+*.pyc
+
+# ---- third-party reference clones (quá nặng, lấy lại được) ----
+php2shell-monitor/repos/
+
+# ---- dev artifacts ----
+proxy_requests_anthropic.json
+*.log
+php2shell-monitor/dist/payload/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.swp

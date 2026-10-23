@@ -1,0 +1,16 @@
+[Unit]
+Description=php2shell-monitor Alert Agent (day alert ve Central Server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/p2s-agent.sh run
+Restart=always
+RestartSec=10
+# File cấu hình /etc/php2shell/agent.conf (0600, root) do lệnh 'p2s-agent.sh pair' tạo ra
+User=root
+UMask=077
+
+[Install]
+WantedBy=multi-user.target
