@@ -392,31 +392,21 @@ UUID2 = "9B8A7C6D-5E4F-43B2-A1C0-D2E3F4A5B6C7"
 
 
 def test_bot_add_new_id_then_pair_two_servers(env):
-    """Một người (một chat) ghép 2 server: /add_new_id -> code 1, /add_new_id -> code 2."""
-    _, cfg, tg = env
+    """Một chat ghép 2 server: /add_new_id (hướng dẫn mới) -> register-chatid x2 -> /confirm."""
+    client, cfg, tg = env
     bot = _bot(cfg, tg)
     chat = 8001
 
     asyncio.run(bot.handle_update(_msg(chat, "/add_new_id")))
-    assert str(chat) in bot._awaiting
-    assert "Thêm server mới" in tg.sent[-1][1]
+    text = tg.sent[-1][1]
+    assert "Thêm server mới" in text and str(chat) in text  # /id inline luôn chat id
 
-    # nhầm lẫn gì đó trong lúc chờ mã -> bot nhắc đang chờ
-    asyncio.run(bot.handle_update(_msg(chat, "hello")))
-    assert "Đang chờ mã" in tg.sent[-1][1]
-
-    # server 1
-    _pending_code(cfg, "web-cluster", f"SEC-{UUID1}")
-    asyncio.run(bot.handle_update(_msg(chat, f"SEC-{UUID1}")))
-    assert "Ghép nối thành công" in tg.sent[-1][1]
-    assert "2 dự án" not in tg.sent[-1][1] or "1 dự án" in tg.sent[-1][1]
-    assert str(chat) not in bot._awaiting  # hết trạng thái chờ sau khi pair
-
-    # server 2 — /add_new_id lần nữa, cùng chat
-    asyncio.run(bot.handle_update(_msg(chat, "/add_new_id@php2shell_alert_bot")))
-    _pending_code(cfg, "db-cluster", f"SEC-{UUID2}")
-    asyncio.run(bot.handle_update(_msg(chat, f"SEC-{UUID2}")))
-    assert "2 dự án" in tg.sent[-1][1]
+    # 2 server đăng ký cùng chat -> 1 /confirm ghép cả hai
+    _register_chatid(client, "web-cluster", chat)
+    _register_chatid(client, "db-cluster", chat)
+    asyncio.run(bot.handle_update(_msg(chat, "/confirm")))
+    assert "2 server" in tg.sent[-1][1]
+    assert len(db.projects_by_chat(cfg.database_path, str(chat))) == 2
 
 
 def test_bot_list_shows_all_servers_of_one_chat(env):
@@ -441,7 +431,8 @@ def test_bot_help_mentions_commands(env):
     bot = _bot(cfg, tg)
     asyncio.run(bot.handle_update(_msg(8003, "/help")))
     text = tg.sent[-1][1]
-    assert "/add_new_id" in text and "/list" in text and "nhiều server" in text
+    assert "/add_new_id" in text and "/list" in text and "/id" in text
+    assert "/confirm" in text and "Chat ID" in text
     assert "≡" in text and "3 bước" in text  # gợi ý menu + luồng ghép nối
 
 
@@ -475,3 +466,89 @@ def test_bot_wrong_code_does_not_create_awaiting_leak(env):
     _pending_code(cfg, "gamma", f"SEC-{UUID2}")
     asyncio.run(bot.handle_update(_msg(chat, f"SEC-{UUID2}")))
     assert "Ghép nối thành công" in tg.sent[-1][1]
+
+
+# ------------------------------------------------------------ chat-id pairing
+GROUP = -1001234567890
+
+
+def _register_chatid(client, name, chat_id):
+    r = client.post("/api/v1/register-chatid", json={
+        "project_name": name, "chat_id": str(chat_id)})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_register_chatid_group_flow_and_confirm(env):
+    """Luồng đầy đủ: script đăng ký chat GROUP -> bot notify vào đúng chat ->
+    /confirm -> linked, api_key tiết lộ qua pairing-status."""
+    client, cfg, tg = env
+    res = _register_chatid(client, "web01", GROUP)
+    assert res["pair_ref"].startswith("SEC-")
+    assert res["chat_id"] == str(GROUP)
+    assert res["warning"] is None
+    # bot đã chủ động gửi yêu cầu /confirm vào đúng chat đích
+    assert tg.sent and tg.sent[0][0] == str(GROUP)
+    assert "Yêu cầu ghép nối mới" in tg.sent[0][1]
+    assert "web01" in tg.sent[0][1]
+
+    bot = _bot(cfg, tg)
+    # pending: status chưa linked
+    st = client.get(f"/api/v1/pairing-status?code={res['pair_ref']}").json()
+    assert st["status"] == "pending"
+
+    asyncio.run(bot.handle_update(_msg(GROUP, "/confirm")))
+    assert "Ghép nối thành công" in tg.sent[-1][1]
+    st = client.get(f"/api/v1/pairing-status?code={res['pair_ref']}").json()
+    assert st["status"] == "linked" and st.get("api_key")
+
+
+def test_confirm_links_multiple_servers_one_chat(env):
+    """Một GROUP nhận alert của nhiều server: 2 lần register -> 1 /confirm ghép cả hai."""
+    client, cfg, tg = env
+    r1 = _register_chatid(client, "alpha", GROUP)
+    r2 = _register_chatid(client, "beta", GROUP)
+    bot = _bot(cfg, tg)
+    asyncio.run(bot.handle_update(_msg(GROUP, "/confirm")))
+    text = tg.sent[-1][1]
+    assert "2 server" in text and "alpha" in text and "beta" in text
+    for r in (r1, r2):
+        st = client.get(f"/api/v1/pairing-status?code={r['pair_ref']}").json()
+        assert st["status"] == "linked" and st.get("api_key")
+    assert len(db.projects_by_chat(cfg.database_path, str(GROUP))) == 2
+
+
+def test_confirm_rejects_other_chat_and_empty(env):
+    """/confirm từ chat KHÁC không leak; chat không có pending được báo rõ."""
+    client, cfg, tg = env
+    _register_chatid(client, "secret-server", GROUP)
+    bot = _bot(cfg, tg)
+    asyncio.run(bot.handle_update(_msg(999111, "/confirm")))   # chat khác
+    assert "Không có yêu cầu" in tg.sent[-1][1]
+    st = db.pairing_status(cfg.database_path,
+                           db.pending_codes_by_chat_id(cfg.database_path, str(GROUP))[0]["code"])
+    assert st["status"] == "pending"   # vẫn chờ, chưa bị chat lạ confirm
+
+
+def test_register_chatid_validates_input(env):
+    client, cfg, tg = env
+    for bad in ("abc", "12", "0", "--100", "+100"):
+        r = client.post("/api/v1/register-chatid",
+                        json={"project_name": "x", "chat_id": bad})
+        assert r.status_code == 422, bad
+
+
+def test_bot_id_command_replies_chat_id(env):
+    _, cfg, tg = env
+    bot = _bot(cfg, tg)
+    asyncio.run(bot.handle_update(_msg(8005354626, "/id")))
+    assert "8005354626" in tg.sent[-1][1]
+
+
+def test_plain_message_hints_pending_confirm(env):
+    """Tin nhắn thường trong chat có pending -> nhắc /confirm."""
+    client, cfg, tg = env
+    _register_chatid(client, "hinted", 4242)
+    bot = _bot(cfg, tg)
+    asyncio.run(bot.handle_update(_msg(4242, "hello")))
+    assert "/confirm" in tg.sent[-1][1]

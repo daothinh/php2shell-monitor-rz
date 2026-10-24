@@ -106,21 +106,33 @@ ALERT_EVIDENCE_ROOT=/data/evidence
 ALERT_RETENTION_DAYS=90
 ```
 
-### 3.2. Lệnh bot — một người quản lý nhiều server
+### 3.2. Ghép nối theo Chat ID — chat riêng HOẶC group
 
-Bot **tự đăng ký menu lệnh** (nút **≡** cạnh ô nhập / gõ `/`) và mô tả bot qua `setMyCommands`/`setMyDescription` khi khởi động — người dùng không cần nhớ cú pháp.
+> Nhánh `feature/chatid-pairing`: pairing theo **Chat ID** thay vì mã `SEC-<UUID>` — alert đi được về **chat riêng của một user hoặc cả group** (cả team cùng nhận).
 
-Một chat Telegram (một người) có thể ghép **nhiều server**, mỗi server một mã `SEC-<UUID>` riêng; cảnh báo của tất cả các server về cùng chat đó.
+Bot **tự đăng ký menu lệnh** (nút **≡** / gõ `/`) khi khởi động.
+
+**Luồng ghép nối (không cần gõ mã):**
+
+```
+1️⃣ Telegram → bot → /id          → bot trả Chat ID (chat riêng: số dương; group: số âm)
+2️⃣ Server:   sudo p2s-agent.sh pair --server <url>
+             → script hỏi Chat ID → nhập số vừa copy
+3️⃣ Bot gửi "🔔 Yêu cầu ghép nối mới" vào đúng chat đó → nhắn /confirm → xong ✅
+```
 
 | Lệnh (menu ≡) | Chức năng |
 |---|---|
-| `/start` | Lời chào + tổng quan bot |
-| `/add_new_id` | Bắt đầu phiên ghép nối server mới (bot vào trạng thái chờ mã trong 10 phút; gửi mã `SEC-<UUID>` in trên terminal khi chạy `p2s-agent.sh pair` để hoàn tất) |
-| `/list` (hoặc `/ids`, `/servers`) | Liệt kê mọi server/dự án đã ghép với chat: tên, số thiết bị, ngày ghép, alert gần nhất |
-| `/help` | Trợ giúp đầy đủ: danh sách lệnh + luồng ghép nối 3 bước + số dự án đang quản lý |
-| Gửi `SEC-<UUID>` trực tiếp | Ghép nối luôn mà không cần `/add_new_id` trước |
+| `/id` | Lấy Chat ID của chat hiện tại (cần cho script pair) |
+| `/confirm` | Đồng ý các yêu cầu ghép nối đang chờ của **chính chat này** (TTL 10 phút; nhóm @botname khi dùng trong group) |
+| `/add_new_id` | Hướng dẫn thêm server mới vào chat hiện tại (kèm sẵn Chat ID) |
+| `/list` (hoặc `/ids`, `/servers`) | Các server/dự án đã ghép với chat: tên, số thiết bị, ngày ghép, alert gần nhất |
+| `/start`, `/help` | Chào mừng / trợ giúp đầy đủ |
+| Gửi `SEC-<UUID>` trực tiếp | Fallback (luồng mã cũ vẫn hoạt động) |
 
-Mọi lệnh chấp nhận cả dạng `/add_new_id@tên_bot` (khi dùng bot trong nhóm).
+API: `POST /api/v1/register-chatid` `{project_name, chat_id}` → `{pair_ref, ...}` (bot tự gửi yêu cầu /confirm vào chat đích); agent vẫn poll `GET /pairing-status?code=<pair_ref>` như cũ.
+
+**Bảo mật:** chat đích phải chủ động `/confirm` (chống ai đó trỏ alert vào chat lạ); tin nhắn thường trong chat có yêu cầu chờ sẽ được bot nhắc `/confirm`. Group cần bot là thành viên (hoặc tắt privacy mode qua BotFather) để nhận `/confirm`.
 
 ### 3.3. Chạy
 

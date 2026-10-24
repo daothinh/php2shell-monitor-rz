@@ -167,15 +167,52 @@ def init_db(path: str) -> None:
         conn.executescript(SCHEMA)
 
 
+# ---------------------------------------------------------------- telegram chat id
+
+CHAT_ID_RE = re.compile(r"^-?[1-9][0-9]{2,14}$")
+
+
+def norm_chat_id(s: str) -> str:
+    """Chuẩn hoá chat ID Telegram (user: dương; group/supergroup: âm).
+    ValueError nếu không hợp lệ."""
+    c = str(s or "").strip().replace(" ", "")
+    if not CHAT_ID_RE.fullmatch(c):
+        raise ValueError("chat_id phải là số Telegram (user chat dương,"
+                         " group/supergroup âm, ví dụ: 8005354626 hoặc -1001234567890)")
+    return c
+
+
 # ---------------------------------------------------------------- projects
 
-def create_project(db_path: str, name: str) -> int:
+def create_project(db_path: str, name: str, telegram_chat_id: Optional[str] = None) -> int:
+    """Project pending; telegram_chat_id khi có là CHAT ĐÍCH script yêu cầu ghép
+    (luồng chat-id pairing). Trạng thái pending cho tới khi chat đó /confirm."""
     with _WRITE_LOCK, connect(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO projects (project_name, status, created_at) VALUES (?, 'pending', ?)",
-            (name, iso()),
+            "INSERT INTO projects (project_name, status, created_at, telegram_chat_id)"
+            " VALUES (?, 'pending', ?, ?)",
+            (name, iso(), telegram_chat_id),
         )
         return int(cur.lastrowid)
+
+
+def pending_codes_by_chat_id(db_path: str, chat_id: str) -> list[sqlite3.Row]:
+    """Các mã pairing còn hiệu lực của mọi project CHỜ /confirm theo chat ID.
+    Một chat (user hoặc group) có thể có nhiều server đang chờ cùng lúc."""
+    with connect(db_path) as conn:
+        return conn.execute(
+            """
+            SELECT pc.code, p.project_name, p.id AS project_id
+            FROM pairing_codes pc
+            JOIN projects p ON p.id = pc.project_id
+            WHERE p.telegram_chat_id = ?
+              AND p.status = 'pending'
+              AND pc.used_at IS NULL
+              AND pc.expires_at > ?
+            ORDER BY pc.expires_at
+            """,
+            (str(chat_id), iso()),
+        ).fetchall()
 
 
 def get_project(db_path: str, project_id: int) -> Optional[sqlite3.Row]:

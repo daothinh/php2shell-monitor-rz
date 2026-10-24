@@ -1,4 +1,5 @@
 """API endpoints: pairing, ingest, ops (alerts/devices/stats/search), admin, health."""
+import html
 import logging
 import re
 import secrets
@@ -27,6 +28,11 @@ UUID_CODE_RE = r"^SEC-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4
 
 class RegisterBody(BaseModel):
     project_name: str = Field(min_length=1, max_length=64)
+
+
+class RegisterChatIdBody(BaseModel):
+    project_name: str = Field(min_length=1, max_length=64)
+    chat_id: str = Field(min_length=1, max_length=20)
 
 
 class AdminLinkBody(BaseModel):
@@ -92,6 +98,58 @@ def register_pairing(body: RegisterBody, request: Request):
         "expires_in": cfg.pairing_ttl_sec,
         "expires_at": db.iso(db.utcnow() + timedelta(seconds=cfg.pairing_ttl_sec)),
         "instruction": f"Gửi mã {code} cho bot Telegram để hoàn tất ghép nối",
+    }
+
+
+@router.post("/register-chatid")
+async def register_chatid(body: RegisterChatIdBody, request: Request):
+    """Luồng pairing theo CHAT ID Telegram (private user hoặc group đều được).
+
+    Script chạy trên server dự án hỏi user nhập chat ID (lấy từ lệnh /id của
+    bot) rồi gọi endpoint này. Server tạo project pending + pair_ref nội bộ,
+    và bot gửi yêu cầu xác nhận vào đúng chat đó — ai đó trong chat nhắn
+    /confirm trong TTL là ghép nối xong. User không phải gõ mã nào.
+    """
+    cfg = _cfg(request)
+    if not _NAME_RE.match(body.project_name):
+        raise HTTPException(422, "project_name 1-64 ký tự, chỉ chữ/số/._-@ và khoảng trắng")
+    try:
+        chat_id = db.norm_chat_id(body.chat_id)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    ip = _client_ip(request)
+    ok, retry = _limiter.allow(f"reg:{ip}", cfg.register_rate_per_hour, 3600)
+    if not ok:
+        raise HTTPException(429, f"Quá nhiều lượt đăng ký từ IP này; thử lại sau {retry}s")
+    project_id = db.create_project(cfg.database_path, body.project_name,
+                                   telegram_chat_id=chat_id)
+    pair_ref = db.issue_pairing_code(cfg.database_path, project_id, cfg.pairing_ttl_sec,
+                                     gen_pairing_code)
+    log.info("chat-id pairing: project=%s chat=%s", project_id, chat_id)
+
+    # Bot chủ động thông báo vào chat đích để /confirm tại chỗ
+    # (duck-typing: TestClient thay bot bằng stub cùng giao diện send_message)
+    warning = ""
+    tg = request.app.state.telegram
+    if tg is not None and hasattr(tg, "send_message"):
+        sent, err = await tg.send_message(
+            chat_id,
+            "🔔 <b>Yêu cầu ghép nối mới</b>\n"
+            f"📦 Server: <b>{html.escape(body.project_name)}</b> muốn gửi cảnh báo"
+            " về chat này.\n"
+            f"✅ Nhắn <code>/confirm</code> trong {cfg.pairing_ttl_sec // 60} phút"
+            " để đồng ý (hoặc làm ngơ để huỷ).",
+        )
+        if not sent:
+            warning = (f"chưa nhắn được bot vào chat {chat_id}: {err} — hãy mở bot"
+                       " (hoặc thêm bot vào group) rồi nhắn /confirm ở đó")
+    return {
+        "pair_ref": pair_ref,
+        "chat_id": chat_id,
+        "expires_in": cfg.pairing_ttl_sec,
+        "expires_at": db.iso(db.utcnow() + timedelta(seconds=cfg.pairing_ttl_sec)),
+        "instruction": f"Nhắn /confirm trong chat {chat_id} để hoàn tất ghép nối",
+        "warning": warning or None,
     }
 
 

@@ -64,15 +64,20 @@ usage() {
 $PROG — agent Central Alert Server cho php2shell-monitor
 
 Usage:
-  $PROG pair   --server <url-central-server>
+  $PROG pair   --server <url-central-server> [--chatid <chat-id-telegram>]
   $PROG run    [--file <alerts.jsonl>]
   $PROG test
+
+pair sẽ HỎI Chat ID Telegram (hoặc nhận qua --chatid / P2S_TG_CHATID).
+Lấy Chat ID: nhắn /id cho bot (trong chat riêng HOẶC group — group để cả
+team cùng nhận alert). Sau đó chỉ cần nhắn /confirm trong chat đó.
 
 Tên dự án gửi lên server lấy từ P2S_PROJECT_NAME (mặc định: hostname).
 
 Biến môi trường (ghi đè mặc định):
   P2S_AGENT_CONF=$CONF_PATH
   P2S_AGENT_STATE=$STATE_DIR
+  P2S_TG_CHATID=<chat id Telegram>
   P2S_ALERT_FILE=<queue.jsonl> (mặc định: /var/lib/php2shell/projects/default/devices/<host>/alerts/queue.jsonl)
   P2S_AGENT_POLL=$POLL_INTERVAL (giây)
 EOF
@@ -80,33 +85,53 @@ EOF
 
 # ============================================================ pair
 cmd_pair() {
-  local server=
+  local server= chatid=
   while [[ $# -gt 0 ]]; do
     case $1 in
       --server) server=${2:?}; shift 2 ;;
+      --chatid) chatid=${2:?}; shift 2 ;;
       *) die "tham số không hợp lệ: $1 (xem $PROG help)" ;;
     esac
   done
   [[ $server =~ ^https?:// ]] || die "--server phải là URL http(s)://..."
 
-  local resp code name
+  # Chat ID: --chatid > P2S_TG_CHATID > prompt tương tác
+  chatid=${chatid:-${P2S_TG_CHATID:-}}
+  if [[ -z $chatid ]]; then
+    cat >&2 <<'EOF'
+Lấy Chat ID: mở Telegram → vào bot → nhắn /id → bot trả Chat ID
+(chat riêng: số dương; group: số âm — dùng group để cả team nhận alert).
+EOF
+    printf 'Nhập Chat ID Telegram: '
+    IFS= read -r chatid || die "không đọc được input — dùng --chatid <chat_id>"
+  fi
+  chatid=$(printf '%s' "$chatid" | tr -d ' ')
+  [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] \
+    || die "Chat ID không hợp lệ: '$chatid' (ví dụ: 8005354626 hoặc -1001234567890)"
+
+  local resp pair_ref name warn
   name=${P2S_PROJECT_NAME:-$(hostname 2>/dev/null || echo unknown)}
-  resp=$("${CURL[@]}" -X POST "$server/api/v1/register-pairing" \
+  resp=$("${CURL[@]}" -X POST "$server/api/v1/register-chatid" \
     -H 'Content-Type: application/json' \
-    -d "{\"project_name\":\"$(json_escape "$name")\"}") || die "không gọi được $server"
-  code=$(json_get "$resp" code)
-  [[ -n $code ]] || die "server trả về không có mã: $resp"
+    -d "{\"project_name\":\"$(json_escape "$name")\",\"chat_id\":\"$(json_escape "$chatid")\"}") \
+    || die "không gọi được $server"
+  pair_ref=$(json_get "$resp" pair_ref)
+  [[ -n $pair_ref ]] || die "server trả về không có pair_ref: $resp"
+  warn=$(json_get "$resp" warning)
+  [[ -n $warn && $warn != null ]] && printf '⚠️  %s\n' "$warn"
 
   cat <<EOF
 
 ==============================================================
-   MÃ GHÉP NỐI TELEGRAM:   $code
+   GHÉP NỐI QUA TELEGRAM CHAT ID:   $chatid
 ==============================================================
- 1. Mở Telegram, tìm bot của hệ thống (do quản trị viên cung cấp)
- 2. Nhắn đúng nội dung:   $code
+ 1. Mở Telegram vào CHAT có ID $chatid
+    (bot đã vừa gửi yêu cầu ghép nối vào đó)
+ 2. Nhắn:   /confirm
  3. Bot trả lời "Ghép nối thành công" là xong.
+    → KHÔNG cần gõ mã nào.
 
- Đang chờ ghép nối (tối đa $((PAIR_TIMEOUT / 60)) phút)...
+ Đang chờ /confirm (tối đa $((PAIR_TIMEOUT / 60)) phút)...
 ==============================================================
 
 EOF
@@ -114,14 +139,14 @@ EOF
   local i st status api_key
   for ((i = 0; i < PAIR_TIMEOUT; i += 3)); do
     sleep 3
-    if ! st=$("${CURL[@]}" "$server/api/v1/pairing-status?code=$code"); then
+    if ! st=$("${CURL[@]}" "$server/api/v1/pairing-status?code=$pair_ref"); then
       printf '  (chờ lại — không gọi được server)\n' >&2
       continue
     fi
     status=$(json_get "$st" status)
     if [[ $status == linked ]]; then
       api_key=$(json_get "$st" api_key)
-      [[ -n $api_key ]] || continue   # đã linked nhưng hết cửa sổ lấy key ->.poll tiếp vô ích
+      [[ -n $api_key ]] || continue   # hết cửa sổ reveal -> poll tiếp vô ích
       mkdir -p -- "$(dirname -- "$CONF_PATH")"
       (umask 077 && printf 'SERVER_URL=%q\nAPI_KEY=%q\nPROJECT_NAME=%q\n' \
         "$server" "$api_key" "$name" >"$CONF_PATH")
