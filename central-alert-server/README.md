@@ -114,27 +114,32 @@ ALERT_RETENTION_DAYS=90
 
 Bot **tự đăng ký menu lệnh** (nút **≡** / gõ `/`) khi khởi động.
 
-**Luồng ghép nối (không cần gõ mã):**
+**Luồng ghép nối (TỰ ĐỘNG — không cần /confirm, không spam chat khi triển khai số lượng lớn):**
 
 ```
 1️⃣ Telegram → bot → /id          → bot trả Chat ID (chat riêng: số dương; group: số âm)
 2️⃣ Server:   sudo p2s-agent.sh pair
-             → script hỏi Chat ID → nhập số vừa copy
+             → script hỏi Chat ID → nhập số vừa copy → GHÉP NỐI NGAY
              (server trung tâm đã hardcode sẵn trong script; muốn trỏ server
               khác thì thêm --server <url> hoặc set P2S_SERVER_URL)
-3️⃣ Bot gửi "🔔 Yêu cầu ghép nối mới" vào đúng chat đó → nhắn /confirm → xong ✅
 ```
+
+- Bot chỉ nhắn **1 tin** "✅ Đã tự động ghép nối" vào chat cho dự án **mới**
+  (kèm `/unlink <tên>` để ngắt nếu không phải do bạn); thêm máy vào dự án đã
+  ghép thì **im lặng** — 1000 thiết bị chạy pair cũng không spam chat.
+- Mỗi lần pair cấp **một API key riêng** cho dự án (bảng `api_keys`, các key
+  cũ vẫn sống) — cứ chạy pair trên từng máy, khỏi copy conf tay.
 
 | Lệnh (menu ≡) | Chức năng |
 |---|---|
 | `/id` | Lấy Chat ID của chat hiện tại (cần cho script pair) |
-| `/confirm` | Đồng ý các yêu cầu ghép nối đang chờ của **chính chat này** (TTL 10 phút; nhóm @botname khi dùng trong group) |
 | `/list` (hoặc `/ids`, `/servers`) | Các server/dự án đã ghép với chat: tên, số thiết bị, ngày ghép, alert gần nhất |
+| `/unlink <tên>` | Ngắt một dự án khỏi chat: alert dừng gửi ngay, lịch sử vẫn lưu |
 | `/start`, `/help` | Chào mừng / trợ giúp đầy đủ |
 
-API: `POST /api/v1/register-chatid` `{project_name, chat_id}` → `{pair_ref, ...}` (bot tự gửi yêu cầu /confirm vào chat đích); agent vẫn poll `GET /pairing-status?code=<pair_ref>` như cũ.
+API: `POST /api/v1/register-chatid` `{project_name, chat_id, device?}` → `{pair_ref, auto_linked, ...}` — ghép nối và cấp key NGAY; agent poll `GET /pairing-status?code=<pair_ref>` nhận `linked` + `api_key` ở lần đầu tiên.
 
-**Bảo mật:** chat đích phải chủ động `/confirm` (chống ai đó trỏ alert vào chat lạ); tin nhắn thường trong chat có yêu cầu chờ sẽ được bot nhắc `/confirm`. Group cần bot là thành viên (hoặc tắt privacy mode qua BotFather) để nhận `/confirm`.
+**Bảo mật:** ghép nối tự động nên chat ID là "khóa": rate-limit 30 đăng ký/giờ/IP; tin nhắn thông báo nêu rõ `/unlink` để chủ chat tự vệ khi có người lạ trỏ alert vào. Group cần bot là thành viên để bot gửi được alert.
 
 ### 3.3. Chạy
 

@@ -210,7 +210,7 @@ N "pair: chatid sai không gửi lên server" '"abc"' "$(cat "$stub/register_bod
 rm -f "$stub/poll_count"
 out=$(env "${PAIR_ENV[@]}" \
       bash "$w2/engine/central.sh" pair --server http://fake-central.test --chatid 998877665 2>&1)
-T "pair: nhắc chờ /confirm"          "Đang chờ /confirm"   "$out"
+T "pair: ghi rõ ghép tự động"        "TỰ ĐỘNG"             "$out"
 T "pair: đăng ký đúng project"       '"project_name":"test-project"' "$(cat "$stub/register_body")"
 T "pair: thành công sau khi confirm" "GHÉP NỐI THÀNH CÔNG" "$out"
 T "pair: gợi ý bước tiếp theo"        "php2shell-monitor.sh -- run" "$out"

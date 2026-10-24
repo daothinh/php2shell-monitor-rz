@@ -76,7 +76,8 @@ pair KHÔNG cần --server: mặc định trỏ sẵn $DEFAULT_SERVER
 
 pair sẽ HỎI Chat ID Telegram (hoặc nhận qua --chatid / P2S_TG_CHATID).
 Lấy Chat ID: nhắn /id cho bot (trong chat riêng HOẶC group — group để cả
-team cùng nhận alert). Sau đó chỉ cần nhắn /confirm trong chat đó.
+team cùng nhận alert). Ghép nối TỰ ĐỘNG ngay sau khi nhập — không cần
+/confirm; mỗi lần chạy cấp một API key riêng (key cũ vẫn sống).
 
 Tên dự án gửi lên server lấy từ P2S_PROJECT_NAME (mặc định: hostname).
 
@@ -119,7 +120,7 @@ cmd_pair() {
  Mở nhanh     :  $botlink
  Central server :  $server
 
- Bạn sẽ làm 3 bước (khoảng 1 phút):
+ Bạn sẽ làm 2 bước (khoảng 1 phút) — ghép nối TỰ ĐỘNG, không cần /confirm:
 
  BƯỚC 1️⃣ — Lấy Chat ID trên Telegram
    • Mở $botlink  → nhấn  START  (bắt buộc nếu chưa từng nhấn)
@@ -131,12 +132,10 @@ cmd_pair() {
       (ví dụ  -1001234567890)
 
  BƯỚC 2️⃣ — Nhập Chat ID vào dòng script sẽ hỏi ngay bên dưới
-
- BƯỚC 3️⃣ — Xác nhận trên Telegram
-   • Bot gửi  "🔔 Yêu cầu ghép nối mới"  vào đúng chat của bạn
-   • Bạn nhắn:   /confirm
-   • Thấy  "✅ Ghép nối thành công"  là HOÀN TẤT — script dưới đây
-     tự nhận API key và lưu cấu hình, bạn không phải gõ gì thêm.
+   → xong: server ghép nối NGAY, bot nhắn 1 tin xác nhận vào chat,
+     script tự nhận API key và lưu cấu hình — bạn không phải gõ gì thêm.
+   💡 Thêm máy khác vào cùng dự án sau này: chạy lại lệnh này trên máy đó
+     (tên dự án + Chat ID giữ nguyên) — tự động, không spam chat.
 
 ────────────────────────────────────────────────────────────────
 EOF
@@ -162,7 +161,7 @@ EOF
   name=${P2S_PROJECT_NAME:-$(hostname 2>/dev/null || echo unknown)}
   resp=$("${CURL[@]}" -X POST "$server/api/v1/register-chatid" \
     -H 'Content-Type: application/json' \
-    -d "{\"project_name\":\"$(json_escape "$name")\",\"chat_id\":\"$(json_escape "$chatid")\"}") \
+    -d "{\"project_name\":\"$(json_escape "$name")\",\"chat_id\":\"$(json_escape "$chatid")\",\"device\":\"$(json_escape "$(hostname 2>/dev/null || echo unknown)")\"}") \
     || die "không gọi được $server — kiểm tra đường mạng/URL: $server"
   pair_ref=$(json_get "$resp" pair_ref)
   [[ -n $pair_ref ]] || die "server trả về không có pair_ref: $resp"
@@ -173,23 +172,13 @@ EOF
     cat >&2 <<EOF
 
 ⚠️  Bot chưa nhắn được vào chat $chatid (chưa được START).
-   Cách xử lý: mở $botlink → nhấn START → nhắn  /confirm
-   (yêu cầu ghép nối vẫn còn hiệu lực, không cần làm lại từ đầu)
+   Cách xử lý: mở $botlink → nhấn START (bot vào group nếu là group chat).
+   Dự án VẪN đã ghép nối và API key vẫn được cấp — nhưng alert chỉ tới
+   sau khi bot nhắn được vào chat, nên hãy START trước.
 EOF
   fi
 
-  cat <<EOF
-
-────────────────────────────────────────────────────────────────
- BƯỚC 3️⃣ — Bây giờ trên Telegram:
-   1. Vào chat có ID  $chatid
-   2. Nhắn:   /confirm
-   3. Chờ bot trả lời "✅ Ghép nối thành công"
-
-⏳ Đang chờ bạn /confirm (tối đa $((PAIR_TIMEOUT / 60)) phút, Ctrl+C để huỷ)...
-────────────────────────────────────────────────────────────────
-
-EOF
+  printf '\n⏳ Đang nhận API key (ghép nối TỰ ĐỘNG — không cần /confirm)...\n'
 
   local i st status api_key elapsed
   for ((i = 0; i < PAIR_TIMEOUT; i += 3)); do
@@ -222,17 +211,16 @@ EOF
         sudo cp p2s-agent.service /etc/systemd/system/
         sudo systemctl enable --now p2s-agent
    3) Trên Telegram, nhắn  /list  cho $bot để xem các server đang quản lý.
+   4) Thêm máy khác vào CÙNG dự án: chạy lại lệnh pair này trên máy đó
+      (tên dự án + Chat ID giữ nguyên) — tự động, không spam chat.
 EOF
       return 0
     fi
-    # mỗi ~30s nhắc nhẹ còn bao lâu
     if (( (i + 3) % 30 == 0 )); then
-      elapsed=$(( (i + 3) / 60 ))
-      printf '  ... vẫn đang chờ /confirm (đã chờ %d phút, còn %d phút)\n' \
-        "$elapsed" "$(( PAIR_TIMEOUT / 60 - elapsed ))"
+      printf '  ... vẫn đang chờ server phản hồi (đã %d giây)\n' "$((i + 3))"
     fi
   done
-  die "hết thời gian chờ /confirm — chạy lại lệnh pair (yêu cầu cũ đã hết hạn)"
+  die "hết thời gian chờ server cấp key — chạy lại lệnh pair"
 }
 
 # ============================================================ helpers run

@@ -29,6 +29,7 @@ UUID_CODE_RE = r"^SEC-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4
 class RegisterChatIdBody(BaseModel):
     project_name: str = Field(min_length=1, max_length=64)
     chat_id: str = Field(min_length=1, max_length=20)
+    device: Optional[str] = Field(default=None, max_length=64)  # nhãn key (hostname)
 
 
 class AdminLinkBody(BaseModel):
@@ -81,11 +82,12 @@ def _read_scope(request: Request, x_api_key: str = Header(default=""),
 async def register_chatid(body: RegisterChatIdBody, request: Request):
     """Luồng pairing theo CHAT ID Telegram (private user hoặc group đều được).
 
-    Script chạy trên server dự án hỏi user nhập chat ID (lấy từ lệnh /id của
-    bot) rồi gọi endpoint này. Server tạo project pending + pair_ref nội bộ,
-    và bot gửi yêu cầu xác nhận vào đúng chat đó — ai đó trong chat nhắn
-    /confirm trong TTL là ghép nối xong. User không phải gõ mã nào.
-    """
+    Ghép nối TỰ ĐỘNG — không cần /confirm (triển khai số lượng lớn: 1000 thiết bị
+    không ai ngồi confirm từng máy). Script hỏi user chat ID (lấy từ /id của
+    bot) rồi gọi endpoint này; server cấp API key NGAY (mỗi lần gọi cấp THÊM
+    một key, các key cũ vẫn sống). Bot chỉ nhắn 1 tin duy nhất vào chat khi dự
+    án lần đầu được ghép (kèm lệnh /unlink để tự vệ); re-pair thêm máy thì im
+    lặng."""
     cfg = _cfg(request)
     if not _NAME_RE.match(body.project_name):
         raise HTTPException(422, "project_name 1-64 ký tự, chỉ chữ/số/._-@ và khoảng trắng")
@@ -101,32 +103,36 @@ async def register_chatid(body: RegisterChatIdBody, request: Request):
                                    telegram_chat_id=chat_id)
     pair_ref = db.issue_pairing_code(cfg.database_path, project_id, cfg.pairing_ttl_sec,
                                      gen_pairing_code)
-    log.info("chat-id pairing: project=%s chat=%s", project_id, chat_id)
+    label = (body.device or "").strip()[:64]
+    res = db.auto_link_code(cfg.database_path, pair_ref, gen_api_key, sha256_hex, label)
+    log.info("chat-id auto-pairing: project=%s chat=%s newly_linked=%s",
+             project_id, chat_id, res["newly_linked"])
 
-    # Bot chủ động thông báo vào chat đích để /confirm tại chỗ
-    # (duck-typing: TestClient thay bot bằng stub cùng giao diện send_message)
+    # Chỉ dự án MỚI được thông báo vào chat (1 tin/khách); thêm máy im lặng.
     warning = ""
     tg = request.app.state.telegram
-    if tg is not None and hasattr(tg, "send_message"):
+    if res["newly_linked"] and tg is not None and hasattr(tg, "send_message"):
         sent, err = await tg.send_message(
             chat_id,
-            "🔔 <b>Yêu cầu ghép nối mới</b>\n"
-            f"📦 Server: <b>{html.escape(body.project_name)}</b> muốn gửi cảnh báo"
-            " về chat này.\n"
-            f"✅ Nhắn <code>/confirm</code> trong {cfg.pairing_ttl_sec // 60} phút"
-            " để đồng ý (hoặc làm ngơ để huỷ).",
+            "✅ <b>Đã tự động ghép nối</b>\n"
+            f"📦 Dự án <b>{html.escape(body.project_name)}</b> vừa ghép với chat này"
+            " — mọi cảnh báo của dự án sẽ về đây (không cần làm gì thêm).\n"
+            "🚫 Không phải do bạn? Nhắn <code>/unlink "
+            f"{html.escape(body.project_name)}</code> để ngắt ngay.",
         )
         if not sent:
-            warning = (f"chưa nhắn được bot vào chat {chat_id}: {err} — hãy mở bot"
-                       " (hoặc thêm bot vào group) rồi nhắn /confirm ở đó")
+            warning = (f"bot chưa nhắn được vào chat {chat_id} (chưa START): {err} —"
+                       " dự án VẪN đã ghép và key đã cấp; hãy mở bot (hoặc thêm bot"
+                       " vào group) để nhận được alert")
     return {
         "pair_ref": pair_ref,
         "chat_id": chat_id,
         "bot": (f"@{getattr(tg, 'bot_username', '')}"
                 if getattr(tg, "bot_username", "") else None),
+        "auto_linked": True,
         "expires_in": cfg.pairing_ttl_sec,
         "expires_at": db.iso(db.utcnow() + timedelta(seconds=cfg.pairing_ttl_sec)),
-        "instruction": f"Nhắn /confirm trong chat {chat_id} để hoàn tất ghép nối",
+        "instruction": "Đã ghép nối tự động — script sẽ nhận API key ngay",
         "warning": warning or None,
     }
 
@@ -313,8 +319,8 @@ def admin_link(body: AdminLinkBody, request: Request, x_admin_token: str = Heade
     if x_admin_token != cfg.admin_token:
         raise HTTPException(403, "admin token sai")
     try:
-        res = db.complete_pairing(cfg.database_path, body.code, body.chat_id,
-                                  gen_api_key, sha256_hex)
+        res = db.auto_link_code(cfg.database_path, body.code,
+                                gen_api_key, sha256_hex)
     except db.PairingError as e:
         raise HTTPException(409, e.reason) from e
     log.info("admin link: project=%s chat=%s", res["project_id"], body.chat_id)

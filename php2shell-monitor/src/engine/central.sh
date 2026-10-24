@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # central.sh - Central Alert Server integration: pair once, forward alerts.
 #
-#   central.sh pair  --server <url> [--chatid <chat-id>] [--detach]
+#   central.sh pair  [--server <url>] [--chatid <chat-id>] [--detach]
 #     Ghép nối theo CHAT ID Telegram cho PROJECT trong conf/device.conf:
-#     hỏi Chat ID (hoặc nhận --chatid), gọi register-chatid; bot gửi yêu
-#     cầu xác nhận vào đúng chat đích — nhắn /confirm trong TTL là xong.
+#     hỏi Chat ID (hoặc nhận --chatid), gọi register-chatid — ghép nối
+#     TỰ ĐỘNG (không /confirm): key được cấp ngay, mỗi lần chạy cấp thêm
+#     một key riêng (key cũ vẫn sống — thêm N máy không spam chat).
 #     API key lưu trong conf/central.conf (0600).
 #
 #   central.sh agent
@@ -145,7 +146,7 @@ cmd_pair() {
   local resp pair_ref warn rbot
   resp=$("${CURL[@]}" -X POST "$server/api/v1/register-chatid" \
     -H 'Content-Type: application/json' \
-    -d "{\"project_name\":\"$(json_escape "$proj")\",\"chat_id\":\"$(json_escape "$chatid")\"}") \
+    -d "{\"project_name\":\"$(json_escape "$proj")\",\"chat_id\":\"$(json_escape "$chatid")\",\"device\":\"$(json_escape "$DEVICE")\"}") \
     || die "không gọi được $server — kiểm tra đường mạng/URL: $server"
   pair_ref=$(json_get "$resp" pair_ref)
   [[ -n $pair_ref ]] || die "server trả về không có pair_ref: $resp"
@@ -156,15 +157,13 @@ cmd_pair() {
     cat >&2 <<EOF
 
 ⚠️  Bot chưa nhắn được vào chat $chatid (chưa được START).
-   Cách xử lý: mở $botlink → nhấn START → nhắn  /confirm
-   (yêu cầu ghép nối vẫn còn hiệu lực, không cần làm lại từ đầu)
+   Cách xử lý: mở $botlink → nhấn START (thêm bot vào group nếu là group).
+   Dự án VẪN đã ghép nối và API key vẫn được cấp — nhưng alert chỉ tới
+   sau khi bot nhắn được vào chat, nên hãy START trước.
 EOF
   fi
 
-  cat <<EOF
-
-⏳ Đang chờ /confirm trong Telegram chat $chatid (tối đa $(( (PAIR_TIMEOUT + 59) / 60 )) phút)...
-EOF
+  printf '\n⏳ Đang nhận API key (ghép nối TỰ ĐỘNG — không cần /confirm)...\n'
 
   local i st status api_key elapsed
   for ((i = 0; i < PAIR_TIMEOUT; i += PAIR_POLL)); do
@@ -198,14 +197,11 @@ EOF
       fi
       return 0
     fi
-    # mỗi ~30s nhắc nhẹ còn bao lâu
     if (( (i + PAIR_POLL) % 30 == 0 )); then
-      elapsed=$(( (i + PAIR_POLL + 59) / 60 ))
-      printf '  ... vẫn đang chờ /confirm (đã chờ %d phút, còn %d phút)\n' \
-        "$elapsed" "$(( (PAIR_TIMEOUT + 59) / 60 - elapsed ))"
+      printf '  ... vẫn đang chờ server phản hồi (đã %d giây)\n' "$((i + PAIR_POLL))"
     fi
   done
-  die "hết thời gian chờ /confirm — chạy lại lệnh pair (yêu cầu cũ đã hết hạn)"
+  die "hết thời gian chờ server cấp key — chạy lại lệnh pair"
 }
 
 # ============================================================ forwarder

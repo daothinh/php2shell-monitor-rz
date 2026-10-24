@@ -58,13 +58,21 @@ sudo bash php2shell-monitor.sh ten-khachhang --chatid -1001234567890
 > tiếp sau khi cài thì thoải mái:
 > `sudo bash /opt/php2shell-monitor/main.sh ten-khachhang --chatid -1001234567890`.
 
-Script in hướng dẫn từng bước, rồi bot Telegram gửi
-**"🔔 Yêu cầu ghép nối mới"** vào đúng group → trong group nhắn **`/confirm`**
-(trong vòng 10 phút). Script tự nhận API key và lưu cấu hình — không phải gõ gì thêm.
+Script in hướng dẫn từng bước, hỏi tên dự án + Chat ID là **ghép nối tự động
+ngay** — không cần `/confirm`, không phải gõ gì thêm. Bot Telegram nhắn 1 tin
+"✅ Đã tự động ghép nối" vào đúng group (kèm `/unlink` để ngắt nếu không phải
+do mình). Script tự nhận API key và lưu cấu hình.
 
-> Nếu bot chưa nhắn được vào group: kiểm tra bot đã được thêm vào group và
-> đã có ai nhắn `/start` cho bot chưa, rồi nhắn `/confirm` — yêu cầu ghép nối
-> vẫn còn hiệu lực, không cần chạy lại từ đầu.
+> **Triển khai 1000 máy:** cứ chạy đúng lệnh này trên từng máy (cùng tên dự án
+> + Chat ID). Mỗi máy nhận một API key riêng, các key cũ không bị vô hiệu,
+> chat KHÔNG bị spam thêm tin nào (re-pair im lặng).
+
+> Nếu bot chưa nhắn được vào group (chưa ai `/start`): dự án vẫn ghép nối và
+> key vẫn được cấp, nhưng alert chỉ tới sau khi bot nhắn được vào group —
+> thêm bot vào group và có ai đó `/start` bot là xong, không cần chạy lại.
+
+**Ngắt một dự án khỏi chat** (khách muốn dừng nhận alert): trong group nhắn
+`/unlink ten-khachhang` — alert dừng gửi ngay, lịch sử vẫn lưu trên server.
 
 ## 2. Kiểm tra hoạt động
 
@@ -126,7 +134,8 @@ Bằng chứng đã an toàn trên server trung tâm, gỡ máy khách không m�
 | Triệu chứng | Xử lý |
 |---|---|
 | `không gọi được http://45.124.93.136:8000` | Máy khách chặn egress — mở firewall cho IP:port này (chỉ cần outbound) |
-| Bot không gửi yêu cầu ghép nối | Group chưa thêm bot / chưa ai `/start` bot — làm rồi nhắn `/confirm` |
-| Muốn đổi nơi nhận alert | Chạy lại lệnh ở bước 1 với `--chatid` mới (hoặc wizard) rồi `/confirm` ở chat mới |
+| Bot không nhắn vào group được | Group chưa thêm bot / chưa ai `/start` bot — thêm rồi `/start`, không cần chạy lại pair |
+| Muốn đổi nơi nhận alert | Chạy lại lệnh ở bước 1 với `--chatid` mới (hoặc wizard); `/unlink <tên>` ở chat cũ nếu muốn ngắt |
+| Muốn dừng nhận alert của một dự án | Nhắn `/unlink ten-khachhang` trong group |
 | Quên Chat ID | Nhắn `/id` trong group/chat đó, bot trả lại ngay |
 | Xem máy nào đang ghép | Nhắn `/list` cho bot |

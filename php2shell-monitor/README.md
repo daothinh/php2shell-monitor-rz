@@ -176,14 +176,16 @@ Test: `bash tests/run_tests.sh` (hoặc `bats tests/unit`).
 ## 7. Gửi về central
 
 ```bash
-sudo bash php2shell-monitor.sh -- pair --server <url-central-server>
+sudo bash php2shell-monitor.sh ten-du-an --chatid <chat-id>   # hoặc không arg -> wizard
 ```
 
 Ghép nối theo **Chat ID Telegram** (private hoặc group): nhắn `/id` cho bot
-lấy Chat ID → nhập vào script → bot gửi yêu cầu vào chat → nhắn `/confirm`.
-API key lưu trong `conf/central.conf` (0600); từ đó supervisor tự giữ một
-forwarder (tail `alerts/queue.jsonl`, spool khi mất mạng) POST lên server;
-server đẩy alert vào Telegram chat đã ghép. Xem `../central-alert-server/README.md`.
+lấy Chat ID → nhập vào script → ghép nối **TỰ ĐỘNG ngay** (không cần
+/confirm — triển khai nhiều máy không spam chat; mỗi máy chạy pair được một
+API key riêng, key cũ vẫn sống). API key lưu trong `conf/central.conf`
+(0600); từ đó supervisor tự giữ một forwarder (tail `alerts/queue.jsonl`,
+spool khi mất mạng) POST lên server; server đẩy alert vào Telegram chat đã
+ghép. Xem `../central-alert-server/README.md`.
 
 ---
 

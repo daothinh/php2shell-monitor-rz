@@ -45,7 +45,7 @@ ssh root@<vps> 'bash /opt/host-lab/install.sh'
 ```bash
 ssh root@<vps> 'P2S_AGENT_CONF=/etc/php2shell/agent.conf /usr/local/bin/p2s-agent.sh \
     pair --server http://127.0.0.1:8000 --chatid <chat-id-group>'
-# -> bot gửi yêu cầu vào group → nhắn /confirm trong group
+# -> ghép nối TỰ ĐỘNG; bot nhắn 1 tin xác nhận vào group (không cần /confirm)
 ```
 
 ## Vận hành hằng ngày

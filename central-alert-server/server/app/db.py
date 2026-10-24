@@ -95,8 +95,19 @@ CREATE TABLE IF NOT EXISTS alert_hits (
     ts_utc TEXT
 );
 
+CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    key_hash TEXT UNIQUE NOT NULL,          -- sha256(api_key); mỗi lần pair CẤP THÊM key,
+    label TEXT,                             -- key cũ vẫn sống: 1000 máy = 1000 key song song
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE INDEX IF NOT EXISTS idx_pairing_project ON pairing_codes(project_id);
 CREATE INDEX IF NOT EXISTS idx_devices_project ON devices(project_id);
+CREATE INDEX IF NOT EXISTS idx_keys_project    ON api_keys(project_id, active);
 CREATE INDEX IF NOT EXISTS idx_alerts_project  ON alerts(project_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_alerts_device   ON alerts(device_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity, id DESC);
@@ -165,6 +176,18 @@ def init_db(path: str) -> None:
             else:
                 conn.execute("DROP TABLE alerts_log")
         conn.executescript(SCHEMA)
+        # Migrate (một lần, idempotent): key duy nhất cũ trên projects ->
+        # thành 1 row trong api_keys; từ đó mỗi lần pair cấp thêm key mới.
+        conn.execute(
+            """
+            INSERT INTO api_keys (project_id, key_hash, label, created_at)
+            SELECT p.id, p.api_key_hash, 'legacy', ?
+            FROM projects p
+            WHERE p.api_key_hash IS NOT NULL AND p.status = 'linked'
+              AND NOT EXISTS (SELECT 1 FROM api_keys k WHERE k.project_id = p.id)
+            """,
+            (iso(),),
+        )
 
 
 # ---------------------------------------------------------------- telegram chat id
@@ -189,14 +212,14 @@ def create_project(db_path: str, name: str, telegram_chat_id: Optional[str] = No
     (luồng chat-id pairing). Trạng thái pending cho tới khi chat đó /confirm.
 
     Idempotent theo (tên, chat): pair lại cùng tên về cùng một chat TÁI DỤNG
-    row cũ (pending hoặc linked) — không bao giờ tạo row trùng tên khiến /list
-    hiện một dự án hai lần và thiết bị bị xé lẻ sang row mới."""
+    row cũ bất kể trạng thái (pending/linked/disabled) — không bao giờ tạo row
+    trùng tên khiến /list hiện một dự án hai lần."""
     with _WRITE_LOCK, connect(db_path) as conn:
         if telegram_chat_id is not None:
             row = conn.execute(
                 "SELECT id FROM projects"
                 " WHERE project_name = ? AND telegram_chat_id = ?"
-                "   AND status IN ('pending', 'linked') ORDER BY id LIMIT 1",
+                " ORDER BY id LIMIT 1",
                 (name, str(telegram_chat_id)),
             ).fetchone()
             if row is not None:
@@ -235,9 +258,18 @@ def get_project(db_path: str, project_id: int) -> Optional[sqlite3.Row]:
 
 
 def project_by_api_key_hash(db_path: str, key_hash: str) -> Optional[sqlite3.Row]:
-    with connect(db_path) as conn:
+    """Auth theo bảng api_keys (nhiều key song song/dự án); cập nhật last_used."""
+    with _WRITE_LOCK, connect(db_path) as conn:
+        conn.execute(
+            "UPDATE api_keys SET last_used_at = ? WHERE key_hash = ? AND active = 1",
+            (iso(), key_hash),
+        )
         return conn.execute(
-            "SELECT * FROM projects WHERE api_key_hash = ? AND status = 'linked'",
+            """
+            SELECT p.* FROM api_keys k
+            JOIN projects p ON p.id = k.project_id
+            WHERE k.key_hash = ? AND k.active = 1 AND p.status = 'linked'
+            """,
             (key_hash,),
         ).fetchone()
 
@@ -248,7 +280,8 @@ def count_projects(db_path: str) -> int:
 
 
 def projects_by_chat(db_path: str, chat_id: str) -> list[sqlite3.Row]:
-    """Mọi project đã ghép với MỘT chat Telegram — một người, nhiều server/dự án."""
+    """Mọi project ĐANG GHÉP với MỘT chat Telegram — một người, nhiều server/dự án.
+    Chỉ status='linked': dự án đã /unlink không hiện trong /list."""
     with connect(db_path) as conn:
         return conn.execute(
             """
@@ -257,7 +290,7 @@ def projects_by_chat(db_path: str, chat_id: str) -> list[sqlite3.Row]:
                    (SELECT MAX(a.received_at) FROM alerts a WHERE a.project_id = p.id)
                        AS last_alert_at
             FROM projects p
-            WHERE p.telegram_chat_id = ? AND p.status != 'pending'
+            WHERE p.telegram_chat_id = ? AND p.status = 'linked'
             ORDER BY p.linked_at
             """,
             (str(chat_id),),
@@ -322,7 +355,12 @@ class PairingError(Exception):
         self.reason = reason
 
 
-def complete_pairing(db_path: str, code: str, chat_id: str, gen_api_key, key_hash) -> dict:
+def auto_link_code(db_path: str, code: str, gen_api_key, key_hash,
+                   device_label: str = "") -> dict:
+    """Ghép nối TỰ ĐỘNG (không /confirm): dùng code ngay khi script đăng ký,
+    cấp THÊM một API key mới vào api_keys (các key cũ vẫn sống). Trả về
+    newly_linked=True khi đây là lần liên kết đầu của dự án với chat (để bot
+    chỉ thông báo 1 tin cho dự án mới, re-pair im lặng)."""
     now = iso()
     with _WRITE_LOCK, connect(db_path) as conn:
         row = conn.execute(
@@ -338,19 +376,38 @@ def complete_pairing(db_path: str, code: str, chat_id: str, gen_api_key, key_has
         exp = parse_iso(row["_expires"])
         if exp is None or exp < utcnow():
             raise PairingError("Mã đã hết hạn (sống 10 phút). Hãy tạo mã mới.")
+        newly_linked = row["status"] != "linked"
         api_key = gen_api_key()
-        already_linked = row["status"] == "linked" and row["api_key_hash"] is not None
+        if newly_linked:
+            conn.execute(
+                "UPDATE projects SET status = 'linked', linked_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
         conn.execute(
-            "UPDATE projects SET telegram_chat_id = ?, status = 'linked',"
-            " api_key_hash = ?, linked_at = ? WHERE id = ?",
-            (str(chat_id), key_hash(api_key), now, row["id"]),
+            "INSERT INTO api_keys (project_id, key_hash, label, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (row["id"], key_hash(api_key), (device_label or "")[:64], now),
         )
         conn.execute(
             "UPDATE pairing_codes SET used_at = ?, api_key_plain = ? WHERE code = ?",
             (now, api_key, code.upper()),
         )
         return {"project_id": row["id"], "project_name": row["project_name"],
-                "api_key": api_key, "already_linked": already_linked}
+                "api_key": api_key, "newly_linked": newly_linked}
+
+
+def unlink_project(db_path: str, project_name: str, chat_id: str) -> Optional[str]:
+    """/unlink: ngắt một dự án khỏi chat (status=disabled — alert dừng gửi,
+    lịch sử giữ nguyên). Trả về tên dự án đã ngắt, None nếu không tìm thấy."""
+    with _WRITE_LOCK, connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE projects SET status = 'disabled'"
+            " WHERE project_name = ? AND telegram_chat_id = ? AND status = 'linked'",
+            (project_name, str(chat_id)),
+        )
+        if cur.rowcount:
+            return project_name
+        return None
 
 
 def pairing_status(db_path: str, code: str) -> Optional[dict]:

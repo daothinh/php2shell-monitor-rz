@@ -31,7 +31,7 @@ Modes:
   once       Run a single batch now (same work the supervisor does every 5 min)
   run        Start the background supervisor (batch every BATCH_INTERVAL, default 300s)
   (mặc định) Chạy không arg → wizard tương tác, hỏi từng bước:
-             TÊN DỰ ÁN → Chat ID → /confirm trên Telegram.
+             TÊN DỰ ÁN → Chat ID → ghép nối TỰ ĐỘNG (không /confirm).
                sudo php2shell-monitor.sh
              Automation (không hỏi): tên dự án đứng đầu hoặc --project,
              --chatid truyền sẵn, --server ghi đè mặc định

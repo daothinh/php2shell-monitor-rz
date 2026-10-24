@@ -53,15 +53,19 @@ def env(tmp_path):
 
 
 def _project_with_key(cfg, chat_id="12345", name="khach-hang-a"):
-    pid = db.create_project(cfg.database_path, name)
     from app.security import gen_api_key, sha256_hex
 
+    pid = db.create_project(cfg.database_path, name, telegram_chat_id=str(chat_id))
     key = gen_api_key()
     with db.connect(cfg.database_path) as conn:
         conn.execute(
-            "UPDATE projects SET status='linked', telegram_chat_id=?, api_key_hash=?"
-            " WHERE id=?",
-            (chat_id, sha256_hex(key), pid),
+            "UPDATE projects SET status='linked', linked_at=? WHERE id=?",
+            (db.iso(), pid),
+        )
+        conn.execute(
+            "INSERT INTO api_keys (project_id, key_hash, label, created_at)"
+            " VALUES (?, ?, 'test', ?)",
+            (pid, sha256_hex(key), db.iso()),
         )
     return pid, key
 
@@ -380,19 +384,6 @@ def _msg(chat_id, text):
     return {"message": {"chat": {"id": chat_id}, "text": text}}
 
 
-def test_bot_two_servers_one_confirm(env):
-    """Một chat ghép 2 server: register-chatid x2 (cùng chat) -> 1 /confirm ghép cả hai."""
-    client, cfg, tg = env
-    bot = _bot(cfg, tg)
-    chat = 8001
-
-    _register_chatid(client, "web-cluster", chat)
-    _register_chatid(client, "db-cluster", chat)
-    asyncio.run(bot.handle_update(_msg(chat, "/confirm")))
-    assert "2 server" in tg.sent[-1][1]
-    assert len(db.projects_by_chat(cfg.database_path, str(chat))) == 2
-
-
 def test_bot_add_new_id_is_gone(env):
     """/add_new_id đã bị bỏ — không còn trong menu và không còn xử lý riêng."""
     _, cfg, tg = env
@@ -427,9 +418,10 @@ def test_bot_help_mentions_commands(env):
     asyncio.run(bot.handle_update(_msg(8003, "/help")))
     text = tg.sent[-1][1]
     assert "/list" in text and "/id" in text
-    assert "/confirm" in text and "Chat ID" in text
-    assert "/add_new_id" not in text  # lệnh đã bỏ
-    assert "≡" in text and "3 bước" in text  # gợi ý menu + luồng ghép nối
+    assert "/unlink" in text and "Chat ID" in text
+    assert "/confirm" not in text          # luồng confirm đã bỏ
+    assert "/add_new_id" not in text       # lệnh đã bỏ
+    assert "≡" in text and "2 bước" in text  # gợi ý menu + luồng tự động
 
 
 def test_bot_welcome_on_start(env):
@@ -448,24 +440,24 @@ def test_bot_command_menu_is_valid():
     assert len(cmds) == len(set(cmds))
     for c in cmds:
         assert re.fullmatch(r"[a-z0-9_]{1,32}", c), c
-    for expected in ("start", "help", "id", "confirm", "list"):
+    for expected in ("start", "help", "id", "unlink", "list"):
         assert expected in cmds, expected
 
 
 def test_bot_sec_code_fallback_is_removed(env):
     """Fallback mã SEC-<UUID> đã bỏ: gửi mã KHÔNG ghép nối được gì, bot trả
-    thông báo đã ngừng và hướng dẫn luồng Chat ID."""
+    thông báo đã ngừng và hướng dẫn luồng Chat ID (giờ tự động, không /confirm)."""
     client, cfg, tg = env
     bot = _bot(cfg, tg)
     chat = 8004
-    # tạo một pending chat-id cho chat khác; gửi mã internal của nó cho bot
     res = _register_chatid(client, "gamma", 777)
     pair_ref = res["pair_ref"]
     asyncio.run(bot.handle_update(_msg(chat, pair_ref)))
     assert "ngừng sử dụng" in tg.sent[-1][1]
-    assert "/id" in tg.sent[-1][1] and "/confirm" in tg.sent[-1][1]
-    # không có project nào bị link qua đường mã
-    assert db.pairing_status(cfg.database_path, pair_ref)["status"] == "pending"
+    assert "/id" in tg.sent[-1][1] and "tự động" in tg.sent[-1][1]
+    # gửi mã cho bot không đổi gì trạng thái ghép nối
+    st = db.pairing_status(cfg.database_path, pair_ref)
+    assert st["status"] == "linked"          # auto-link từ lúc register
     assert len(db.projects_by_chat(cfg.database_path, str(chat))) == 0
 
 
@@ -473,62 +465,93 @@ def test_bot_sec_code_fallback_is_removed(env):
 GROUP = -1001234567890
 
 
-def _register_chatid(client, name, chat_id):
-    r = client.post("/api/v1/register-chatid", json={
-        "project_name": name, "chat_id": str(chat_id)})
+def _register_chatid(client, name, chat_id, device=None):
+    body = {"project_name": name, "chat_id": str(chat_id)}
+    if device:
+        body["device"] = device
+    r = client.post("/api/v1/register-chatid", json=body)
     assert r.status_code == 200, r.text
     return r.json()
 
 
-def test_register_chatid_group_flow_and_confirm(env):
-    """Luồng đầy đủ: script đăng ký chat GROUP -> bot notify vào đúng chat ->
-    /confirm -> linked, api_key tiết lộ qua pairing-status."""
+def test_bot_two_servers_one_confirm(env):
+    """(di sản tên hàm) 2 register cùng chat: mỗi dự án 1 tin tự động ghép."""
+    client, cfg, tg = env
+    bot = _bot(cfg, tg)
+    chat = 8001
+
+    _register_chatid(client, "web-cluster", chat)
+    _register_chatid(client, "db-cluster", chat)
+    notifies = [t for _, t in tg.sent if "tự động ghép nối" in t]
+    assert len(notifies) == 2
+    assert len(db.projects_by_chat(cfg.database_path, str(chat))) == 2
+
+
+def test_register_chatid_group_auto_link(env):
+    """Luồng đầy đủ KHÔNG /confirm: script đăng ký chat GROUP -> server ghép nối
+    + cấp key NGAY (pairing-status trả linked ngay) -> bot nhắn 1 tin xác nhận
+    vào đúng chat kèm /unlink."""
     client, cfg, tg = env
     res = _register_chatid(client, "web01", GROUP)
     assert res["pair_ref"].startswith("SEC-")
     assert res["chat_id"] == str(GROUP)
+    assert res["auto_linked"] is True
     assert res["warning"] is None
-    # bot đã chủ động gửi yêu cầu /confirm vào đúng chat đích
+    # key có ngay ở lần poll đầu — không cần chờ ai đó /confirm
+    st = client.get(f"/api/v1/pairing-status?code={res['pair_ref']}").json()
+    assert st["status"] == "linked" and st.get("api_key", "").startswith("p2s_")
+    # bot nhắn đúng 1 tin xác nhận (kèm /unlink để tự vệ)
     assert tg.sent and tg.sent[0][0] == str(GROUP)
-    assert "Yêu cầu ghép nối mới" in tg.sent[0][1]
-    assert "web01" in tg.sent[0][1]
-
-    bot = _bot(cfg, tg)
-    # pending: status chưa linked
-    st = client.get(f"/api/v1/pairing-status?code={res['pair_ref']}").json()
-    assert st["status"] == "pending"
-
-    asyncio.run(bot.handle_update(_msg(GROUP, "/confirm")))
-    assert "Ghép nối thành công" in tg.sent[-1][1]
-    st = client.get(f"/api/v1/pairing-status?code={res['pair_ref']}").json()
-    assert st["status"] == "linked" and st.get("api_key")
+    assert "tự động ghép nối" in tg.sent[0][1]
+    assert "web01" in tg.sent[0][1] and "/unlink web01" in tg.sent[0][1]
 
 
-def test_confirm_links_multiple_servers_one_chat(env):
-    """Một GROUP nhận alert của nhiều server: 2 lần register -> 1 /confirm ghép cả hai."""
+def test_multiple_servers_one_chat_auto_linked(env):
+    """Một GROUP nhận alert của nhiều server: 2 lần register -> mỗi dự án 1 tin
+    bot, cả hai key dùng được ngay, /list hiện đủ 2."""
     client, cfg, tg = env
     r1 = _register_chatid(client, "alpha", GROUP)
     r2 = _register_chatid(client, "beta", GROUP)
-    bot = _bot(cfg, tg)
-    asyncio.run(bot.handle_update(_msg(GROUP, "/confirm")))
-    text = tg.sent[-1][1]
-    assert "2 server" in text and "alpha" in text and "beta" in text
     for r in (r1, r2):
         st = client.get(f"/api/v1/pairing-status?code={r['pair_ref']}").json()
         assert st["status"] == "linked" and st.get("api_key")
+    notifies = [t for _, t in tg.sent if "tự động ghép nối" in t]
+    assert len(notifies) == 2
     assert len(db.projects_by_chat(cfg.database_path, str(GROUP))) == 2
 
 
-def test_confirm_rejects_other_chat_and_empty(env):
-    """/confirm từ chat KHÁC không leak; chat không có pending được báo rõ."""
+def test_confirm_is_now_an_explainer(env):
+    """/confirm không còn tác dụng (tự động rồi): bot trả lời giải thích, mọi
+    chat đều nhận cùng thông điệp, không leak gì của chat khác."""
     client, cfg, tg = env
     _register_chatid(client, "secret-server", GROUP)
     bot = _bot(cfg, tg)
     asyncio.run(bot.handle_update(_msg(999111, "/confirm")))   # chat khác
-    assert "Không có yêu cầu" in tg.sent[-1][1]
-    st = db.pairing_status(cfg.database_path,
-                           db.pending_codes_by_chat_id(cfg.database_path, str(GROUP))[0]["code"])
-    assert st["status"] == "pending"   # vẫn chờ, chưa bị chat lạ confirm
+    assert "TỰ ĐỘNG" in tg.sent[-1][1]
+    assert "secret-server" not in tg.sent[-1][1]
+
+
+def test_unlink_stops_alerts_for_project(env):
+    """/unlink <tên>: dự án rời /list, key bị từ chối (401) — dừng spam alert."""
+    client, cfg, tg = env
+    bot = _bot(cfg, tg)
+    chat = 8012
+    r = _register_chatid(client, "victim", chat)
+    key = client.get(f"/api/v1/pairing-status?code={r['pair_ref']}").json()["api_key"]
+
+    asyncio.run(bot.handle_update(_msg(chat, "/unlink victim")))
+    assert "Đã ngắt" in tg.sent[-1][1]
+    assert len(db.projects_by_chat(cfg.database_path, str(chat))) == 0
+
+    a = _alert(batch="20261024T000200Z")
+    a["device"] = a["host"] = "web01"
+    resp = client.post("/api/v1/ingest-log", headers={"X-API-Key": key},
+                       json={"host": "web01", "alerts": [a]})
+    assert resp.status_code == 401  # dự án disabled -> key không còn hiệu lực
+
+    # /unlink tên sai / thiếu tên: báo lỗi có hướng dẫn
+    asyncio.run(bot.handle_update(_msg(chat, "/unlink khong-ton-tai")))
+    assert "Không tìm thấy" in tg.sent[-1][1]
 
 
 def test_register_chatid_validates_input(env):
@@ -546,53 +569,51 @@ def test_bot_id_command_replies_chat_id(env):
     assert "8005354626" in tg.sent[-1][1]
 
 
-def test_plain_message_hints_pending_confirm(env):
-    """Tin nhắn thường trong chat có pending -> nhắc /confirm."""
+def test_plain_message_falls_back_to_help(env):
+    """Tin nhắn thường -> help (không còn khái niệm pending/confirm)."""
     client, cfg, tg = env
     _register_chatid(client, "hinted", 4242)
     bot = _bot(cfg, tg)
     asyncio.run(bot.handle_update(_msg(4242, "hello")))
-    assert "/confirm" in tg.sent[-1][1]
+    assert "Trợ giúp" in tg.sent[-1][1] or "Chào mừng" in tg.sent[-1][1]
 
 
-def test_repair_same_project_reuses_row_and_rotates_key(env):
-    """Pair lại cùng tên về cùng chat: TÁI DỤNG row dự án (không còn trùng tên
-    trong /list, thiết bị không bị xé sang row mới); API key bị XOAY — key cũ
-    chết, key mới gửi được, bot cảnh báo rõ việc xoay key."""
+def test_repair_same_project_adds_key_silently(env):
+    """Pair lại cùng tên về cùng chat (thêm máy): TÁI DỤNG row dự án, CẤP THÊM
+    key mới — key cũ VẪN SỐNG (1000 máy = 1000 key song song), bot KHÔNG nhắn
+    thêm tin nào (re-pair im lặng, không spam chat)."""
     client, cfg, tg = env
-    bot = _bot(cfg, tg)
     chat = 8010
 
-    # lần 1: pair + confirm -> linked, lấy key
-    r1 = _register_chatid(client, "bruh", chat)
-    asyncio.run(bot.handle_update(_msg(chat, "/confirm")))
+    # lần 1: pair -> auto-link, key1; đúng 1 tin bot (dự án mới)
+    r1 = _register_chatid(client, "bruh", chat, device="may1")
     key1 = client.get(f"/api/v1/pairing-status?code={r1['pair_ref']}").json()["api_key"]
+    assert len(tg.sent) == 1
 
-    # lần 2: pair lại CÙNG TÊN, cùng chat -> không được tạo row mới
-    r2 = _register_chatid(client, "bruh", chat)
+    # lần 2: pair lại CÙNG TÊN, cùng chat (máy 2) -> key2, im lặng
+    r2 = _register_chatid(client, "bruh", chat, device="may2")
     assert r2["pair_ref"] != r1["pair_ref"]
-    asyncio.run(bot.handle_update(_msg(chat, "/confirm")))
     key2 = client.get(f"/api/v1/pairing-status?code={r2['pair_ref']}").json()["api_key"]
     assert key2 and key2 != key1
+    assert len(tg.sent) == 1  # KHÔNG tin bot nào thêm
 
-    # đúng 1 row dự án tên này cho chat; /list không còn hiện trùng
+    # đúng 1 row dự án; /list không trùng
     rows = db.projects_by_chat(cfg.database_path, str(chat))
     assert len(rows) == 1 and rows[0]["project_name"] == "bruh"
 
-    # tin nhắn confirm lần 2 phải cảnh báo dự án đã ghép từ trước (key xoay)
-    assert "đã ghép từ trước" in tg.sent[-1][1]
-
-    # key mới ingest được; key cũ bị từ chối; cùng device vẫn là MỘT row
+    # CẢ HAI key cùng gửi được (multi-key); device đếm đúng
     a = _alert(batch="20261024T000100Z")
     a["device"] = a["host"] = "web01"
-    ok = client.post("/api/v1/ingest-log", headers={"X-API-Key": key2},
+    ok = client.post("/api/v1/ingest-log", headers={"X-API-Key": key1},
                      json={"host": "web01", "alerts": [a]})
     assert ok.status_code == 200, ok.text
-    stale = client.post("/api/v1/ingest-log", headers={"X-API-Key": key1},
-                        json={"host": "web01", "alerts": [a]})
-    assert stale.status_code == 401
+    a2 = _alert(batch="20261024T000101Z")
+    a2["device"] = a2["host"] = "web02"
+    ok2 = client.post("/api/v1/ingest-log", headers={"X-API-Key": key2},
+                      json={"host": "web02", "alerts": [a2]})
+    assert ok2.status_code == 200, ok2.text
     rows = db.projects_by_chat(cfg.database_path, str(chat))
-    assert rows[0]["device_count"] == 1  # web01 chỉ 1 lần, không nhân đôi
+    assert rows[0]["device_count"] == 2  # web01 + web02, không nhân đôi
 
 
 def test_repair_same_name_different_chat_creates_separate_project(env):
