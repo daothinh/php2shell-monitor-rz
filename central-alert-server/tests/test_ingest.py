@@ -249,8 +249,8 @@ def test_telegram_message_matches_compact_template(env):
     lines = text.split("\n")
     assert len(lines) == 4, text
     assert lines[0] == "🛡 <b>Central Security Alert</b> - 24/10/2026"
-    # CRITICAL wins over the HIGH hit; P2S-020 has 2 hits vs P2S-010's 1
-    assert lines[1].startswith("🚨 <b>CRITICAL</b> · Webroot bị ghi/thay đổi file")
+    # CRITICAL wins over the HIGH hit; P2S-020 (RCE_RULES) sets the RCE headline
+    assert lines[1].startswith("🚨 <b>CRITICAL</b> · <b>Server bị chiếm quyền (RCE)</b>")
     assert "3 hit / 5 phút" in lines[1]
     assert lines[2] == "📦 Dự án: <b>khach-hang-a</b>"
     assert lines[3] == "🖥 <b>web01</b> / 10.0.0.15"

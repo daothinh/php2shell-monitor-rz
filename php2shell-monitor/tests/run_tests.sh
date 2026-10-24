@@ -47,7 +47,7 @@ T "parser: method"        "POST"         "$(printf '%s' "$out" | cut -f6)"
 T "parser: uri marker"    "PHP_SESSION_UPLOAD_PROGRESS" "$(printf '%s' "$out" | cut -f7)"
 T "parser: file recorded" "mal_access_upload_progress.log" "$(printf '%s' "$out" | cut -f3)"
 T "parser: line recorded" "1"            "$(printf '%s' "$out" | cut -f4)"
-T "parser: raw line kept" 'POST /index.php' "$(printf '%s' "$out" | cut -f11)"
+T "parser: raw line kept" 'POST /upload.php' "$(printf '%s' "$out" | cut -f11)"
 
 out=$(awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_access_php2shell_ua.log")
 T "parser: ua" "php2shell-109619" "$(printf '%s' "$out" | cut -f9)"
