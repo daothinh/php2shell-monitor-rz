@@ -75,7 +75,7 @@ json_escape() { # chuỗi -> chuỗi JSON an toàn (không có dấu " \ và con
 }
 
 load_conf() {
-  [[ -r $CONF_PATH ]] || die "chưa ghép nối — chạy: sudo bash php2shell-monitor.sh -- pair --server <url>"
+  [[ -r $CONF_PATH ]] || die "chưa ghép nối — chạy: sudo php2shell-monitor.sh --chatid <chat-id> (server trung tâm đã cấu hình sẵn)"
   # shellcheck disable=SC1090
   source "$CONF_PATH"
   [[ ${SERVER_URL:-} =~ ^https?:// ]] || die "SERVER_URL trong conf không hợp lệ"
@@ -106,6 +106,10 @@ start_agent() { # spawn the forwarder unless it is already running
 # trong response của register-chatid và sẽ ghi đè giá trị này.
 P2S_BOT=${P2S_BOT:-@p2shell_bot}
 
+# Server trung tâm mặc định — main.sh tự inject; dùng trực tiếp central.sh
+# cũng chạy được luôn (override: --server / P2S_DEFAULT_SERVER).
+P2S_DEFAULT_SERVER=${P2S_DEFAULT_SERVER:-http://45.124.93.136:8000}
+
 cmd_pair() {
   local server='' chatid='' detach=0
   while [[ $# -gt 0 ]]; do
@@ -113,9 +117,10 @@ cmd_pair() {
       --server) server=${2:?}; shift 2 ;;
       --chatid) chatid=${2:?}; shift 2 ;;
       --detach) detach=1; shift ;;
-      *) die "tham số không hợp lệ: $1 (pair --server <url> [--chatid <id>])" ;;
+      *) die "tham số không hợp lệ: $1 (pair [--server <url>] [--chatid <id>])" ;;
     esac
   done
+  server=${server:-$P2S_DEFAULT_SERVER}
   [[ $server =~ ^https?:// ]] || die "--server phải là URL http(s)://..."
   local proj=$PROJECT
   local bot=$P2S_BOT botlink="https://t.me/${P2S_BOT#@}"
@@ -389,5 +394,5 @@ case ${1:-help} in
   pair)  shift; cmd_pair "$@" ;;
   agent) cmd_agent ;;
   test)  cmd_test ;;
-  *) die "central.sh {pair --server <url>} | agent | test" ;;
+  *) die "central.sh {pair [--server <url>]} | agent | test" ;;
 esac
