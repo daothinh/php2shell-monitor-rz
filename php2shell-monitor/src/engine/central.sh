@@ -129,30 +129,15 @@ cmd_pair() {
   cat <<EOF
 
 ╔══════════════════════════════════════════════════════════════╗
-║   🛡  GHÉP NỐI SERVER VỚI TELEGRAM ALERT — HƯỚNG DẪN        ║
+║   🛡  GHÉP NỐI TELEGRAM ALERT                               ║
 ╚══════════════════════════════════════════════════════════════╝
  Dự án        :  $proj   (device: $DEVICE)
- Bot hệ thống :  $bot
- Mở nhanh     :  $botlink
 
- Bạn sẽ làm 3 bước (khoảng 1 phút):
+ BƯỚC 1 — Lấy Chat ID: mở $botlink → nhắn /id → copy dãy số
 
- BƯỚC 1️⃣ — Lấy Chat ID trên Telegram
-   • Mở $botlink  → nhấn  START  (bắt buộc nếu chưa từng nhấn)
-   • Nhắn cho bot:   /id
-   • Bot trả lời kèm  🆔 Chat ID  → copy dãy số đó
-   💡 Chat riêng của bạn: số DƯƠNG  (ví dụ  812345678)
-   💡 Muốn CẢ TEAM cùng nhận alert: thêm bot vào group Telegram,
-      rồi nhắn /id ngay trong group — Chat ID group là số ÂM
-      (ví dụ  -1001234567890)
+ BƯỚC 2 — Nhập Chat ID ở dòng bên dưới
 
- BƯỚC 2️⃣ — Nhập Chat ID vào dòng script sẽ hỏi ngay bên dưới
-
- BƯỚC 3️⃣ — Xác nhận trên Telegram
-   • Bot gửi  "🔔 Yêu cầu ghép nối mới"  vào đúng chat của bạn
-   • Bạn nhắn:   /confirm
-   • Thấy  "✅ Ghép nối thành công"  là HOÀN TẤT — script dưới đây
-     tự nhận API key và lưu cấu hình, bạn không phải gõ gì thêm.
+ BƯỚC 3 — Khi bot gửi yêu cầu ghép nối vào chat, nhắn: /confirm
 
 ────────────────────────────────────────────────────────────────
 EOF
@@ -195,15 +180,7 @@ EOF
 
   cat <<EOF
 
-────────────────────────────────────────────────────────────────
- BƯỚC 3️⃣ — Bây giờ trên Telegram:
-   1. Vào chat có ID  $chatid
-   2. Nhắn:   /confirm
-   3. Chờ bot trả lời "✅ Ghép nối thành công"
-
-⏳ Đang chờ bạn /confirm (tối đa $(( (PAIR_TIMEOUT + 59) / 60 )) phút, Ctrl+C để huỷ)...
-────────────────────────────────────────────────────────────────
-
+⏳ Đang chờ /confirm trong Telegram chat $chatid (tối đa $(( (PAIR_TIMEOUT + 59) / 60 )) phút)...
 EOF
 
   local i st status api_key elapsed
@@ -224,27 +201,16 @@ EOF
 ╔══════════════════════════════════════════════════════════════╗
 ║   ✅  GHÉP NỐI THÀNH CÔNG!                                  ║
 ╚══════════════════════════════════════════════════════════════╝
- Cấu hình đã lưu:  $CONF_PATH   (chỉ root đọc được)
- Từ giờ mọi alert bảo mật của server này sẽ về Telegram chat $chatid.
-
- BƯỚC TIẾP THEO — kiểm tra & chạy thật:
-   1) Gửi alert thử (xem Telegram có nhận không):
-        sudo bash php2shell-monitor.sh -- test
+ Alert bảo mật của server này sẽ về Telegram chat $chatid.
 EOF
       local spid
       spid=$(supervisor_pid)
       if ((detach)) || { [[ $spid =~ ^[0-9]+$ ]] && ((spid > 0)) && \
                          kill -0 "$spid" 2>/dev/null; }; then
         start_agent
-        cat <<EOF
-   2) Agent đẩy alert đã chạy — log: $P2S_DEVICE_RUN_DIR/agent.log
-   3) Trên Telegram, nhắn  /list  cho $bot để xem các server đang quản lý.
-EOF
       else
         cat <<EOF
-   2) Chạy thường trực để đẩy alert tự động:
-        sudo bash php2shell-monitor.sh -- run
-   3) Trên Telegram, nhắn  /list  cho $bot để xem các server đang quản lý.
+ Chạy thường trực:  sudo bash php2shell-monitor.sh -- run
 EOF
       fi
       return 0
