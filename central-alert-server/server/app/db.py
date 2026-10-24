@@ -196,6 +196,23 @@ def count_projects(db_path: str) -> int:
         return conn.execute("SELECT COUNT(*) AS n FROM projects").fetchone()["n"]
 
 
+def projects_by_chat(db_path: str, chat_id: str) -> list[sqlite3.Row]:
+    """Mọi project đã ghép với MỘT chat Telegram — một người, nhiều server/dự án."""
+    with connect(db_path) as conn:
+        return conn.execute(
+            """
+            SELECT p.id, p.project_name, p.status, p.linked_at,
+                   (SELECT COUNT(*) FROM devices d WHERE d.project_id = p.id) AS device_count,
+                   (SELECT MAX(a.received_at) FROM alerts a WHERE a.project_id = p.id)
+                       AS last_alert_at
+            FROM projects p
+            WHERE p.telegram_chat_id = ? AND p.status != 'pending'
+            ORDER BY p.linked_at
+            """,
+            (str(chat_id),),
+        ).fetchall()
+
+
 # ---------------------------------------------------------------- devices
 
 def upsert_device(db_path: str, project_id: int, device_name: str) -> int:

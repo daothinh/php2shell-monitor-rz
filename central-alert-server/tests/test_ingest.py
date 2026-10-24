@@ -364,3 +364,93 @@ def test_read_token_disabled_when_unset(env):
     cfg.read_token = ""
     _project_with_key(cfg)
     assert client.get("/api/v1/devices", headers={"X-Read-Token": ""}).status_code == 401
+
+
+# ------------------------------------------------------------ bot commands
+import asyncio  # noqa: E402
+
+from app.telegram import PairingBot  # noqa: E402
+
+
+def _bot(cfg, tg):
+    return PairingBot(cfg, tg, cfg.database_path)
+
+
+def _msg(chat_id, text):
+    return {"message": {"chat": {"id": chat_id}, "text": text}}
+
+
+def _pending_code(cfg, name, code):
+    """Tạo project pending + mã pairing cố định (giống agent chạy pair)."""
+    pid = db.create_project(cfg.database_path, name)
+    db.issue_pairing_code(cfg.database_path, pid, 600, lambda: code)
+    return pid
+
+
+UUID1 = "3F2504E0-4F89-41D3-9A0C-0305E82C3301"
+UUID2 = "9B8A7C6D-5E4F-43B2-A1C0-D2E3F4A5B6C7"
+
+
+def test_bot_add_new_id_then_pair_two_servers(env):
+    """Một người (một chat) ghép 2 server: /add_new_id -> code 1, /add_new_id -> code 2."""
+    _, cfg, tg = env
+    bot = _bot(cfg, tg)
+    chat = 8001
+
+    asyncio.run(bot.handle_update(_msg(chat, "/add_new_id")))
+    assert str(chat) in bot._awaiting
+    assert "Thêm server mới" in tg.sent[-1][1]
+
+    # nhầm lẫn gì đó trong lúc chờ mã -> bot nhắc đang chờ
+    asyncio.run(bot.handle_update(_msg(chat, "hello")))
+    assert "Đang chờ mã" in tg.sent[-1][1]
+
+    # server 1
+    _pending_code(cfg, "web-cluster", f"SEC-{UUID1}")
+    asyncio.run(bot.handle_update(_msg(chat, f"SEC-{UUID1}")))
+    assert "Ghép nối thành công" in tg.sent[-1][1]
+    assert "2 dự án" not in tg.sent[-1][1] or "1 dự án" in tg.sent[-1][1]
+    assert str(chat) not in bot._awaiting  # hết trạng thái chờ sau khi pair
+
+    # server 2 — /add_new_id lần nữa, cùng chat
+    asyncio.run(bot.handle_update(_msg(chat, "/add_new_id@php2shell_alert_bot")))
+    _pending_code(cfg, "db-cluster", f"SEC-{UUID2}")
+    asyncio.run(bot.handle_update(_msg(chat, f"SEC-{UUID2}")))
+    assert "2 dự án" in tg.sent[-1][1]
+
+
+def test_bot_list_shows_all_servers_of_one_chat(env):
+    _, cfg, tg = env
+    bot = _bot(cfg, tg)
+    chat = 8002
+
+    asyncio.run(bot.handle_update(_msg(chat, "/list")))
+    assert "Chưa có server" in tg.sent[-1][1]
+
+    for name, u in (("alpha", UUID1), ("beta", UUID2)):
+        _pending_code(cfg, name, f"SEC-{u}")
+        asyncio.run(bot.handle_update(_msg(chat, f"SEC-{u}")))
+
+    asyncio.run(bot.handle_update(_msg(chat, "/list")))
+    text = tg.sent[-1][1]
+    assert "2" in text and "alpha" in text and "beta" in text
+
+
+def test_bot_help_mentions_commands(env):
+    _, cfg, tg = env
+    bot = _bot(cfg, tg)
+    asyncio.run(bot.handle_update(_msg(8003, "/start")))
+    text = tg.sent[-1][1]
+    assert "/add_new_id" in text and "/list" in text and "nhiều server" in text
+
+
+def test_bot_wrong_code_does_not_create_awaiting_leak(env):
+    """Mã sai vẫn qua attempt-guard; mã đúng sau đó vẫn pair được bình thường."""
+    _, cfg, tg = env
+    bot = _bot(cfg, tg)
+    chat = 8004
+    asyncio.run(bot.handle_update(_msg(chat, f"SEC-{UUID1}")))  # không tồn tại
+    assert "thất bại" in tg.sent[-1][1].lower()
+    _pending_code(cfg, "gamma", f"SEC-{UUID2}")
+    asyncio.run(bot.handle_update(_msg(chat, f"SEC-{UUID2}")))
+    assert "Ghép nối thành công" in tg.sent[-1][1]
