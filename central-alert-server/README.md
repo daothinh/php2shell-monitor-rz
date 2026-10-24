@@ -109,6 +109,8 @@ ALERT_RETENTION_DAYS=90
 ### 3.2. Ghép nối theo Chat ID — chat riêng HOẶC group
 
 > Nhánh `feature/chatid-pairing`: pairing theo **Chat ID** thay vì mã `SEC-<UUID>` — alert đi được về **chat riêng của một user hoặc cả group** (cả team cùng nhận).
+>
+> Bot chính thức của hệ thống: **@p2shell_bot** (script `pair` in sẵn link và hướng dẫn từng bước).
 
 Bot **tự đăng ký menu lệnh** (nút **≡** / gõ `/`) khi khởi động.
 

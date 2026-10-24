@@ -84,6 +84,10 @@ EOF
 }
 
 # ============================================================ pair
+# Bot hệ thống (hiển thị trong hướng dẫn); server có thể trả tên bot thật
+# trong response của register-chatid và sẽ ghi đè giá trị này.
+P2S_BOT=${P2S_BOT:-@p2shell_bot}
+
 cmd_pair() {
   local server= chatid=
   while [[ $# -gt 0 ]]; do
@@ -95,48 +99,90 @@ cmd_pair() {
   done
   [[ $server =~ ^https?:// ]] || die "--server phải là URL http(s)://..."
 
+  local bot=$P2S_BOT botlink="https://t.me/${P2S_BOT#@}"
+
+  # ---------- màn hình hướng dẫn (in TRƯỚC khi hỏi input) ----------
+  cat <<EOF
+
+╔══════════════════════════════════════════════════════════════╗
+║   🛡  GHÉP NỐI SERVER VỚI TELEGRAM ALERT — HƯỚNG DẪN        ║
+╚══════════════════════════════════════════════════════════════╝
+ Bot hệ thống :  $bot
+ Mở nhanh     :  $botlink
+
+ Bạn sẽ làm 3 bước (khoảng 1 phút):
+
+ BƯỚC 1️⃣ — Lấy Chat ID trên Telegram
+   • Mở $botlink  → nhấn  START  (bắt buộc nếu chưa từng nhấn)
+   • Nhắn cho bot:   /id
+   • Bot trả lời kèm  🆔 Chat ID  → nhớ/số copy dãy số đó
+   💡 Chat riêng của bạn: số DƯƠNG  (ví dụ  812345678)
+   💡 Muốn CẢ TEAM cùng nhận alert: thêm bot vào group Telegram,
+      rồi nhắn /id ngay trong group — Chat ID group là số ÂM
+      (ví dụ  -1001234567890)
+
+ BƯỚC 2️⃣ — Nhập Chat ID vào dòng script sẽ hỏi ngay bên dưới
+
+ BƯỚC 3️⃣ — Xác nhận trên Telegram
+   • Bot gửi  "🔔 Yêu cầu ghép nối mới"  vào đúng chat của bạn
+   • Bạn nhắn:   /confirm
+   • Thấy  "✅ Ghép nối thành công"  là HOÀN TẤT — script dưới đây
+     tự nhận API key và lưu cấu hình, bạn không phải gõ gì thêm.
+
+────────────────────────────────────────────────────────────────
+EOF
+
   # Chat ID: --chatid > P2S_TG_CHATID > prompt tương tác
   chatid=${chatid:-${P2S_TG_CHATID:-}}
   if [[ -z $chatid ]]; then
-    cat >&2 <<'EOF'
-Lấy Chat ID: mở Telegram → vào bot → nhắn /id → bot trả Chat ID
-(chat riêng: số dương; group: số âm — dùng group để cả team nhận alert).
-EOF
-    printf 'Nhập Chat ID Telegram: '
+    printf 'BƯỚC 2️⃣  Nhập Chat ID Telegram của bạn: '
     IFS= read -r chatid || die "không đọc được input — dùng --chatid <chat_id>"
   fi
   chatid=$(printf '%s' "$chatid" | tr -d ' ')
-  [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] \
-    || die "Chat ID không hợp lệ: '$chatid' (ví dụ: 8005354626 hoặc -1001234567890)"
+  [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] || {
+    printf '\n❌ Chat ID "%s" không đúng định dạng.\n' "$chatid" >&2
+    printf '   Hãy nhắn /id cho %s và copy NGUYÊN dãy số (chat riêng: dương,\n' "$bot" >&2
+    printf '   group: âm, ví dụ -1001234567890). Nhập lại: ' >&2
+    IFS= read -r chatid || die "không đọc được input — dùng --chatid <chat_id>"
+    chatid=$(printf '%s' "$chatid" | tr -d ' ')
+    [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] || die "Chat ID vẫn không hợp lệ: '$chatid'"
+  }
 
-  local resp pair_ref name warn
+  printf '\n⏳ Đang đăng ký server "%s" với central server...\n' "${P2S_PROJECT_NAME:-$(hostname 2>/dev/null || echo unknown)}"
+  local resp pair_ref name warn rbot
   name=${P2S_PROJECT_NAME:-$(hostname 2>/dev/null || echo unknown)}
   resp=$("${CURL[@]}" -X POST "$server/api/v1/register-chatid" \
     -H 'Content-Type: application/json' \
     -d "{\"project_name\":\"$(json_escape "$name")\",\"chat_id\":\"$(json_escape "$chatid")\"}") \
-    || die "không gọi được $server"
+    || die "không gọi được $server — kiểm tra đường mạng/URL: $server"
   pair_ref=$(json_get "$resp" pair_ref)
   [[ -n $pair_ref ]] || die "server trả về không có pair_ref: $resp"
+  rbot=$(json_get "$resp" bot)
+  [[ -n $rbot && $rbot != null ]] && bot=$rbot && botlink="https://t.me/${rbot#@}"
   warn=$(json_get "$resp" warning)
-  [[ -n $warn && $warn != null ]] && printf '⚠️  %s\n' "$warn"
+  if [[ -n $warn && $warn != null ]]; then
+    cat >&2 <<EOF
+
+⚠️  Bot chưa nhắn được vào chat $chatid (chưa được START).
+   Cách xử lý: mở $botlink → nhấn START → nhắn  /confirm
+   (yêu cầu ghép nối vẫn còn hiệu lực, không cần làm lại từ đầu)
+EOF
+  fi
 
   cat <<EOF
 
-==============================================================
-   GHÉP NỐI QUA TELEGRAM CHAT ID:   $chatid
-==============================================================
- 1. Mở Telegram vào CHAT có ID $chatid
-    (bot đã vừa gửi yêu cầu ghép nối vào đó)
- 2. Nhắn:   /confirm
- 3. Bot trả lời "Ghép nối thành công" là xong.
-    → KHÔNG cần gõ mã nào.
+────────────────────────────────────────────────────────────────
+ BƯỚC 3️⃣ — Bây giờ trên Telegram:
+   1. Vào chat có ID  $chatid
+   2. Nhắn:   /confirm
+   3. Chờ bot trả lời "✅ Ghép nối thành công"
 
- Đang chờ /confirm (tối đa $((PAIR_TIMEOUT / 60)) phút)...
-==============================================================
+⏳ Đang chờ bạn /confirm (tối đa $((PAIR_TIMEOUT / 60)) phút, Ctrl+C để huỷ)...
+────────────────────────────────────────────────────────────────
 
 EOF
 
-  local i st status api_key
+  local i st status api_key elapsed
   for ((i = 0; i < PAIR_TIMEOUT; i += 3)); do
     sleep 3
     if ! st=$("${CURL[@]}" "$server/api/v1/pairing-status?code=$pair_ref"); then
@@ -150,12 +196,34 @@ EOF
       mkdir -p -- "$(dirname -- "$CONF_PATH")"
       (umask 077 && printf 'SERVER_URL=%q\nAPI_KEY=%q\nPROJECT_NAME=%q\n' \
         "$server" "$api_key" "$name" >"$CONF_PATH")
-      printf '✅ Ghép nối thành công! Cấu hình đã lưu: %s\n' "$CONF_PATH"
-      printf 'Kiểm tra đường truyền:  %s test\nBắt đầu đẩy alert:      %s run\n' "$PROG" "$PROG"
+      cat <<EOF
+
+╔══════════════════════════════════════════════════════════════╗
+║   ✅  GHÉP NỐI THÀNH CÔNG!                                  ║
+╚══════════════════════════════════════════════════════════════╝
+ Cấu hình đã lưu:  $CONF_PATH   (chỉ root đọc được)
+ Từ giờ mọi alert bảo mật của server này sẽ về Telegram chat $chatid.
+
+ BƯỚC TIẾP THEO — kiểm tra & chạy thật:
+   1) Gửi alert thử (xem Telegram có nhận không):
+        $PROG test
+   2) Chạy thường trực để đẩy alert tự động:
+        sudo $PROG run
+      hoặc cài service (khởi động cùng máy chủ):
+        sudo cp p2s-agent.service /etc/systemd/system/
+        sudo systemctl enable --now p2s-agent
+   3) Trên Telegram, nhắn  /list  cho $bot để xem các server đang quản lý.
+EOF
       return 0
     fi
+    # mỗi ~30s nhắc nhẹ còn bao lâu
+    if (( (i + 3) % 30 == 0 )); then
+      elapsed=$(( (i + 3) / 60 ))
+      printf '  ... vẫn đang chờ /confirm (đã chờ %d phút, còn %d phút)\n' \
+        "$elapsed" "$(( PAIR_TIMEOUT / 60 - elapsed ))"
+    fi
   done
-  die "hết thời gian chờ ghép nối — chạy lại lệnh pair để lấy mã mới"
+  die "hết thời gian chờ /confirm — chạy lại lệnh pair (yêu cầu cũ đã hết hạn)"
 }
 
 # ============================================================ helpers run

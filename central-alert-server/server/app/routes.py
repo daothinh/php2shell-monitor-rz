@@ -122,6 +122,8 @@ async def register_chatid(body: RegisterChatIdBody, request: Request):
     return {
         "pair_ref": pair_ref,
         "chat_id": chat_id,
+        "bot": (f"@{getattr(tg, 'bot_username', '')}"
+                if getattr(tg, "bot_username", "") else None),
         "expires_in": cfg.pairing_ttl_sec,
         "expires_at": db.iso(db.utcnow() + timedelta(seconds=cfg.pairing_ttl_sec)),
         "instruction": f"Nhắn /confirm trong chat {chat_id} để hoàn tất ghép nối",

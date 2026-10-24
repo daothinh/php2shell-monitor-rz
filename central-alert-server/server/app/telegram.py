@@ -211,6 +211,7 @@ class PairingBot:
     async def start(self) -> None:
         me = await self._api("getMe")
         self._me = me["result"].get("username", "")
+        self.tg.bot_username = self._me  # routes dùng để trả bot handle cho agent
         log.info("bot @%s polling started", self._me)
         # Đăng ký menu lệnh (nút ≡ / gõ "/"): idempotent, lỗi không chặn polling
         for method, payload in (
