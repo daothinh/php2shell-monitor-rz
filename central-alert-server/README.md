@@ -108,13 +108,16 @@ ALERT_RETENTION_DAYS=90
 
 ### 3.2. Lệnh bot — một người quản lý nhiều server
 
+Bot **tự đăng ký menu lệnh** (nút **≡** cạnh ô nhập / gõ `/`) và mô tả bot qua `setMyCommands`/`setMyDescription` khi khởi động — người dùng không cần nhớ cú pháp.
+
 Một chat Telegram (một người) có thể ghép **nhiều server**, mỗi server một mã `SEC-<UUID>` riêng; cảnh báo của tất cả các server về cùng chat đó.
 
-| Lệnh | Chức năng |
+| Lệnh (menu ≡) | Chức năng |
 |---|---|
+| `/start` | Lời chào + tổng quan bot |
 | `/add_new_id` | Bắt đầu phiên ghép nối server mới (bot vào trạng thái chờ mã trong 10 phút; gửi mã `SEC-<UUID>` in trên terminal khi chạy `p2s-agent.sh pair` để hoàn tất) |
 | `/list` (hoặc `/ids`, `/servers`) | Liệt kê mọi server/dự án đã ghép với chat: tên, số thiết bị, ngày ghép, alert gần nhất |
-| `/start`, `/help` | Trợ giúp + số dự án đang quản lý |
+| `/help` | Trợ giúp đầy đủ: danh sách lệnh + luồng ghép nối 3 bước + số dự án đang quản lý |
 | Gửi `SEC-<UUID>` trực tiếp | Ghép nối luôn mà không cần `/add_new_id` trước |
 
 Mọi lệnh chấp nhận cả dạng `/add_new_id@tên_bot` (khi dùng bot trong nhóm).

@@ -179,6 +179,22 @@ class PairingBot:
 
     AWAIT_TTL_SEC = 600  # /add_new_id hiệu lực 10 phút — khớp TTL mã pairing
 
+    # Menu lệnh (nút ≡ / gõ "/"). Tên: lowercase a-z0-9_, tối đa 32 ký tự.
+    BOT_COMMANDS = [
+        ("start", "Bắt đầu & xem tổng quan"),
+        ("add_new_id", "Ghép nối thêm server mới"),
+        ("list", "Danh sách server/dự án đã ghép"),
+        ("help", "Trợ giúp đầy đủ"),
+    ]
+    BOT_DESCRIPTION = (
+        "🛡 Central Alert Bot — nhận cảnh báo an ninh (php2shell-monitor) từ các"
+        " server của bạn ngay trên Telegram.\n\n"
+        "Một chat quản lý được nhiều server: chạy /add_new_id rồi gửi mã SEC-<UUID>"
+        " in trên terminal server để ghép nối. /list xem tất cả."
+    )
+    BOT_SHORT_DESCRIPTION = ("Cảnh báo an ninh server → Telegram. "
+                             "/add_new_id để ghép nối server mới.")
+
     def __init__(self, cfg: Config, tg: TelegramClient, db_path: str) -> None:
         self.cfg = cfg
         self.tg = tg
@@ -198,6 +214,17 @@ class PairingBot:
         me = await self._api("getMe")
         self._me = me["result"].get("username", "")
         log.info("bot @%s polling started", self._me)
+        # Đăng ký menu lệnh (nút ≡ / gõ "/"): idempotent, lỗi không chặn polling
+        for method, payload in (
+            ("setMyCommands", {"commands": [
+                {"command": c, "description": d} for c, d in self.BOT_COMMANDS]}),
+            ("setMyDescription", {"description": self.BOT_DESCRIPTION}),
+            ("setMyShortDescription", {"short_description": self.BOT_SHORT_DESCRIPTION}),
+        ):
+            try:
+                await self._api(method, json=payload)
+            except Exception:  # noqa: BLE001
+                log.warning("bot %s thất bại (menu/mô tả không cập nhật)", method)
 
     async def run(self) -> None:
         offset = 0
@@ -235,7 +262,9 @@ class PairingBot:
         m = CODE_RE.search(text)
         if m:
             await self._cmd_pair_code(chat_id, f"SEC-{m.group(1)}")
-        elif cmd in ("start", "help"):
+        elif cmd == "start":
+            await self._cmd_help(chat_id, welcome=True)
+        elif cmd == "help":
             await self._cmd_help(chat_id)
         elif cmd == "add_new_id":
             await self._cmd_add_new_id(chat_id)
@@ -262,19 +291,26 @@ class PairingBot:
 
     # ------------------------------------------------------------- lệnh
 
-    async def _cmd_help(self, chat_id: str) -> None:
+    async def _cmd_help(self, chat_id: str, welcome: bool = False) -> None:
         n = len(db.projects_by_chat(self.db_path, chat_id))
+        head = ("👋 <b>Chào mừng!</b> Đây là <b>Central Alert Bot</b> — nhận cảnh báo"
+                " an ninh từ các server của bạn ngay trên Telegram."
+                if welcome else "🤖 <b>Central Alert Bot — Trợ giúp</b>")
         await self.tg.send_message(
             chat_id,
-            "🤖 <b>Central Alert Bot</b>\n"
+            head + "\n"
             "Một chat có thể quản lý <b>nhiều server</b> — mỗi server ghép một mã riêng.\n\n"
-            "📋 <b>Lệnh</b>\n"
-            "• <code>/add_new_id</code> — bắt đầu ghép nối một server mới\n"
-            "• <code>/list</code> — xem các server/dự án đã ghép với chat này\n"
-            "• Gửi trực tiếp mã <code>SEC-&lt;UUID&gt;</code> (in trên terminal khi chạy"
-            " <code>p2s-agent.sh pair</code>)\n\n"
-            + (f"📎 Hiện bạn đang quản lý <b>{n} dự án</b>. Dùng /list để xem chi tiết."
-               if n else "📎 Chưa có server nào được ghép với chat này."),
+            "📋 <b>Lệnh</b> — nhấn <b>≡</b> cạnh ô nhập hoặc gõ <code>/</code> để mở menu:\n"
+            "• <code>/add_new_id</code> — ➕ ghép nối một server mới\n"
+            "• <code>/list</code> — 🗂 các server/dự án đã ghép với chat này\n"
+            "• <code>/help</code> — 📖 trợ giúp này\n\n"
+            "🔌 <b>Ghép nối server mới (3 bước)</b>\n"
+            "1️⃣ Trên server, chạy <code>sudo p2s-agent.sh pair --server &lt;url&gt;</code>\n"
+            "2️⃣ Terminal in mã <code>SEC-&lt;UUID&gt;</code> — gửi mã về chat này\n"
+            "3️⃣ Bot xác nhận ✅ — mọi cảnh báo của server sẽ về đúng chat này\n\n"
+            + (f"📎 Bạn đang quản lý <b>{n} dự án</b>. Dùng <code>/list</code> để xem chi tiết."
+               if n else "📎 Chưa có server nào được ghép với chat này — bắt đầu với"
+                         " <code>/add_new_id</code>."),
         )
 
     async def _cmd_add_new_id(self, chat_id: str) -> None:

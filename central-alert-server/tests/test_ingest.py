@@ -439,9 +439,30 @@ def test_bot_list_shows_all_servers_of_one_chat(env):
 def test_bot_help_mentions_commands(env):
     _, cfg, tg = env
     bot = _bot(cfg, tg)
-    asyncio.run(bot.handle_update(_msg(8003, "/start")))
+    asyncio.run(bot.handle_update(_msg(8003, "/help")))
     text = tg.sent[-1][1]
     assert "/add_new_id" in text and "/list" in text and "nhiều server" in text
+    assert "≡" in text and "3 bước" in text  # gợi ý menu + luồng ghép nối
+
+
+def test_bot_welcome_on_start(env):
+    _, cfg, tg = env
+    bot = _bot(cfg, tg)
+    asyncio.run(bot.handle_update(_msg(8005, "/start")))
+    assert "Chào mừng" in tg.sent[-1][1]
+
+
+def test_bot_command_menu_is_valid():
+    """BOT_COMMANDS phải hợp lệ với Telegram: lowercase a-z0-9_, <=32 ký tự, duy nhất;
+    và phủ mọi lệnh chính của router (để menu ≡ không thiếu lệnh nào)."""
+    import re
+    from app.telegram import PairingBot
+    cmds = [c for c, _ in PairingBot.BOT_COMMANDS]
+    assert len(cmds) == len(set(cmds))
+    for c in cmds:
+        assert re.fullmatch(r"[a-z0-9_]{1,32}", c), c
+    for expected in ("start", "help", "add_new_id", "list"):
+        assert expected in cmds, expected
 
 
 def test_bot_wrong_code_does_not_create_awaiting_leak(env):
