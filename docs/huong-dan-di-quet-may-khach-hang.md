@@ -31,22 +31,32 @@ Mọi thứ trên máy khách đều nằm gọn trong `/opt/php2shell-monitor` 
 
 ## 1. Cài + ghép nối = MỘT LỆNH (trên máy khách)
 
-Copy file vào máy khách rồi chạy (lần đầu tự cài vào `/opt/php2shell-monitor`,
-tự bật supervisor nền rà log mỗi 5 phút):
+Copy file vào máy khách rồi chạy **1 trong 2 cách** (lần đầu tự cài vào
+`/opt/php2shell-monitor`, tự bật supervisor nền rà log mỗi 5 phút):
 
+**Cách A — wizard tương tác (dễ nhất khi ngồi tại máy khách):**
 ```bash
-sudo bash php2shell-monitor.sh -- --chatid -1001234567890 --project ten-khachhang
+sudo bash php2shell-monitor.sh
+```
+Script tự hỏi từng bước: *tên dự án* (đặt theo tên khách hàng) → *Chat ID*
+(dán số đã lấy ở bước 0).
+
+**Cách B — 1 dòng cho automation/cron:**
+```bash
+sudo bash php2shell-monitor.sh ten-khachhang --chatid -1001234567890
 ```
 
 | Tham số | Ý nghĩa |
 |---|---|
-| `-- --chatid` | Chat ID đã lấy ở bước 0 (số âm của group, hoặc số dương nếu nhận vào chat riêng) |
-| `--project` | Tên dự án/khách hàng — nhiều máy của cùng khách dùng chung một tên, mỗi máy tự thành một device (theo hostname) |
+| `ten-khachhang` (arg đầu) | Tên dự án — nhiều máy của cùng khách dùng chung một tên, mỗi máy tự thành một device (theo hostname). Chỉ chữ/số/`.`/`_`/`-`, tối đa 64 ký tự |
+| `--chatid` | Chat ID đã lấy ở bước 0 (số âm của group, hoặc số dương nếu nhận vào chat riêng) |
+| `--server <url>` | (hiếm khi cần) ghi đè server trung tâm mặc định `http://45.124.93.136:8000` |
 
-> ⚠️ **Chú ý dấu `--` đứng trước**: file cài là archive makeself, mọi tham số
-> muốn tới cho tool phải đặt sau `--` (thiếu `--` sẽ báo "Unrecognized flag").
-> Sau khi cài xong có thể gọi thẳng không cần `--`:
-> `sudo bash /opt/php2shell-monitor/main.sh --chatid -1001234567890`.
+> ⚠️ File cài là archive makeself: **đừng để `--chatid` đứng ở vị trí đầu tiên**
+> (makeself sẽ báo "Unrecognized flag"). Dùng wizard (không arg), hoặc đặt tên
+> dự án đứng trước như cách B, hoặc thêm separator `--` phía trước. Gọi trực
+> tiếp sau khi cài thì thoải mái:
+> `sudo bash /opt/php2shell-monitor/main.sh ten-khachhang --chatid -1001234567890`.
 
 Script in hướng dẫn từng bước, rồi bot Telegram gửi
 **"🔔 Yêu cầu ghép nối mới"** vào đúng group → trong group nhắn **`/confirm`**
@@ -117,6 +127,6 @@ Bằng chứng đã an toàn trên server trung tâm, gỡ máy khách không m�
 |---|---|
 | `không gọi được http://45.124.93.136:8000` | Máy khách chặn egress — mở firewall cho IP:port này (chỉ cần outbound) |
 | Bot không gửi yêu cầu ghép nối | Group chưa thêm bot / chưa ai `/start` bot — làm rồi nhắn `/confirm` |
-| Muốn đổi nơi nhận alert | Chạy lại lệnh ở bước 1 với `-- --chatid` mới rồi `/confirm` ở chat mới |
+| Muốn đổi nơi nhận alert | Chạy lại lệnh ở bước 1 với `--chatid` mới (hoặc wizard) rồi `/confirm` ở chat mới |
 | Quên Chat ID | Nhắn `/id` trong group/chat đó, bot trả lại ngay |
 | Xem máy nào đang ghép | Nhắn `/list` cho bot |
