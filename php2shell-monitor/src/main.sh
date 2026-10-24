@@ -30,11 +30,11 @@ Modes:
              alert sinh ra được đẩy Telegram nếu đã pair.
   once       Run a single batch now (same work the supervisor does every 5 min)
   run        Start the background supervisor (batch every BATCH_INTERVAL, default 300s)
-  pair       Ghép nối project với Central Alert Server -> Telegram
-             theo Chat ID (pair --server <url> [--chatid <id>]):
+  (mặc định / pair) Ghép nối với Central Alert Server (đã hardcode:
+             http://45.124.93.136:8000) — chỉ cần:
+               sudo php2shell-monitor.sh --chatid <chat-id> [--project <tên>]
+             --server có thể ghi đè; --device được bỏ qua (tự detect hostname);
              nhắn /id cho bot để lấy Chat ID, rồi /confirm trong chat đó.
-             Tên dự án lấy từ conf/device.conf (PROJECT); alert được
-             đẩy tự động khi supervisor chạy
   test       Send one test alert to the paired central server
   status     Project/device, plugin health, last batches, last alert
   stop       Stop the supervisor (state preserved)
@@ -52,8 +52,47 @@ EOF
 
 # makeself passes the script args verbatim, so callers may write `-- once`.
 [[ ${1:-} == -- ]] && shift
-mode=${1:-}
-[[ -z $mode || $mode == help || $mode == -h || $mode == --help ]] && { usage; exit 0; }
+
+# Single-command mode (không cần mode tường minh):
+#   sudo php2shell-monitor.sh --chatid <chat-id> [--project <tên>]
+#   = pair với server hardcode bên dưới, DEVICE luôn tự detect (hostname).
+# `--device` được chấp nhận nhưng BỎ QUA (auto-detect). Nếu mode không phải
+# `|--chatid|--server|--project|--device|--...` thì dùng như mode cũ.
+P2S_DEFAULT_SERVER=${P2S_DEFAULT_SERVER:-http://45.124.93.136:8000}
+
+first=${1:-}
+if [[ -z $first || $first == -* ]]; then mode=pair; else mode=$first; fi
+[[ $mode == help || $mode == -h || $mode == --help ]] && mode=help
+
+pair_args=() want_project=
+if [[ $mode == pair ]]; then
+  if [[ -n $first && $first != -* ]]; then shift; fi
+  while (($#)); do
+    case $1 in
+      --chatid)  pair_args+=(--chatid "${2:-}"); shift 2 ;;
+      --server)  pair_args+=(--server "${2:-}"); shift 2 ;;
+      --project) want_project=${2:-}; shift 2 ;;
+      --device)  shift 2 ;;   # bỏ qua — device luôn tự detect qua hostname
+      --detach)  pair_args+=(--detach); shift ;;
+      *) echo "tham số không hợp lệ: $1" >&2; usage; exit 2 ;;
+    esac
+  done
+  # server mặc định: chỉ thêm khi caller không truyền --server
+  has_server=0
+  for a in "${pair_args[@]}"; do [[ $a == --server ]] && has_server=1; done
+  ((has_server)) || pair_args=(--server "$P2S_DEFAULT_SERVER" "${pair_args[@]}")
+  # --project: ghi vào conf/device.conf trước khi p2s_device_init đọc nó
+  if [[ -n $want_project ]]; then
+    conf=$WORKDIR/conf/device.conf
+    if [[ -e $conf ]] && grep -q '^PROJECT=' "$conf" && [[ $(grep '^PROJECT=' "$conf") != "PROJECT=\"$want_project\"" ]]; then
+      sed -i "s|^PROJECT=.*|PROJECT=\"$want_project\"|" "$conf"
+    else
+      printf '# php2shell-monitor — device identity\nPROJECT="%s"\nDEVICE="$(hostname 2>/dev/null || echo unknown)"\n' "$want_project" >"$conf"
+    fi
+  fi
+fi
+
+[[ $mode == help ]] && { usage; exit 0; }
 
 p2s_device_init || { echo "cannot initialise data dirs under $WORKDIR" >&2; exit 1; }
 
@@ -71,8 +110,7 @@ case $mode in
     bash "$WORKDIR/engine/supervisor.sh" start
     ;;
   pair)
-    shift
-    bash "$WORKDIR/engine/central.sh" pair "$@"
+    bash "$WORKDIR/engine/central.sh" pair ${pair_args+"${pair_args[@]}"}
     ;;
   test)
     bash "$WORKDIR/engine/central.sh" test
