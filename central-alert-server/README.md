@@ -118,8 +118,10 @@ Bot **tự đăng ký menu lệnh** (nút **≡** / gõ `/`) khi khởi động.
 
 ```
 1️⃣ Telegram → bot → /id          → bot trả Chat ID (chat riêng: số dương; group: số âm)
-2️⃣ Server:   sudo p2s-agent.sh pair --server <url>
+2️⃣ Server:   sudo p2s-agent.sh pair
              → script hỏi Chat ID → nhập số vừa copy
+             (server trung tâm đã hardcode sẵn trong script; muốn trỏ server
+              khác thì thêm --server <url> hoặc set P2S_SERVER_URL)
 3️⃣ Bot gửi "🔔 Yêu cầu ghép nối mới" vào đúng chat đó → nhắn /confirm → xong ✅
 ```
 
@@ -300,7 +302,8 @@ Chi tiết rule/evidence vẫn tra qua `GET /api/v1/alerts/{id}`.
 ## 5. Client agent
 
 ```bash
-sudo ./p2s-agent.sh pair --server https://alert.example.com
+sudo ./p2s-agent.sh pair    # server mặc định đã hardcode sẵn trong script
+sudo ./p2s-agent.sh pair --server https://alert.example.com   # trỏ server khác
 sudo ./p2s-agent.sh test
 sudo ./p2s-agent.sh run
 ```

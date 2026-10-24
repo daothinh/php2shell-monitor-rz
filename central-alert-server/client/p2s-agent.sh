@@ -14,6 +14,9 @@ set -u
 
 CONF_PATH=${P2S_AGENT_CONF:-/etc/php2shell/agent.conf}
 STATE_DIR=${P2S_AGENT_STATE:-/var/lib/php2shell-agent}
+# Central server mặc định — chạy "pair" là ăn ngay, khỏi gõ --server.
+# Muốn trỏ server khác: --server <url> hoặc P2S_SERVER_URL.
+DEFAULT_SERVER="http://45.124.93.136:8000"
 # Default queue of the monitor on this host. The monitor stores per
 # project/device; set P2S_ALERT_FILE when the project/device name differs.
 ALERT_FILE=${P2S_ALERT_FILE:-/var/lib/php2shell/projects/default/devices/$(hostname 2>/dev/null || echo unknown)/alerts/queue.jsonl}
@@ -64,9 +67,12 @@ usage() {
 $PROG — agent Central Alert Server cho php2shell-monitor
 
 Usage:
-  $PROG pair   --server <url-central-server> [--chatid <chat-id-telegram>]
+  $PROG pair   [--server <url-central-server>] [--chatid <chat-id-telegram>]
   $PROG run    [--file <alerts.jsonl>]
   $PROG test
+
+pair KHÔNG cần --server: mặc định trỏ sẵn $DEFAULT_SERVER
+(chỉ dùng --server / P2S_SERVER_URL khi muốn trỏ server khác).
 
 pair sẽ HỎI Chat ID Telegram (hoặc nhận qua --chatid / P2S_TG_CHATID).
 Lấy Chat ID: nhắn /id cho bot (trong chat riêng HOẶC group — group để cả
@@ -89,7 +95,8 @@ EOF
 P2S_BOT=${P2S_BOT:-@p2shell_bot}
 
 cmd_pair() {
-  local server= chatid=
+  # --server / P2S_SERVER_URL là tuỳ chọn: mặc định đã hardcode sẵn
+  local server=${P2S_SERVER_URL:-} chatid=
   while [[ $# -gt 0 ]]; do
     case $1 in
       --server) server=${2:?}; shift 2 ;;
@@ -97,6 +104,7 @@ cmd_pair() {
       *) die "tham số không hợp lệ: $1 (xem $PROG help)" ;;
     esac
   done
+  server=${server:-$DEFAULT_SERVER}
   [[ $server =~ ^https?:// ]] || die "--server phải là URL http(s)://..."
 
   local bot=$P2S_BOT botlink="https://t.me/${P2S_BOT#@}"
@@ -109,6 +117,7 @@ cmd_pair() {
 ╚══════════════════════════════════════════════════════════════╝
  Bot hệ thống :  $bot
  Mở nhanh     :  $botlink
+ Central server :  $server
 
  Bạn sẽ làm 3 bước (khoảng 1 phút):
 
