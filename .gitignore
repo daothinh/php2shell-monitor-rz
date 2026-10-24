@@ -5,6 +5,7 @@
 
 # ---- central alert server ----
 central-alert-server/server/.venv/
+central-alert-server/server/data/
 data-central/
 *.db
 *.db-wal
