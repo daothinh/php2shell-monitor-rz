@@ -16,7 +16,6 @@ from .security import AttemptGuard, gen_api_key, sha256_hex
 log = logging.getLogger("alert-server.telegram")
 
 TG_API = "https://api.telegram.org/bot{token}/{method}"
-MSG_LIMIT = 3900  # giới hạn Telegram 4096, chừa buffer an toàn
 CODE_RE = re.compile(
     r"\bSEC-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
 )
@@ -24,6 +23,44 @@ CODE_RE = re.compile(
 _SEV_EMOJI = {
     "CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "🟡", "LOW": "ℹ️", "INFO": "ℹ️",
 }
+_SEV_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+
+# Alert headline: exactly two messages.
+#   "Server bị chiếm quyền (RCE)" — any hit from an exploitation-success rule
+#   (T3: webshell dropped, backdoor, host exec, fpm child shell, reverse shell).
+#   "Server đang bị khai thác php2shell" — everything else, i.e. any batch with
+#   more than 2 distinct rules (T1 pre-exploit probes / T2 in-progress signals).
+RCE_RULES = frozenset({
+    "P2S-020",  # webroot file written/changed
+    "P2S-021",  # host process exec (auditd)
+    "P2S-022",  # auto_prepend_file injected (backdoor)
+    "P2S-024",  # php-fpm spawned shell child
+    "P2S-025",  # reverse shell / post-exploitation
+})
+
+
+def _alert_rule_ids(alert: dict) -> set[str]:
+    """Every rule_id present in the alert (evidence[] preferred, else counters)."""
+    ids: set[str] = set()
+    for h in alert.get("evidence") or []:
+        if isinstance(h, dict) and h.get("rule_id"):
+            ids.add(str(h["rule_id"]))
+    if not ids:  # payload without evidence[]: fall back to the rule counters
+        for r in alert.get("rules") or []:
+            if isinstance(r, dict) and r.get("rule_id"):
+                ids.add(str(r["rule_id"]))
+        if alert.get("rule_id"):
+            ids.add(str(alert["rule_id"]))
+    return ids
+
+
+def _headline(alert: dict) -> str:
+    """One of the two allowed messages for the alert headline."""
+    ids = _alert_rule_ids(alert)
+    if ids & RCE_RULES:
+        return "Server bị chiếm quyền (RCE)"
+    return "Server đang bị khai thác php2shell"
+DEFAULT_WINDOW_MIN = 5   # monitor BATCH_INTERVAL
 
 
 def _sev(a: dict) -> str:
@@ -31,80 +68,63 @@ def _sev(a: dict) -> str:
     return s if s in _SEV_EMOJI else "INFO"
 
 
-def _fmt_ts(ts_raw: Any, tz: ZoneInfo) -> str:
+def _parse_ts(ts_raw: Any) -> Optional[datetime]:
     s = str(ts_raw or "")
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         try:  # định dạng CLF-ish 2026-10-23 14:02:11
-            dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            return ""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(tz).strftime("%d/%m %H:%M:%S")
+            return None
+        return dt.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def format_alert(project_name: str, alert: dict, tz: ZoneInfo, host_default: str = "") -> str:
-    """Một alert -> khối HTML ngắn gọn cho Telegram."""
+def _window_span(alert: dict) -> str:
+    """Batch window as a short duration: '5 phút' / '<1 phút' (5 min default)."""
+    start = _parse_ts(alert.get("window_start"))
+    end = _parse_ts(alert.get("window_end"))
+    if not (start and end and end > start):
+        return f"{DEFAULT_WINDOW_MIN} phút"
+    secs = int((end - start).total_seconds())
+    if secs < 60:
+        return "<1 phút"
+    return f"{max(1, round(secs / 60))} phút"
+
+
+def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
+    """One batch alert -> one 4-line Telegram message.
+
+    🛡 Central Security Alert - DD/MM/YYYY
+    <emoji> SEVERITY · <what happened> · <hits>/<window>
+    📦 Dự án: <project>
+    🖥 <hostname> / <LAN IP>
+
+    Full evidence (every raw hit with file:line) stays on the server
+    (`GET /api/v1/alerts/<id>`) and in the evidence mirror.
+    """
     esc = html.escape
     sev = _sev(alert)
-    emoji = _SEV_EMOJI[sev]
-    rule = esc(str(alert.get("rule_id") or "LOG"))
-    tier = str(alert.get("tier") or "").strip().upper()
-    tier_tag = f" <code>[{esc(tier)}]</code>" if tier else ""
 
-    host = esc(str(alert.get("host") or host_default or "?")[:64])
-    lines = [f"{emoji} <b>{esc(sev)} · {rule}</b>{tier_tag} — <b>{host}</b>"]
+    when = (_parse_ts(alert.get("ts_utc") or alert.get("ts") or alert.get("window_end"))
+            or datetime.now(tz)).astimezone(tz)
 
-    uri = str(alert.get("uri") or "").strip()
-    if uri:
-        lines.append(f"🔗 <code>{esc(uri[:160])}</code>")
+    hits = alert.get("evidence") or []
+    total = int(alert.get("hits") or len(hits))
+    what = f"<b>{esc(_headline(alert))}</b>"
+    freq = f"{total} hit / {_window_span(alert)}"
 
-    # IP: hỗ trợ cả src_ip trực tiếp lẫn src_ip_candidates của php2shell-monitor
-    ip = str(alert.get("src_ip") or "").strip()
-    if not ip:
-        cands = alert.get("src_ip_candidates") or []
-        if isinstance(cands, list) and cands:
-            first = cands[0]
-            if isinstance(first, dict):
-                ip = f"{first.get('ip', '?')} (ứng viên, {first.get('score', '?')} hit)"
-            else:
-                ip = str(first)
-    if ip:
-        lines.append(f"👤 IP: <code>{esc(ip[:100])}</code>")
+    host = str(alert.get("host") or alert.get("device") or "?")[:64]
+    lan_ip = str(alert.get("lan_ip") or "").strip()[:64]
+    where = f"🖥 <b>{esc(host)}</b>" + (f" / {esc(lan_ip)}" if lan_ip else "")
 
-    msg = str(alert.get("message") or alert.get("notes") or "").strip()
-    if not msg:
-        evid = alert.get("evidence") or []
-        if isinstance(evid, list) and evid and isinstance(evid[0], dict):
-            msg = str(evid[0].get("msg") or "")
-    if msg:
-        lines.append(f"📝 {esc(msg[:300])}")
-
-    ts = _fmt_ts(alert.get("ts_utc") or alert.get("ts") or alert.get("timestamp"), tz)
-    if ts:
-        lines.append(f"🕒 {ts} ({tz.key.split('/')[-1].replace('_', ' ')})")
-
-    lines.append(f"📦 Dự án: <b>{esc(project_name[:64])}</b>")
-    return "\n".join(lines)
-
-
-def chunk_messages(header: str, blocks: list[str], footer: str = "") -> list[str]:
-    """Gộp các khối alert thành tin nhắn ≤ MSG_LIMIT ký tự (tin mới mở lại bằng header)."""
-    out: list[str] = []
-    cur = header
-    has_block = False
-    for b in blocks:
-        sep = "\n\n" if has_block else ""
-        if has_block and len(cur) + len(sep) + len(b) + len(footer) > MSG_LIMIT:
-            out.append(cur + footer)
-            cur = header + b
-        else:
-            cur += sep + b
-        has_block = True
-    out.append(cur + footer)
-    return out
+    return "\n".join([
+        f"🛡 <b>Central Security Alert</b> - {when:%d/%m/%Y}",
+        f"{_SEV_EMOJI[sev]} <b>{esc(sev)}</b> · {what} · {freq}",
+        f"📦 Dự án: <b>{esc(project_name[:64])}</b>",
+        where,
+    ])
 
 
 class TelegramClient:

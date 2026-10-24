@@ -1,7 +1,7 @@
-# accesslog.awk - fast nginx/apache access log -> stream TSV (lib/stream.sh contract)
-# Pure awk (mawk/gawk): no per-line forks; epoch math inline (no mktime needed).
-# Usage: awk -f accesslog.awk -v src=access_log /path/access.log
-# Emits 14 fields: ts source src_ip method uri status size ua pid sessid file rule msg referer
+# accesslog.awk - fast nginx/apache access log -> stream TSV.
+# Pure awk (mawk/gawk): no per-line forks; epoch math inline.
+# Usage: awk -f accesslog.awk -v src=access_log [-v realfile=/path -v startline=N] file
+# Emits 12 fields: ts source file line ip method uri status ua pid msg rule
 BEGIN { OFS="\t"; split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", MN, " ") }
 
 function days_from_civil(y, m, d,   era, yoe, doy, doe) {
@@ -97,10 +97,8 @@ function quoted(line, start,   q1, q2) {
     split(tmp, SB, " ")
     status = SB[1]; size = SB[2]
     if (size == "-") size = ""
-    # strip request-time suffix "0.123" if present
     if (size ~ /^[0-9]+\.[0-9]+$/) size = ""
   } else {
-    # upstream_status style or missing: try any 3-digit token after request
     tmp = after
     if (match(tmp, /[ ]([1-5][0-9][0-9])[ ]/)) status = substr(tmp, RSTART + 1, 3)
   }
@@ -114,7 +112,7 @@ function quoted(line, start,   q1, q2) {
   if (f2 != "") ua = f2
   if (referer == "-") referer = ""
 
-  # --- X-Forwarded-For when the log format includes it (quoted or bare token)
+  # --- X-Forwarded-For when the log format includes it
   xff = ""
   n = split(line, TOK, "\"")
   for (i = 2; i <= n; i += 2) {
@@ -124,6 +122,10 @@ function quoted(line, start,   q1, q2) {
   }
   if (xff != "") ip = xff
 
-  msg = line; gsub(/[\t\r\n]/, " ", msg); msg = substr(msg, 1, 2000)
-  print ts, src, ip, method, uri, status, size, ua, "", "", "", "-", msg, referer
+  raw = line; gsub(/[\t\r\n]/, " ", raw)
+  # realfile/startline let the caller replace FILENAME and rebase the line number
+  # for a byte-offset slice of the file.
+  fname = (realfile != "" ? realfile : FILENAME)
+  lno = (startline != "" ? startline + FNR : FNR)
+  print ts, src, fname, lno, ip, method, uri, status, ua, "", raw, "-"
 }

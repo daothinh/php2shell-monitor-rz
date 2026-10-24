@@ -18,10 +18,36 @@ logging.basicConfig(
 log = logging.getLogger("alert-server")
 
 
+def _prune_evidence(cfg: Config) -> None:
+    """Delete evidence batch files older than the retention window.
+
+    Layout: <root>/<project>/IP-LAN_<ip>_<host>_<user>/<batch>.jsonl — the
+    batch filename carries the UTC timestamp (YYYYMMDDTHHMMSSZ), so file
+    mtime decides what is expired.
+    """
+    if cfg.retention_days <= 0:
+        return
+    import time
+    from pathlib import Path
+
+    root = Path(cfg.evidence_root)
+    if not root.is_dir():
+        return
+    cutoff = time.time() - cfg.retention_days * 86400
+    for f in root.glob("*/*/*.jsonl"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+                f.parent.rmdir()  # only succeeds when the device folder is empty
+        except OSError:
+            continue
+
+
 async def _cleanup_loop(cfg: Config) -> None:
     while True:
         try:
-            db.cleanup(cfg.database_path, cfg.reveal_ttl_sec)
+            db.cleanup(cfg.database_path, cfg.reveal_ttl_sec, cfg.retention_days)
+            _prune_evidence(cfg)
         except Exception:  # noqa: BLE001
             log.exception("cleanup lỗi")
         await asyncio.sleep(900)  # 15 phút
@@ -29,18 +55,20 @@ async def _cleanup_loop(cfg: Config) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cfg = load_config()
+    # Honour a config injected by the host (tests/embedding); load from env otherwise.
+    cfg: Config = getattr(app.state, "cfg", None) or load_config()
     if not cfg.bot_token:
         log.warning("ALERT_BOT_TOKEN chưa cấu hình — bot Telegram TẮT, chỉ API hoạt động")
     app.state.cfg = cfg
-    try:
-        app.state.tz = ZoneInfo(cfg.display_tz)
-    except Exception:  # noqa: BLE001 — zoneinfo thiếu dữ liệu tz thì dùng UTC
-        from datetime import timezone
-        app.state.tz = timezone.utc
+    if getattr(app.state, "tz", None) is None:
+        try:
+            app.state.tz = ZoneInfo(cfg.display_tz)
+        except Exception:  # noqa: BLE001 — missing tzdata: fall back to UTC
+            from datetime import timezone
+            app.state.tz = timezone.utc
     db.init_db(cfg.database_path)
 
-    tg = TelegramClient(cfg.bot_token or "unset")
+    tg = getattr(app.state, "telegram", None) or TelegramClient(cfg.bot_token or "unset")
     app.state.telegram = tg
     tasks = [asyncio.create_task(_cleanup_loop(cfg), name="cleanup")]
     if cfg.bot_polling:

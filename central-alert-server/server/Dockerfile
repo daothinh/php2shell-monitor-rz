@@ -6,7 +6,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-ENV ALERT_DB_PATH=/data/alerts.db
+ENV ALERT_DB_PATH=/data/alerts.db \
+    ALERT_EVIDENCE_ROOT=/data/evidence
 VOLUME /data
 EXPOSE 8000
 

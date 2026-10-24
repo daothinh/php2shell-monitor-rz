@@ -1,26 +1,44 @@
 #!/usr/bin/env bash
-# status.sh - human status report (plan 5.4): supervisor, plugins ON/OFF (+why),
-# rules ON/OFF (+why), 10 latest alerts.
+# status.sh - project/device overview: supervisor state, plugins, rules, last batches.
 set -u
-WORKDIR=${WORKDIR:-/tmp/php2shell-monitor}
+WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
 # shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
+# shellcheck source=/dev/null
+source "$WORKDIR/lib/paths.sh"
+p2s_device_init || exit 1
 
-echo "== supervisor =="
-pid=$(cat "$P2S_RUN_DIR/supervisor.pid" 2>/dev/null || echo 0)
+pid=$(cat "$P2S_DEVICE_RUN_DIR/supervisor.pid" 2>/dev/null || echo 0)
 if [[ $pid != 0 ]] && kill -0 "$pid" 2>/dev/null; then
-  echo "running (pid $pid)"
+  echo "supervisor: running (pid $pid)"
 else
-  echo "NOT running"
+  echo "supervisor: NOT running"
 fi
-[[ -f $P2S_RUN_DIR/status.json ]] && cat "$P2S_RUN_DIR/status.json"
-
-echo ""
-echo "== plugins (last scan) =="
-if [[ -f $P2S_RUN_DIR/plugin_status.tsv ]]; then
-  tail -20 "$P2S_RUN_DIR/plugin_status.tsv" | column -t -s $'\t' 2>/dev/null || tail -20 "$P2S_RUN_DIR/plugin_status.tsv"
+echo "project:    $PROJECT"
+echo "device:     $DEVICE"
+echo "data dir:   $P2S_DATA_DIR"
+echo "batch:      every ${BATCH_INTERVAL:-300}s"
+if [[ -r $WORKDIR/conf/central.conf ]]; then
+  # shellcheck disable=SC1090
+  source "$WORKDIR/conf/central.conf"
+  echo "central:    paired -> $SERVER_URL (project: ${PROJECT_NAME:-$PROJECT})"
+  apid=$(cat "$P2S_DEVICE_RUN_DIR/agent/agent.pid" 2>/dev/null || echo 0)
+  if [[ $apid =~ ^[0-9]+$ ]] && kill -0 "$apid" 2>/dev/null; then
+    echo "agent:      running (pid $apid)"
+  else
+    echo "agent:      NOT running (bật khi chạy '-- run')"
+  fi
 else
-  echo "no scan has run yet"
+  echo "central:    not paired (sudo bash php2shell-monitor.sh -- pair --server <url>)"
+fi
+echo ""
+
+echo "== plugins (last batch) =="
+if [[ -f $P2S_DEVICE_RUN_DIR/plugin_status.tsv ]]; then
+  tail -20 "$P2S_DEVICE_RUN_DIR/plugin_status.tsv" | column -t -s $'\t' 2>/dev/null ||
+    tail -20 "$P2S_DEVICE_RUN_DIR/plugin_status.tsv"
+else
+  echo "no batch has run yet"
 fi
 
 echo ""
@@ -32,17 +50,18 @@ else
 fi
 
 echo ""
-echo "== rules =="
-if [[ -f $P2S_STATE_DIR/rules.loaded.tsv ]]; then
-  awk -F'\t' '{ printf "%-8s %-3s %-9s %-6s %s\n", $1, $2, $3, ($6==1?"ON":"OFF"), $7 }' "$P2S_STATE_DIR/rules.loaded.tsv"
-else
-  echo "rules not loaded yet (run -- run or -- discover)"
-fi
+echo "== last 5 batches =="
+tail -5 "$P2S_DEVICE_RUN_DIR/batches.log" 2>/dev/null || echo "(none)"
 
 echo ""
-echo "== last 10 alerts =="
+echo "== last alert =="
 if [[ -s $P2S_ALERT_DIR/queue.jsonl ]]; then
-  tail -10 "$P2S_ALERT_DIR/queue.jsonl" | "$P2S_JQ" -r '[.ts_utc,.severity,.rule_id,.tier,(.src_ip_candidates[0].ip // "-"),.uri] | @tsv' 2>/dev/null
+  if [[ -n ${P2S_JQ:-} ]]; then
+    "$P2S_JQ" -r '[.ts_utc,.severity,(.hits|tostring),(.rules|map(.rule_id)|join(",")),.evidence_file] | @tsv' \
+      <(tail -1 "$P2S_ALERT_DIR/queue.jsonl")
+  else
+    tail -1 "$P2S_ALERT_DIR/queue.jsonl"
+  fi
 else
   echo "(none)"
 fi

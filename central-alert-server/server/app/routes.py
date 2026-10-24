@@ -1,17 +1,18 @@
-"""API endpoints: pairing, ingest-log, admin, health."""
+"""API endpoints: pairing, ingest, ops (alerts/devices/stats/search), admin, health."""
 import logging
 import re
+import secrets
 from datetime import timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from . import db
+from . import db, evidence
 from .config import Config
 from .security import RateLimiter, gen_api_key, gen_pairing_code, sha256_hex
-from .telegram import TelegramClient, chunk_messages, format_alert
+from .telegram import TelegramClient, format_alert
 
 log = logging.getLogger("alert-server.api")
 
@@ -44,6 +45,30 @@ def _cfg(request: Request) -> Config:
 
 def _tz(request: Request) -> ZoneInfo:
     return request.app.state.tz
+
+
+def _read_scope(request: Request, x_api_key: str = Header(default=""),
+                authorization: str = Header(default=""),
+                x_admin_token: str = Header(default=""),
+                x_read_token: str = Header(default="")) -> Optional[int]:
+    """Xác thực endpoint đọc. Trả `project_id` được phép xem, `None` = mọi project.
+
+    Thứ tự ưu tiên: admin token / read token (xem tất cả) → API key của project
+    (chỉ thấy project mình). Không có credential hợp lệ → 401.
+    """
+    cfg = _cfg(request)
+    if cfg.admin_token and x_admin_token and secrets.compare_digest(x_admin_token, cfg.admin_token):
+        return None
+    if cfg.read_token and x_read_token and secrets.compare_digest(x_read_token, cfg.read_token):
+        return None
+    api_key = x_api_key or (authorization[7:] if authorization.lower().startswith("bearer ") else "")
+    if not api_key:
+        raise HTTPException(401, "Thiếu credential đọc: X-API-Key, Authorization: Bearer, "
+                                 "X-Read-Token hoặc X-Admin-Token")
+    project = db.project_by_api_key_hash(cfg.database_path, sha256_hex(api_key))
+    if project is None:
+        raise HTTPException(401, "API key không hợp lệ hoặc dự án chưa ghép nối")
+    return int(project["id"])
 
 
 # ------------------------------------------------------------- pairing
@@ -89,7 +114,24 @@ def pairing_status(code: str, request: Request):
 
 class IngestBody(BaseModel):
     host: Optional[str] = Field(default=None, max_length=128)
+    device: Optional[str] = Field(default=None, max_length=64)
+    lan_ip: Optional[str] = Field(default=None, max_length=64)
+    user: Optional[str] = Field(default=None, max_length=64)
     alerts: list[dict[str, Any]] = Field(min_length=1)
+
+
+def _auth_project(request: Request, api_key: str) -> Any:
+    cfg = _cfg(request)
+    if not api_key:
+        raise HTTPException(401, "Thiếu API key (header X-API-Key hoặc Authorization: Bearer)")
+    ok, retry = _limiter.allow(f"ingest:{sha256_hex(api_key)[:16]}",
+                               cfg.ingest_rate_per_min, 60)
+    if not ok:
+        raise HTTPException(429, f"Quá nhanh; thử lại sau {retry}s")
+    project = db.project_by_api_key_hash(cfg.database_path, sha256_hex(api_key))
+    if project is None:
+        raise HTTPException(401, "API key không hợp lệ hoặc dự án chưa ghép nối")
+    return project
 
 
 @router.post("/ingest-log")
@@ -99,44 +141,129 @@ async def ingest_log(
     x_api_key: str = Header(default=""),
     authorization: str = Header(default=""),
 ):
-    """Nhận alert từ client (X-API-Key hoặc Bearer), định dạng và bắn Telegram."""
+    """Receive batch alerts from a device: store, mirror evidence, notify Telegram.
+
+    Expected shape (php2shell-monitor): one alert per 5-minute batch, whose
+    `evidence` array holds every raw hit line with file/line. Legacy single-hit
+    payloads are accepted and normalized into the same shape.
+    """
     cfg = _cfg(request)
     api_key = x_api_key or (authorization[7:] if authorization.lower().startswith("bearer ") else "")
-    if not api_key:
-        raise HTTPException(401, "Thiếu API key (header X-API-Key hoặc Authorization: Bearer)")
-    ok, retry = _limiter.allow(f"ingest:{sha256_hex(api_key)[:16]}",
-                               cfg.ingest_rate_per_min, 60)
-    if not ok:
-        raise HTTPException(429, f"Quá nhanh; thử lại sau {retry}s")
-
-    project = db.project_by_api_key_hash(cfg.database_path, sha256_hex(api_key))
-    if project is None:
-        raise HTTPException(401, "API key không hợp lệ hoặc dự án chưa ghép nối")
+    project = _auth_project(request, api_key)
     chat_id = project["telegram_chat_id"]
     if not chat_id:
         raise HTTPException(409, "Dự án chưa có telegram_chat_id")
 
-    alerts = body.alerts[: cfg.max_alerts_per_request]
     tz = _tz(request)
-    header = "🛡 <b>Central Security Alert</b>"
-    blocks = [format_alert(project["project_name"], a, tz, body.host or "") for a in alerts]
-    messages = chunk_messages(header, blocks)
-
     tg: TelegramClient = request.app.state.telegram
-    delivered, last_err = 0, ""
-    for m in messages:
-        sent, err = await tg.send_message(chat_id, m)
+    stored = duplicated = 0
+    messages = delivered = 0
+    last_err = ""
+    results: list[dict[str, Any]] = []
+
+    for raw_alert in body.alerts[: cfg.max_alerts_per_request]:
+        alert = evidence.normalize(raw_alert, body.host or "", body.lan_ip or "",
+                                   body.user or "")
+        device_name = body.device or evidence.device_of(alert, body.host or "")
+        device_id = db.upsert_device(cfg.database_path, project["id"], device_name)
+
+        # 1. mirror the raw hits to disk first: never lose evidence to a DB error
+        ev_file = evidence.write_evidence(cfg, project["project_name"], alert)
+
+        # 2. notify: exactly one compact message per alert
+        text = format_alert(project["project_name"], alert, tz)
+        sent, err = await tg.send_message(chat_id, text)
         if sent:
             delivered += 1
         else:
             last_err = err
-            log.warning("gửi telegram thất bại project=%s: %s", project["id"], err)
-    all_sent = delivered == len(messages)
-    db.log_alerts(cfg.database_path, project["id"], alerts, all_sent)
-    out: dict[str, Any] = {"accepted": len(alerts), "messages": len(messages), "delivered": delivered}
+            log.warning("gửi telegram thất bại project=%s device=%s: %s",
+                        project["id"], device_name, err)
+        messages += 1
+
+        # 3. persist (idempotent on (device, batch_id): agent retries are safe)
+        alert_id = db.store_alert(cfg.database_path, project["id"], device_id, alert,
+                                  ev_file, sent, 1)
+        if alert_id is None:
+            duplicated += 1
+            results.append({"batch_id": alert.get("batch_id"), "status": "duplicate"})
+        else:
+            stored += 1
+            results.append({
+                "batch_id": alert.get("batch_id"),
+                "status": "stored",
+                "alert_id": alert_id,
+                "severity": alert["severity"],
+                "hits": alert["hits"],
+                "evidence_file": ev_file,
+            })
+
+    out: dict[str, Any] = {
+        "accepted": stored,
+        "duplicates": duplicated,
+        "messages": messages,
+        "delivered": delivered,
+        "alerts": results,
+    }
     if last_err:
-        out["warning"] = f"alert đã nhận nhưng gửi Telegram lỗi: {last_err}"
+        out["warning"] = f"alert đã lưu nhưng gửi Telegram lỗi: {last_err}"
     return out
+
+
+# ------------------------------------------------------------- ops / query
+
+@router.get("/devices")
+def list_devices(request: Request,
+                 scope: Optional[int] = Depends(_read_scope),
+                 project_id: Optional[int] = Query(default=None)):
+    """Every monitored device with alert counters — the inventory view.
+
+    API key chỉ thấy device của project mình; admin/read token thấy tất cả.
+    """
+    cfg = _cfg(request)
+    if scope is not None:
+        if project_id is not None and project_id != scope:
+            raise HTTPException(403, "API key không có quyền xem project này")
+        project_id = scope
+    return {"devices": [dict(r) for r in db.stats(cfg.database_path, project_id)]}
+
+
+@router.get("/alerts")
+def list_alerts(
+    request: Request,
+    scope: Optional[int] = Depends(_read_scope),
+    limit: int = Query(default=20, ge=1, le=200),
+    project_id: Optional[int] = None,
+    device_id: Optional[int] = None,
+    severity: Optional[str] = None,
+):
+    cfg = _cfg(request)
+    if scope is not None:
+        if project_id is not None and project_id != scope:
+            raise HTTPException(403, "API key không có quyền xem project này")
+        project_id = scope
+    rows = db.recent_alerts(cfg.database_path, limit, project_id, device_id, severity)
+    return {"alerts": [dict(r) for r in rows]}
+
+
+@router.get("/alerts/{alert_id}")
+def get_alert(alert_id: int, request: Request,
+              scope: Optional[int] = Depends(_read_scope)):
+    """Full alert including every raw hit line (file + line + raw)."""
+    cfg = _cfg(request)
+    detail = db.alert_detail(cfg.database_path, alert_id, scope)
+    if detail is None:
+        raise HTTPException(404, "alert không tồn tại")
+    return detail
+
+
+@router.get("/search")
+def search(request: Request, scope: Optional[int] = Depends(_read_scope),
+           q: str = Query(min_length=2), limit: int = Query(default=100, ge=1, le=500)):
+    """Free-text search across stored raw hit lines."""
+    cfg = _cfg(request)
+    return {"query": q,
+            "hits": [dict(r) for r in db.search_hits(cfg.database_path, q, limit, scope)]}
 
 
 # ------------------------------------------------------------- admin / ops

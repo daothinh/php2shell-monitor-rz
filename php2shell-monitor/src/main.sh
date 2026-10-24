@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# main.sh - CLI dispatcher (plan 5.4). Always runs with cwd=WORKDIR (bootstrap cd's).
-# Modes: discover | retro | run | status | stop | export | clean | help
+# main.sh - CLI dispatcher. Runs with cwd=WORKDIR (bootstrap cd's).
+#
+# Storage model:
+#   WORKDIR/projects/<project>/devices/<device>/{alerts,evidence,state,run}
+# PROJECT and DEVICE come from conf/device.conf (one monitor install = one device).
 set -u
-export WORKDIR=/tmp/php2shell-monitor
-
+export WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
 P2S_SRC_DIR=$WORKDIR
 export P2S_SRC_DIR
 # shellcheck source=/dev/null
@@ -11,62 +13,84 @@ source "$WORKDIR/lib/common.sh"
 # shellcheck source=/dev/null
 source "$WORKDIR/lib/log.sh"
 # shellcheck source=/dev/null
-source "$WORKDIR/lib/safe_fs.sh"
+source "$WORKDIR/lib/paths.sh"
 
 usage() {
   cat <<'EOF'
-php2shell-monitor — detection for CVE-2026-109618 / CVE-2026-109619 exploitation
+php2shell-monitor — one alert per 5-minute batch, full raw evidence kept
 
 Usage: sudo bash php2shell-monitor.sh -- <mode>
 
+The archive unpacks into /opt/php2shell-monitor and every byte the tool writes
+(code, config, offsets, alerts, evidence, temp files) stays under that directory.
+Nothing else on the host is created or modified.
+
 Modes:
-  discover   Read-only discovery: log map, patch status -> reports/log-map-actual.md
-  retro      One-shot retro-hunt over rotated logs since 2026-10-17 -> reports/
-  run        Start background supervisor (5-min batch + realtime watcher)
-  status     Supervisor/plugin/rule status + last 10 alerts
-  stop       Stop supervisor (state preserved)
-  export     Write SIEM JSON + SQL to export/
-  clean      stop + remove the whole workdir
+  (mặc định) Mọi lần chạy đều tự bật supervisor nền: rà log mỗi 5 phút,
+             alert sinh ra được đẩy Telegram nếu đã pair.
+  once       Run a single batch now (same work the supervisor does every 5 min)
+  run        Start the background supervisor (batch every BATCH_INTERVAL, default 300s)
+  pair       Pair this project with the Central Alert Server -> Telegram
+             (pair --server <url>); the project name comes from
+             conf/device.conf (PROJECT); alerts are forwarded
+             automatically while the supervisor runs
+  test       Send one test alert to the paired central server
+  status     Project/device, plugin health, last batches, last alert
+  stop       Stop the supervisor (state preserved)
+  discover   Read-only host discovery -> reports/log-map-actual.md
+  retro      One-shot hunt over rotated logs (produces one alert for the window)
+  export     Copy alert queue + evidence to export/ as JSON
+  clean      stop + remove /opt/php2shell-monitor entirely
+
+Alert model:
+  * at most ONE alert per batch, severity = highest severity among the hits
+  * every raw hit line is kept in <device>/evidence/<batch>.jsonl with file:line
+  * the alert itself embeds those hits (capped by MAX_EVIDENCE_INLINE)
 EOF
 }
 
-need_dirs() {
-  local d
-  for d in state alerts export reports run tmp state/agg; do
-    [[ -d "$WORKDIR/$d" ]] || (umask 077 && mkdir -m 0700 -p -- "$WORKDIR/$d")
-  done
-}
-
-# ---- mode dispatch ----------------------------------------------------------
+# makeself passes the script args verbatim, so callers may write `-- once`.
+[[ ${1:-} == -- ]] && shift
 mode=${1:-}
 [[ -z $mode || $mode == help || $mode == -h || $mode == --help ]] && { usage; exit 0; }
 
+p2s_device_init || { echo "cannot initialise data dirs under $WORKDIR" >&2; exit 1; }
+
+# Auto-start: any invocation keeps the 5-minute monitor running (idempotent —
+# a live supervisor is left alone, `stop`/`clean` below still win).
+if [[ $mode != stop && $mode != clean ]]; then
+  bash "$WORKDIR/engine/supervisor.sh" start >/dev/null 2>&1 || true
+fi
+
 case $mode in
-  discover)
-    need_dirs
-    bash "$WORKDIR/discovery/discovery.sh" "${2:-}"
-    ;;
-  retro)
-    need_dirs
-    bash "$WORKDIR/discovery/retro_hunt.sh" "${2:-}"
+  once)
+    bash "$WORKDIR/engine/scan.sh"
     ;;
   run)
-    need_dirs
     bash "$WORKDIR/engine/supervisor.sh" start
     ;;
+  pair)
+    shift
+    bash "$WORKDIR/engine/central.sh" pair "$@"
+    ;;
+  test)
+    bash "$WORKDIR/engine/central.sh" test
+    ;;
   status)
-    need_dirs
     bash "$WORKDIR/engine/status.sh"
     ;;
   stop)
-    need_dirs
     bash "$WORKDIR/engine/supervisor.sh" stop
     ;;
+  discover)
+    bash "$WORKDIR/discovery/discovery.sh" "${2:-}"
+    ;;
+  retro)
+    bash "$WORKDIR/discovery/retro_hunt.sh" "${2:-}"
+    ;;
   export)
-    need_dirs
     bash "$WORKDIR/export/export_json.sh"
-    bash "$WORKDIR/export/export_sql.sh"
-    echo "export written to $WORKDIR/export/"
+    echo "export written to $P2S_EXPORT_DIR"
     ;;
   clean)
     bash "$WORKDIR/engine/supervisor.sh" stop 2>/dev/null

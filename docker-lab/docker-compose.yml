@@ -1,0 +1,47 @@
+# PHP2Shell vulnerable lab (CVE-2026-109618 / CVE-2026-109619)
+#
+# Two independent lab environments built on the prebuilt p2slab images
+# (Debian php-fpm 8.2.34 / 8.3.35 — both below the fixed versions
+# 8.2.35 / 8.3.36 — plus nginx, with session.upload_progress enabled).
+#
+# Security posture (lab-standard):
+#   - bound to loopback only (127.0.0.1) — NOT reachable from the network
+#   - noextra_hosts, no privileged mode, no host docker socket
+#   - read/write limited to the mounted scratch dir (test-1 / test-2)
+#   - all aux services (MariaDB/Redis/Mailpit) on isolated internal networks
+#
+# Exposed ports:
+#   test-1 -> http://127.0.0.1:8081  (PHP 8.2.34, /tmp mounted from ../test-1)
+#   test-2 -> http://127.0.0.1:8082  (PHP 8.3.35, /tmp mounted from ../test-2)
+#
+# Usage:
+#   docker compose -f docker-lab/docker-compose.yml up -d
+#   curl http://127.0.0.1:8081/health.php
+#   docker compose -f docker-lab/docker-compose.yml logs web1   # access logs
+
+services:
+  web1:
+    image: p2slab/web:8.2.34-vuln
+    container_name: php2shell-lab-1
+    ports:
+      - "127.0.0.1:8081:80"
+    environment:
+      LAB_ROLE: target-1
+      CVE: "CVE-2026-109618,CVE-2026-109619"
+    volumes:
+      - ../test-1:/tmp:rw
+      - ../test-1/opt:/opt:rw
+    restart: "no"
+
+  web2:
+    image: p2slab/web:8.3.35-vuln
+    container_name: php2shell-lab-2
+    ports:
+      - "127.0.0.1:8082:80"
+    environment:
+      LAB_ROLE: target-2
+      CVE: "CVE-2026-109618,CVE-2026-109619"
+    volumes:
+      - ../test-2:/tmp:rw
+      - ../test-2/opt:/opt:rw
+    restart: "no"

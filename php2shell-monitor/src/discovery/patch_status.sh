@@ -4,7 +4,7 @@
 # Exit codes follow the cybaverse convention (plan 2):
 #   0 = patched (or no PHP), 1 = likely vulnerable, 2 = unknown
 set -u
-WORKDIR=${WORKDIR:-/tmp/php2shell-monitor}
+WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
 # shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
 
@@ -35,9 +35,7 @@ if have dpkg-query; then
     ver_clean=$(printf '%s' "$ver" | grep -oP '^[0-9]+(\.[0-9]+){1,2}')
     major_minor=$(printf '%s' "$ver_clean" | cut -d. -f1,2)
     fixed=${branch_fixed[$major_minor]:-}
-    ev="none"
     if _changelog_has_fix "$pkg"; then
-      ev="changelog mentions CVE-2026-109618/109619"
       echo "   state=PATCHED (changelog)"
     else
       if [[ -n $fixed ]]; then

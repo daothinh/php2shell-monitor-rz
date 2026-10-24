@@ -5,6 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# P2S_ALERT_FILE mặc định: /var/lib/php2shell/projects/default/devices/<host>/alerts/queue.jsonl
+# Đặt biến môi trường nếu project/device khác:
+Environment=P2S_ALERT_FILE=/var/lib/php2shell/projects/default/devices/%H/alerts/queue.jsonl
 ExecStart=/usr/local/bin/p2s-agent.sh run
 Restart=always
 RestartSec=10

@@ -5,8 +5,8 @@
 #   1. pair : xin mã ghép nối -> in ra terminal -> user gửi mã cho bot Telegram
 #             -> agent poll tới khi linked -> lưu api_key vào file conf (0600)
 #   2. run  : tail file alert JSONL của monitor (mặc định
-#             /tmp/php2shell-monitor/alerts/queue.jsonl), batch và POST về
-#             server; lỗi mạng -> spool đĩa, thử lại ở chu kỳ sau
+#             /var/lib/php2shell/projects/<project>/devices/<device>/alerts/queue.jsonl),
+#             batch và POST về server; lỗi mạng -> spool đĩa, thử lại ở chu kỳ sau
 #   3. test : gửi một alert thử để kiểm tra đường truyền sau khi ghép nối
 #
 # Dependencies: bash 4+, curl, coreutils. jq (nếu có) dùng parse JSON.
@@ -14,7 +14,9 @@ set -u
 
 CONF_PATH=${P2S_AGENT_CONF:-/etc/php2shell/agent.conf}
 STATE_DIR=${P2S_AGENT_STATE:-/var/lib/php2shell-agent}
-ALERT_FILE=${P2S_ALERT_FILE:-/tmp/php2shell-monitor/alerts/queue.jsonl}
+# Default queue of the monitor on this host. The monitor stores per
+# project/device; set P2S_ALERT_FILE when the project/device name differs.
+ALERT_FILE=${P2S_ALERT_FILE:-/var/lib/php2shell/projects/default/devices/$(hostname 2>/dev/null || echo unknown)/alerts/queue.jsonl}
 POLL_INTERVAL=${P2S_AGENT_POLL:-5}
 BATCH_MAX=20
 PAIR_TIMEOUT=900          # 15 phút
@@ -24,6 +26,21 @@ PROG=$(basename "$0")
 
 die() { printf '%s: lỗi: %s\n' "$PROG" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# LAN IP of this host: source address of the default route, then the first
+# global IPv4 from `ip -4 addr`, then `hostname -I`. Never loopback, and never
+# `hostname -i` (reverse DNS can block for minutes on a host without a resolver).
+lan_ip() {
+  local ip
+  if have ip; then
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+    [[ -n $ip ]] || ip=$(ip -4 -o addr show scope global 2>/dev/null |
+      awk '{ sub(/\/.*/, "", $4); if ($4 !~ /^127\./) { print $4; exit } }')
+  fi
+  [[ -n $ip ]] || ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\./ && !/^127\./ { print; exit }')
+  [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ip=""
+  printf '%s' "$ip"
+}
 
 # json_get <json> <key> — jq nếu có, fallback grep (đủ dùng với JSON phẳng của server)
 json_get() {
@@ -47,32 +64,33 @@ usage() {
 $PROG — agent Central Alert Server cho php2shell-monitor
 
 Usage:
-  $PROG pair   --name <tên-dự-án> --server <url-central-server>
+  $PROG pair   --server <url-central-server>
   $PROG run    [--file <alerts.jsonl>]
   $PROG test
+
+Tên dự án gửi lên server lấy từ P2S_PROJECT_NAME (mặc định: hostname).
 
 Biến môi trường (ghi đè mặc định):
   P2S_AGENT_CONF=$CONF_PATH
   P2S_AGENT_STATE=$STATE_DIR
-  P2S_ALERT_FILE=$ALERT_FILE
+  P2S_ALERT_FILE=<queue.jsonl> (mặc định: /var/lib/php2shell/projects/default/devices/<host>/alerts/queue.jsonl)
   P2S_AGENT_POLL=$POLL_INTERVAL (giây)
 EOF
 }
 
 # ============================================================ pair
 cmd_pair() {
-  local server= name=
+  local server=
   while [[ $# -gt 0 ]]; do
     case $1 in
-      --name)   name=${2:?}; shift 2 ;;
       --server) server=${2:?}; shift 2 ;;
       *) die "tham số không hợp lệ: $1 (xem $PROG help)" ;;
     esac
   done
   [[ $server =~ ^https?:// ]] || die "--server phải là URL http(s)://..."
-  [[ $name =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "--name 1-64 ký tự (chữ/số/._-@)"
 
-  local resp code
+  local resp code name
+  name=${P2S_PROJECT_NAME:-$(hostname 2>/dev/null || echo unknown)}
   resp=$("${CURL[@]}" -X POST "$server/api/v1/register-pairing" \
     -H 'Content-Type: application/json' \
     -d "{\"project_name\":\"$(json_escape "$name")\"}") || die "không gọi được $server"
@@ -124,10 +142,24 @@ load_conf() {
   [[ -n ${API_KEY:-} ]] || die "API_KEY trống trong conf — ghép nối lại"
 }
 
+# Device name: derived from the monitor's data layout
+# (<workdir>/projects/<project>/devices/<device>/alerts/queue.jsonl) when the
+# path matches, otherwise the hostname.
+device_name() {
+  local d
+  d=$(printf '%s' "$ALERT_FILE" | sed -n 's#.*/projects/[^/]*/devices/\([^/]*\)/alerts/.*#\1#p')
+  printf '%s' "${d:-$(hostname 2>/dev/null || echo unknown)}"
+}
+
 post_alerts() { # các dòng JSON làm tham số -> 0 nếu server nhận
   local payload
-  payload=$(printf '{"host":"%s","alerts":[%s]}' \
+  # The monitor names its own device; fall back to the hostname. Host + LAN IP
+  # + user are sent so the central store can attribute and locate the box.
+  payload=$(printf '{"host":"%s","device":"%s","lan_ip":"%s","user":"%s","alerts":[%s]}' \
     "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" \
+    "$(json_escape "$(device_name)")" \
+    "$(json_escape "$(lan_ip)")" \
+    "$(json_escape "$(id -un 2>/dev/null || echo unknown)")" \
     "$(printf '%s\n' "$@" | paste -sd, -)")
   "${CURL[@]}" -X POST "$SERVER_URL/api/v1/ingest-log" \
     -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
@@ -242,8 +274,11 @@ cmd_test() {
   load_conf
   local ts payload resp
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  payload=$(printf '{"host":"%s","alerts":[{"ts_utc":"%s","rule_id":"TEST-001","severity":"INFO","tier":"TEST","message":"Alert thử từ %s — đường truyền ghép nối hoạt động!"}]}' \
-    "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" "$ts" "$PROG")
+  payload=$(printf '{"host":"%s","lan_ip":"%s","user":"%s","alerts":[{"ts_utc":"%s","rule_id":"TEST-001","severity":"INFO","tier":"TEST","message":"Alert thử từ %s — đường truyền ghép nối hoạt động!"}]}' \
+    "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" \
+    "$(json_escape "$(lan_ip)")" \
+    "$(json_escape "$(id -un 2>/dev/null || echo unknown)")" \
+    "$ts" "$PROG")
   resp=$(curl -sS --connect-timeout 10 --max-time 30 -X POST \
     "$SERVER_URL/api/v1/ingest-log" \
     -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \

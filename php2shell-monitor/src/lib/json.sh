@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# json.sh - minimal JSON emission (no subprocess per value)
+# json.sh - minimal JSON emission without a subprocess per value.
 [[ -n ${P2S_JSON_SH:-} ]] && return 0
 P2S_JSON_SH=1
 
-# Escape a string for inclusion inside JSON quotes. Handles control chars.
 json_escape() {
   local s=${1-}
   s=${s//\\/\\\\}
@@ -13,7 +12,6 @@ json_escape() {
   s=${s//$'\t'/\\t}
   s=${s//$'\b'/\\b}
   s=${s//$'\f'/\\f}
-  # remaining control bytes -> \u00XX
   local out='' i c
   if [[ $s == *[$'\x01'-$'\x1f']* ]]; then
     local LC_ALL=C
@@ -31,7 +29,6 @@ json_escape() {
 
 json_str() { printf '"%s"' "$(json_escape "${1-}")"; }
 
-# Emit a valid JSON number or null.
 json_num() {
   local v=${1-}
   if [[ $v =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
@@ -41,7 +38,7 @@ json_num() {
   fi
 }
 
-# Usage: json_obj key1 value1_json key2 value2_json ...
+# json_obj key1 value1_json key2 value2_json ...
 json_obj() {
   local out='{' first=1 k v
   while [[ $# -ge 2 ]]; do
@@ -50,11 +47,4 @@ json_obj() {
     out+="\"$(json_escape "$k")\":$v"
   done
   printf '%s}' "$out"
-}
-
-# Read a JSONL file's fields via jq/jaq: jqf file filter
-json_query_file() {
-  local file=$1 filter=$2
-  [[ -n ${P2S_JQ:-} ]] || return 1
-  "$P2S_JQ" -c "$filter" "$file" 2>/dev/null
 }

@@ -50,11 +50,3 @@ sudo ./p2s-agent.sh pair --name khach-hang-A --server https://alert.example.com
 sudo ./p2s-agent.sh test    # alert thử phải hiện trên Telegram
 sudo ./p2s-agent.sh run     # chạy thường trực (systemd unit kèm sẵn)
 ```
-
-## Đường alert hoàn chỉnh
-
-php2shell-monitor phát hiện (ví dụ worker php-fpm `exited on signal 11` + IP đang POST upload-progress) → ghi `alerts/queue.jsonl` → `p2s-agent.sh` đọc theo offset (không trùng, spool khi mất mạng) → `POST /api/v1/ingest-log` → central server tra `api_key → project → chat_id` → **🚨 CRITICAL · P2S-011** hiện trên Telegram trong ~giây.
-
-## Giấy phép & phạm vi
-
-Nghiên cứu/giáo dục và vận hành giám sát an ninh cho hệ thống của bạn. Các rule có ghi rõ nguồn gốc/license trong từng file JSONL (tham chiếu Sigma, Elastic, Cybaverse, Lexsah, NSA DFIR…). Thư mục `repos/` chứa bản clone các repo tham chiếu bên thứ ba — **không đưa lên git** (xem `.gitignore`).

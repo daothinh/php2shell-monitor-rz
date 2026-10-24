@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# supervisor.sh - start/stop the background supervisor (plan 5.4: no cron, no
-# systemd; 1 supervisor loops batch every BATCH_INTERVAL seconds and runs the
-# realtime watcher as a child). PID file: run/supervisor.pid. flock prevents
-# double start.
+# supervisor.sh - background loop: one batch every BATCH_INTERVAL seconds.
+# No cron and no systemd unit required. PID file: <device>/run/supervisor.pid.
 set -u
-WORKDIR=${WORKDIR:-/tmp/php2shell-monitor}
+WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
+export WORKDIR
 # shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
 # shellcheck source=/dev/null
 source "$WORKDIR/lib/log.sh"
+# shellcheck source=/dev/null
+source "$WORKDIR/lib/paths.sh"
+p2s_device_init || exit 1
+[[ -f $WORKDIR/conf/default.conf ]] && source "$WORKDIR/conf/default.conf"
+export BATCH_INTERVAL
 
-PIDFILE=$WORKDIR/run/supervisor.pid
-LOCK=$WORKDIR/run/supervisor.lock
+PIDFILE=$P2S_DEVICE_RUN_DIR/supervisor.pid
+LOCK=$P2S_DEVICE_RUN_DIR/supervisor.lock
 
 _supervisor_alive() {
   local pid
@@ -21,57 +25,46 @@ _supervisor_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
-_supervisor_loop() {
-  trap 'pkill -P $$ 2>/dev/null; exit 0' TERM INT
-  log_info "supervisor started (pid $$)"
-  p2s_status_write "supervisor_started"
-  # realtime watcher as child
-  bash "$WORKDIR/engine/watch.sh" &
-  WATCHER_PID=$!
-  while true; do
-    nice -n 10 bash "$WORKDIR/engine/scan.sh" >>"$P2S_RUN_DIR/scan.log" 2>&1
-    sleep "${BATCH_INTERVAL:-300}" &
-    SLEEP_PID=$!
-    wait "$SLEEP_PID" 2>/dev/null || true
-  done
-}
-
-p2s_status_write() { # <phase>
-  local phase=${1:-unknown} now
-  now=$(utc_now)
-  local host
-  host=$(hostname 2>/dev/null || echo unknown)
-  cat >"$P2S_RUN_DIR/status.json" <<EOF
-{"ts_utc":"$now","host":"$host","phase":"$phase","pid":$(cat "$PIDFILE" 2>/dev/null || echo 0),"watcher_pid":${WATCHER_PID:-0}}
-EOF
+# If conf/central.conf exists (already paired with a Central Alert Server),
+# keep one forwarder agent running so every alert reaches Telegram.
+_ensure_agent() {
+  [[ -r $WORKDIR/conf/central.conf ]] || return 0
+  ( umask 077; mkdir -p -- "$P2S_DEVICE_RUN_DIR" )
+  local pid
+  pid=$(cat "$P2S_DEVICE_RUN_DIR/agent/agent.pid" 2>/dev/null || echo 0)
+  [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 0
+  setsid bash "$WORKDIR/engine/central.sh" agent \
+    >>"$P2S_DEVICE_RUN_DIR/agent.log" 2>&1 &
+  log_info "central agent respawned for $PROJECT/$DEVICE"
 }
 
 case ${1:-} in
+  loop)
+    log_info "supervisor started (pid $$) for $PROJECT/$DEVICE"
+    _ensure_agent
+    while true; do
+      nice -n 10 bash "$WORKDIR/engine/scan.sh" >>"$P2S_DEVICE_RUN_DIR/scan.log" 2>&1
+      _ensure_agent
+      sleep "${BATCH_INTERVAL:-300}"
+    done
+    ;;
   start)
     if _supervisor_alive; then
-      echo "php2shell-monitor already running (pid $(cat "$PIDFILE"))"
+      echo "already running (pid $(cat "$PIDFILE")) for $PROJECT/$DEVICE"
       exit 0
     fi
-    # source config for BATCH_INTERVAL
-    [[ -f $WORKDIR/conf/default.conf ]] && source "$WORKDIR/conf/default.conf"
-    export BATCH_INTERVAL
     (
       exec 9>"$LOCK"
-      if ! flock -n 9; then
-        echo "supervisor lock held; refusing double start" >&2
-        exit 1
-      fi
-      setsid bash -c 'declare -f _supervisor_loop p2s_status_write >/dev/null 2>&1; source /dev/stdin <<"P2S_EOF"
-'"$(declare -f _supervisor_loop p2s_status_write)"'
-P2S_EOF
-_supervisor_loop' >>"$P2S_RUN_DIR/supervisor.log" 2>&1 &
+      flock -n 9 || { echo "supervisor lock held; refusing double start" >&2; exit 1; }
+      setsid bash "$WORKDIR/engine/supervisor.sh" loop \
+        >>"$P2S_DEVICE_RUN_DIR/supervisor.log" 2>&1 &
       echo $! >"$PIDFILE"
     )
     sleep 1
     if _supervisor_alive; then
-      echo "supervisor started (pid $(cat "$PIDFILE"))"
+      echo "supervisor started (pid $(cat "$PIDFILE")) — project=$PROJECT device=$DEVICE"
     else
-      echo "supervisor failed to start; see $P2S_RUN_DIR/supervisor.log" >&2
+      echo "supervisor failed to start; see $P2S_DEVICE_RUN_DIR/supervisor.log" >&2
       exit 1
     fi
     ;;
@@ -81,26 +74,30 @@ _supervisor_loop' >>"$P2S_RUN_DIR/supervisor.log" 2>&1 &
       rm -f -- "$PIDFILE"
       exit 0
     fi
-    local_pid=$(cat "$PIDFILE")
-    kill -TERM "$local_pid" 2>/dev/null
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "$local_pid" 2>/dev/null || break
+    pid=$(cat "$PIDFILE")
+    kill -TERM "$pid" 2>/dev/null
+    for _ in 1 2 3 4 5; do
+      kill -0 "$pid" 2>/dev/null || break
       sleep 1
     done
-    kill -9 "$local_pid" 2>/dev/null || true
-    # kill any stragglers running engine code (watcher tails, scoring loops);
-    # exclude our own pid so this stop script is not TERMed mid-run
+    kill -9 "$pid" 2>/dev/null || true
+    # stop any scan still running for this device
     for sp in $(pgrep -f "$WORKDIR/engine/" 2>/dev/null); do
-      [[ $sp == $$ ]] && continue
+      [[ $sp == "$$" ]] && continue
       kill -TERM "$sp" 2>/dev/null || true
     done
+    # stop the central forwarder agent too
+    apid=$(cat "$P2S_DEVICE_RUN_DIR/agent/agent.pid" 2>/dev/null || echo 0)
+    if [[ $apid =~ ^[0-9]+$ ]] && kill -0 "$apid" 2>/dev/null; then
+      kill -TERM "$apid" 2>/dev/null || true
+    fi
+    rm -f -- "$P2S_DEVICE_RUN_DIR/agent.pid"
     rm -f -- "$PIDFILE"
-    p2s_status_write stopped
     echo "supervisor stopped"
     ;;
   status)
     if _supervisor_alive; then
-      echo "running (pid $(cat "$PIDFILE"))"
+      echo "running (pid $(cat "$PIDFILE")) — project=$PROJECT device=$DEVICE"
     else
       echo "not running"
       exit 1

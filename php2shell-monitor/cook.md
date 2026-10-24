@@ -1,25 +1,33 @@
 # 🛡️ PHP2SHELL MONITOR — KẾ HOẠCH TRIỂN KHAI (PLAN v4)
 
+> ⚠️ **Tài liệu này là bản kế hoạch lịch sử.** Mô hình đã được đơn giản hoá và
+> code hiện tại không còn correlator/scoring/dedup/baseline/watcher realtime.
+> Hợp đồng hiện hành: **một batch 5 phút → tối đa một alert (severity cao nhất)
+> + toàn bộ dòng log gốc kèm `file:line`**, lưu theo
+> `projects/<project>/devices/<device>/`.
+> Đọc `README.md`, `ARCHITECTURE.md`, `docs/OPERATIONS.md` trước; các mục dưới
+> đây chỉ còn giá trị tham khảo về nguồn log, rule và bối cảnh CVE.
+
 | Mục | Giá trị |
 |---|---|
 | Đối tượng giám sát | Khai thác CVE-2026-109618 / CVE-2026-109619 ("PHP2Shell") + dấu vết hậu khai thác |
 | Nền tảng | Bash thuần. Source tách trong `src/`, build thành **1 file `.sh` tự giải nén (makeself)**. Chạy trên Linux server, **bắt buộc root**, chạy từ thư mục bất kỳ. Không cron/systemd: 1 supervisor tự lặp batch 5 phút + watcher realtime |
 | Ngôn ngữ | Tiếng Việt (plan), code/comment tiếng Anh |
 | Phạm vi xuất dữ liệu | JSON (chuẩn SIEM) + SQL. **Telebot / Splunk HEC / YARA → deferred** |
-| Thay đổi trên hệ thống | **Chỉ duy nhất thư mục `/tmp/php2shell-monitor`** (mục 5.2). Không cron, không systemd, không user mới, không đụng `/opt` `/var` `/etc`. Không sửa log_format/FPM/php.ini/auditd — chỉ đề xuất ở mục 8 |
+| Thay đổi trên hệ thống | **Chỉ duy nhất thư mục `/opt/php2shell-monitor`** (mục 5.2). Không cron, không systemd, không user mới, không đụng `/var` `/etc` `/usr`. Không sửa log_format/FPM/php.ini/auditd — chỉ đề xuất ở mục 8 |
 
 ---
 
 ## 0. NGUYÊN TẮC BẤT DI BẤT DỊCH
 
-1. **Read-only trên hệ thống đích**: không sửa log_format, php.ini/pool, không cài package, không bật auditd/modsec. Monitor chỉ ĐỌC log có sẵn. Mọi thứ monitor ghi (code giải nén, state, alert, export, file tạm) **chỉ nằm trong `/tmp/php2shell-monitor`** (mục 5.2).
+1. **Read-only trên hệ thống đích**: không sửa log_format, php.ini/pool, không cài package, không bật auditd/modsec. Monitor chỉ ĐỌC log có sẵn. Mọi thứ monitor ghi (code giải nén, state, alert, export, file tạm) **chỉ nằm trong `/opt/php2shell-monitor`** (mục 5.2).
 2. Mọi lệnh discovery chỉ chạy khi được duyệt, và phải là lệnh đọc. **Output discovery phải lọc theo key cần thiết, không dump toàn bộ config** (tránh lộ credential trong upstream URL, env pool, basic-auth path).
 3. Monitor phải **bao phủ được hệ thống "trống"** (chỉ access log). Nguồn log = plugin; thiếu nguồn nào bỏ qua nguồn đó, không crash, và **ghi rõ rule nào bị tắt vì thiếu nguồn** vào status report.
 4. Không hardcode secret. Không gửi dữ liệu ra ngoài ở phase này.
 5. **Không dùng version number để kết luận "đã vá"** (backport Ubuntu ESM/CloudLinux). Dùng package changelog (read-only).
 6. **Mọi timestamp chuẩn hóa về UTC** ngay tại parser (access log có offset, FPM log không có tz, journald dùng local time).
 7. **Bắt buộc chạy root.** Không phải root → in thông báo và thoát (exit 1). Không tạo user/group riêng, không có chế độ "chạy giảm quyền".
-8. **Chạy từ bất kỳ đâu.** File `.sh` tự đủ, không phụ thuộc cwd hay đường dẫn cài đặt; tự tạo và dùng workdir cố định `/tmp/php2shell-monitor`, mọi việc làm trong đó.
+8. **Chạy từ bất kỳ đâu.** File `.sh` tự đủ, không phụ thuộc cwd hay đường dẫn cài đặt; archive giải nén thẳng vào workdir cố định `/opt/php2shell-monitor`, mọi việc làm trong đó.
 
 ---
 
@@ -293,15 +301,15 @@ Bất kỳ T3 đứng riêng                    = CRITICAL
 
 | Mục | Giá trị |
 |---|---|
-| Đường dẫn | `/tmp/php2shell-monitor` (cố định) |
+| Đường dẫn | `/opt/php2shell-monitor` (cố định; makeself `--target`) |
 | Tạo / kiểm tra | `bootstrap.sh` tự tạo bằng `mkdir -m 0700`. Nếu đã tồn tại thì phải là **thư mục thật, owner root, mode 0700, không phải symlink**, sai bất kỳ điều kiện nào → dừng, không ghi gì. Lý do: `/tmp` ghi được bởi mọi user (kể cả `www-data` sau khi bị RCE) → chặn kịch bản kẻ khác dựng sẵn thư mục/symlink để root ghi vào |
-| Ghi ngoài workdir | **Không**. Đặt `TMPDIR=$WORKDIR/tmp` cho mọi file tạm. Ngoại lệ ngắn hạn duy nhất: thư mục giải nén tạm của makeself, tự xóa khi `bootstrap.sh` kết thúc |
+| Ghi ngoài workdir | **Không**. Mọi file tạm dùng `$WORKDIR/tmp`; makeself giải nén trực tiếp vào workdir nên không có thư mục staging nào khác |
 | Đọc ngoài workdir | Chỉ đọc log/config/webroot/session theo mục 3 (read-only) |
-| Không tạo | cron, systemd unit, user/group, file trong `/opt` `/var` `/etc`, thay đổi package |
+| Không tạo | cron, systemd unit, user/group, file trong `/var` `/etc` `/usr`, thay đổi package |
 | Tiến trình | 1 supervisor chạy nền (`setsid`), PID lưu ở `workdir/run/supervisor.pid` |
 
 ```
-/tmp/php2shell-monitor/            (0700, root)
+/opt/php2shell-monitor/            (0700, root)
 ├── bin/ lib/ plugins/ rules/ engine/ export/ discovery/   ← code giải nén (ghi đè khi chạy lại bản mới)
 ├── conf/        default.conf, rules.conf, whitelist.conf   ← giữ nguyên khi cập nhật code
 ├── state/       offsets (inode:offset), baseline, manifest ← giữ nguyên khi cập nhật code
@@ -319,7 +327,7 @@ php2shell-monitor/                 (repo, trên máy build)
 ├── VERSION
 ├── build.sh                       ← shellcheck → bats → makeself → sha256
 ├── src/
-│   ├── bootstrap.sh               ← startup script của makeself (root check, workdir safe-init, copy payload, exec main)
+│   ├── bootstrap.sh               ← startup script của makeself (root check, seed conf/, prune code cũ, exec main)
 │   ├── main.sh                    ← dispatcher CLI (discover|retro|run|status|stop|export|clean)
 │   ├── lib/                       ← common.sh, log.sh, time_utc.sh, safe_fs.sh, state.sh, json.sh, sql.sh
 │   ├── discovery/                 ← discovery.sh (mục 3.4), retro_hunt.sh (mục 6.6), patch_status.sh
@@ -344,10 +352,10 @@ makeself --sha256 --nox11 --noprogress --gzip src dist/php2shell-monitor.sh \
          "PHP2Shell Monitor $(cat VERSION)" ./bootstrap.sh
 sha256sum dist/php2shell-monitor.sh > dist/php2shell-monitor.sh.sha256
 ```
-- Luồng chạy: makeself giải nén vào thư mục tạm → chạy `bootstrap.sh` → bootstrap kiểm tra root + khởi tạo workdir an toàn (5.2) → copy payload vào `/tmp/php2shell-monitor` (ghi đè code, giữ `conf/` `state/`) → `cd` vào workdir → `exec main.sh "$@"`. Từ đó mọi đường dẫn tương đối theo workdir.
+- Luồng chạy: `makeself --needroot --target /opt/php2shell-monitor` kiểm tra root rồi giải nén **thẳng** vào workdir → chạy `bootstrap.sh` tại đó → seed `conf/` từ `conf.default/`, xoá code cũ không còn trong `MANIFEST`, `chown root` + `chmod 0700/0600` → `cd` vào workdir → `exec main.sh "$@"`. Không có bản copy thứ hai, không staging trong `/tmp`.
 - Tham số truyền cho monitor đặt sau `--`: `sudo bash php2shell-monitor.sh -- <mode>`. Không có mode → in help, **không làm gì**.
 - Toàn vẹn: phát hành kèm `.sha256`; makeself tự kiểm checksum nội bộ khi giải nén.
-- Lưu ý khi build: xác nhận cờ makeself theo phiên bản đang dùng (`makeself --help`), nhất là cờ chọn thư mục giải nén; thiết kế trên không phụ thuộc cờ đó vì bootstrap tự copy vào workdir.
+- Lưu ý khi build: `--target`/`--needroot` cần makeself ≥ 2.2; `build.sh` dùng đúng hai cờ này nên bootstrap không phải copy payload.
 
 ### 5.4. CLI & VÒNG ĐỜI
 
@@ -537,7 +545,7 @@ Mức độ: WAF/IDS chỉ *quan sát* (pass/log) nên cảnh báo từ đây l�
 3. **Có CDN/WAF/reverse proxy phía trước không?** Header nào mang IP thật? Log_format hiện tại có chứa không? 
 4. **Một host hay cả fleet?** (ảnh hưởng cách chạy retro-hunt và gom alert)
 5. **Server đã vá chưa?** (đổi ưu tiên: nếu đã vá, vẫn cần retro-hunt vì có thể bị khai thác trước khi vá)
-6. Chấp nhận mô hình v3: root bắt buộc, chỉ ghi `/tmp/php2shell-monitor`, không cron/systemd (mất giám sát sau reboot cho tới khi chạy lại)? `/tmp` trên server có phải tmpfs / `noexec` / bị dọn định kỳ không (`findmnt /tmp`, `systemd-tmpfiles`)?
+6. Chấp nhận mô hình v3: root bắt buộc, chỉ ghi `/opt/php2shell-monitor`, không cron/systemd (mất giám sát sau reboot cho tới khi chạy lại)?
 7. Webroot + `session.save_path` chính thức của server?
 8. Định dạng SQL đích (file `.sql` thuần? DB nào?) và tiêu chí FP rate cho sign-off P4?
 9. **Ai nhận & xử lý alert CRITICAL** khi Telebot còn deferred, và kênh tạm thời là gì? 

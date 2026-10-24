@@ -29,9 +29,12 @@ def _load_dotenv(path: str = ".env") -> None:
 class Config:
     bot_token: str = ""
     database_path: str = "data/alerts.db"
+    evidence_root: str = "data/evidence"  # mirror of raw hits: <root>/<project>/IP-LAN_<ip>_<host>_<user>/
+    retention_days: int = 90            # 0 = keep forever (alerts + evidence)
     pairing_ttl_sec: int = 600          # mã pairing sống 10 phút
     reveal_ttl_sec: int = 600           # api_key được lấy lại trong 10 phút sau lần đầu
-    admin_token: str = ""               # bật endpoint /admin/link nếu khác rỗng
+    admin_token: str = ""               # bật endpoint /admin/link + đọc toàn bộ nếu khác rỗng
+    read_token: str = ""                # token chỉ-đọc (dashboard/ops): xem mọi project
     bot_polling: bool = True
     max_alerts_per_request: int = 50
     ingest_rate_per_min: int = 120      # giới hạn request/phút theo api_key
@@ -48,9 +51,12 @@ def load_config() -> Config:
     cfg = Config(
         bot_token=os.environ.get("ALERT_BOT_TOKEN", os.environ.get("BOT_TOKEN", "")),
         database_path=os.environ.get("ALERT_DB_PATH", "data/alerts.db"),
+        evidence_root=os.environ.get("ALERT_EVIDENCE_ROOT", "data/evidence"),
+        retention_days=int(os.environ.get("ALERT_RETENTION_DAYS", "90")),
         pairing_ttl_sec=int(os.environ.get("ALERT_PAIRING_TTL_SEC", "600")),
         reveal_ttl_sec=int(os.environ.get("ALERT_REVEAL_TTL_SEC", "600")),
         admin_token=os.environ.get("ALERT_ADMIN_TOKEN", ""),
+        read_token=os.environ.get("ALERT_READ_TOKEN", ""),
         bot_polling=os.environ.get("ALERT_BOT_POLLING", "1") not in ("0", "false", "no"),
         max_alerts_per_request=int(os.environ.get("ALERT_MAX_ALERTS_PER_REQUEST", "50")),
         ingest_rate_per_min=int(os.environ.get("ALERT_INGEST_RATE_PER_MIN", "120")),

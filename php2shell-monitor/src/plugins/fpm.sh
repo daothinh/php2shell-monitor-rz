@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# fpm.sh - PHP-FPM master/pool error logs (plan 3.2.C, strongest T2 source).
-# Patterns per plan 6.1: P2S-010 (memory), P2S-011 (signal 11), P2S-018 (exit
-# codes 70/137), P2S-019 (worker churn - count fed to aggregator).
+# fpm.sh - PHP-FPM master/pool error logs (strongest T2 source).
+# Emits every line that looks like a PHP failure; the rule pack decides which
+# rule it belongs to. File path and line number travel with each record.
 set -u
 # shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=fpm
+export plugin_name
 
 fpm_log_files() {
   local -a out=()
@@ -21,33 +22,13 @@ fpm_log_files() {
 }
 
 parse_fpm_line() {
-  local line=$1
-  local ts pid
-  ts=$(t_extract_fpm_ts "$line")
-  P2S_TS=${ts:-$(utc_now)}
-  # pid appears in WARNING: [pool www] child 12345 said...
+  local line=$1 ts pid
+  ts=$(t_extract_fpm_ts "$line") || ts=$(utc_now)
+  P2S_TS=$ts; export P2S_TS
   pid=$(printf '%s' "$line" | grep -oP 'child \K[0-9]+' | head -1)
-  P2S_PID=$pid
-  local rule
-  case $line in
-    *'Allowed memory size of'*|*'Out of memory'*|*'Hard memory limit'*|*'in Unknown on line 0'*)
-      rule=P2S-010 ;;
-    *'exited on signal'*|*'signal 11'*|*'SIGSEGV'*|*'SIGBUS'*|*'SIGABRT'*)
-      rule=P2S-011 ;;
-    *'exit code 70'*|*'exit code 137'*|*'execution timed out'*)
-      rule=P2S-018 ;;
-    *)
-      rule=- ;;
-  esac
-  emit_record fpm_error "" "" "" "" "" "" "$pid" "" "" "$rule" "$line"
+  emit_record fpm_error "$P2S_FILE" "$P2S_LINE" "" "" "" "" "" "$pid" "$line" "-"
 }
 
-plugin_run() {
-  local f
-  while IFS= read -r f; do
-    [[ -n $f ]] && batch_read "$f" parse_fpm_line
-  done < <(fpm_log_files)
-}
-
-plugin_run
-exit 0
+while IFS= read -r f; do
+  [[ -n $f ]] && batch_read "$f" parse_fpm_line
+done < <(fpm_log_files)
