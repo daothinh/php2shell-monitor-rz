@@ -31,8 +31,9 @@ Modes:
   once       Run a single batch now (same work the supervisor does every 5 min)
   run        Start the background supervisor (batch every BATCH_INTERVAL, default 300s)
   (mặc định / pair) Ghép nối với Central Alert Server (đã hardcode:
-             http://45.124.93.136:8000) — chỉ cần:
-               sudo php2shell-monitor.sh --chatid <chat-id> [--project <tên>]
+             http://45.124.93.136:8000). TÊN DỰ ÁN bắt buộc, đứng đầu:
+               sudo php2shell-monitor.sh <tên-dự-án> --chatid <chat-id>
+             (hoặc --project <tên> --chatid <chat-id>).
              --server có thể ghi đè; --device được bỏ qua (tự detect hostname);
              nhắn /id cho bot để lấy Chat ID, rồi /confirm trong chat đó.
   test       Send one test alert to the paired central server
@@ -54,19 +55,30 @@ EOF
 [[ ${1:-} == -- ]] && shift
 
 # Single-command mode (không cần mode tường minh):
-#   sudo php2shell-monitor.sh --chatid <chat-id> [--project <tên>]
-#   = pair với server hardcode bên dưới, DEVICE luôn tự detect (hostname).
-# `--device` được chấp nhận nhưng BỎ QUA (auto-detect). Nếu mode không phải
-# `|--chatid|--server|--project|--device|--...` thì dùng như mode cũ.
+#   sudo php2shell-monitor.sh <tên-dự-án> --chatid <chat-id>
+#   sudo php2shell-monitor.sh --project <tên> --chatid <chat-id>
+# TÊN DỰ ÁN là BẮT BUỘC (arg đầu hoặc --project). Với name từ arg đầu,
+# không được trùng tên mode (once|run|pair|test|status|stop|discover|
+# retro|export|clean) — dùng --project nếu trùng. Device luôn tự detect.
 P2S_DEFAULT_SERVER=${P2S_DEFAULT_SERVER:-http://45.124.93.136:8000}
 
-first=${1:-}
-if [[ -z $first || $first == -* ]]; then mode=pair; else mode=$first; fi
-[[ $mode == help || $mode == -h || $mode == --help ]] && mode=help
+valid_project() { [[ $1 =~ ^[A-Za-z0-9._-]{1,64}$ && $1 != -* ]]; }
 
+first=${1:-}
+mode=
 pair_args=() want_project=
-if [[ $mode == pair ]]; then
-  if [[ -n $first && $first != -* ]]; then shift; fi
+
+if [[ $first == help || $first == -h || $first == --help ]]; then
+  mode=help
+elif [[ $first =~ ^(once|run|pair|test|status|stop|discover|retro|export|clean)$ ]]; then
+  mode=$first
+  [[ -n $1 ]] && shift
+else
+  mode=pair
+  # tên dự án: arg đầu (không phải flag) hoặc --project; bắt buộc
+  if [[ -n $first && $first != -* ]]; then
+    want_project=$first; shift
+  fi
   while (($#)); do
     case $1 in
       --chatid)  pair_args+=(--chatid "${2:-}"); shift 2 ;;
@@ -77,18 +89,25 @@ if [[ $mode == pair ]]; then
       *) echo "tham số không hợp lệ: $1" >&2; usage; exit 2 ;;
     esac
   done
+  if [[ -z $want_project ]]; then
+    printf '❌ Thiếu TÊN DỰ ÁN (bắt buộc).\n' >&2
+    printf '   Cú pháp: sudo php2shell-monitor.sh <tên-dự-án> --chatid <chat-id>\n' >&2
+    exit 2
+  fi
+  valid_project "$want_project" || {
+    printf '❌ Tên dự án "%s" không hợp lệ (chỉ A-Z a-z 0-9 . _ -, độ dài 1-64).\n' "$want_project" >&2
+    exit 2
+  }
   # server mặc định: chỉ thêm khi caller không truyền --server
   has_server=0
   for a in "${pair_args[@]}"; do [[ $a == --server ]] && has_server=1; done
   ((has_server)) || pair_args=(--server "$P2S_DEFAULT_SERVER" "${pair_args[@]}")
-  # --project: ghi vào conf/device.conf trước khi p2s_device_init đọc nó
-  if [[ -n $want_project ]]; then
-    conf=$WORKDIR/conf/device.conf
-    if [[ -e $conf ]] && grep -q '^PROJECT=' "$conf" && [[ $(grep '^PROJECT=' "$conf") != "PROJECT=\"$want_project\"" ]]; then
-      sed -i "s|^PROJECT=.*|PROJECT=\"$want_project\"|" "$conf"
-    else
-      printf '# php2shell-monitor — device identity\nPROJECT="%s"\nDEVICE="$(hostname 2>/dev/null || echo unknown)"\n' "$want_project" >"$conf"
-    fi
+  # tên dự án: ghi vào conf/device.conf trước khi p2s_device_init đọc nó
+  conf=$WORKDIR/conf/device.conf
+  if [[ -e $conf ]] && grep -q '^PROJECT=' "$conf" && [[ $(grep '^PROJECT=' "$conf") != "PROJECT=\"$want_project\"" ]]; then
+    sed -i "s|^PROJECT=.*|PROJECT=\"$want_project\"|" "$conf"
+  else
+    printf '# php2shell-monitor — device identity\nPROJECT="%s"\nDEVICE="$(hostname 2>/dev/null || echo unknown)"\n' "$want_project" >"$conf"
   fi
 fi
 
