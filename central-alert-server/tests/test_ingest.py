@@ -553,3 +553,53 @@ def test_plain_message_hints_pending_confirm(env):
     bot = _bot(cfg, tg)
     asyncio.run(bot.handle_update(_msg(4242, "hello")))
     assert "/confirm" in tg.sent[-1][1]
+
+
+def test_repair_same_project_reuses_row_and_rotates_key(env):
+    """Pair lại cùng tên về cùng chat: TÁI DỤNG row dự án (không còn trùng tên
+    trong /list, thiết bị không bị xé sang row mới); API key bị XOAY — key cũ
+    chết, key mới gửi được, bot cảnh báo rõ việc xoay key."""
+    client, cfg, tg = env
+    bot = _bot(cfg, tg)
+    chat = 8010
+
+    # lần 1: pair + confirm -> linked, lấy key
+    r1 = _register_chatid(client, "bruh", chat)
+    asyncio.run(bot.handle_update(_msg(chat, "/confirm")))
+    key1 = client.get(f"/api/v1/pairing-status?code={r1['pair_ref']}").json()["api_key"]
+
+    # lần 2: pair lại CÙNG TÊN, cùng chat -> không được tạo row mới
+    r2 = _register_chatid(client, "bruh", chat)
+    assert r2["pair_ref"] != r1["pair_ref"]
+    asyncio.run(bot.handle_update(_msg(chat, "/confirm")))
+    key2 = client.get(f"/api/v1/pairing-status?code={r2['pair_ref']}").json()["api_key"]
+    assert key2 and key2 != key1
+
+    # đúng 1 row dự án tên này cho chat; /list không còn hiện trùng
+    rows = db.projects_by_chat(cfg.database_path, str(chat))
+    assert len(rows) == 1 and rows[0]["project_name"] == "bruh"
+
+    # tin nhắn confirm lần 2 phải cảnh báo dự án đã ghép từ trước (key xoay)
+    assert "đã ghép từ trước" in tg.sent[-1][1]
+
+    # key mới ingest được; key cũ bị từ chối; cùng device vẫn là MỘT row
+    a = _alert(batch="20261024T000100Z")
+    a["device"] = a["host"] = "web01"
+    ok = client.post("/api/v1/ingest-log", headers={"X-API-Key": key2},
+                     json={"host": "web01", "alerts": [a]})
+    assert ok.status_code == 200, ok.text
+    stale = client.post("/api/v1/ingest-log", headers={"X-API-Key": key1},
+                        json={"host": "web01", "alerts": [a]})
+    assert stale.status_code == 401
+    rows = db.projects_by_chat(cfg.database_path, str(chat))
+    assert rows[0]["device_count"] == 1  # web01 chỉ 1 lần, không nhân đôi
+
+
+def test_repair_same_name_different_chat_creates_separate_project(env):
+    """Cùng tên nhưng KHÁC chat -> hai dự án riêng (hai nơi nhận alert khác nhau)."""
+    client, cfg, tg = env
+    _register_chatid(client, "web", 8101)
+    _register_chatid(client, "web", 8102)
+    with db.connect(cfg.database_path) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM projects WHERE project_name='web'").fetchone()[0]
+    assert n == 2

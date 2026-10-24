@@ -186,8 +186,21 @@ def norm_chat_id(s: str) -> str:
 
 def create_project(db_path: str, name: str, telegram_chat_id: Optional[str] = None) -> int:
     """Project pending; telegram_chat_id khi có là CHAT ĐÍCH script yêu cầu ghép
-    (luồng chat-id pairing). Trạng thái pending cho tới khi chat đó /confirm."""
+    (luồng chat-id pairing). Trạng thái pending cho tới khi chat đó /confirm.
+
+    Idempotent theo (tên, chat): pair lại cùng tên về cùng một chat TÁI DỤNG
+    row cũ (pending hoặc linked) — không bao giờ tạo row trùng tên khiến /list
+    hiện một dự án hai lần và thiết bị bị xé lẻ sang row mới."""
     with _WRITE_LOCK, connect(db_path) as conn:
+        if telegram_chat_id is not None:
+            row = conn.execute(
+                "SELECT id FROM projects"
+                " WHERE project_name = ? AND telegram_chat_id = ?"
+                "   AND status IN ('pending', 'linked') ORDER BY id LIMIT 1",
+                (name, str(telegram_chat_id)),
+            ).fetchone()
+            if row is not None:
+                return int(row["id"])
         cur = conn.execute(
             "INSERT INTO projects (project_name, status, created_at, telegram_chat_id)"
             " VALUES (?, 'pending', ?, ?)",
@@ -198,7 +211,9 @@ def create_project(db_path: str, name: str, telegram_chat_id: Optional[str] = No
 
 def pending_codes_by_chat_id(db_path: str, chat_id: str) -> list[sqlite3.Row]:
     """Các mã pairing còn hiệu lực của mọi project CHỜ /confirm theo chat ID.
-    Một chat (user hoặc group) có thể có nhiều server đang chờ cùng lúc."""
+    Một chat (user hoặc group) có thể có nhiều server đang chờ cùng lúc.
+    Không lọc theo status của project: dự án ĐÃ linked pair lại (xoay key/
+    thêm máy) cũng có code chờ /confirm như dự án mới."""
     with connect(db_path) as conn:
         return conn.execute(
             """
@@ -206,7 +221,6 @@ def pending_codes_by_chat_id(db_path: str, chat_id: str) -> list[sqlite3.Row]:
             FROM pairing_codes pc
             JOIN projects p ON p.id = pc.project_id
             WHERE p.telegram_chat_id = ?
-              AND p.status = 'pending'
               AND pc.used_at IS NULL
               AND pc.expires_at > ?
             ORDER BY pc.expires_at
@@ -325,6 +339,7 @@ def complete_pairing(db_path: str, code: str, chat_id: str, gen_api_key, key_has
         if exp is None or exp < utcnow():
             raise PairingError("Mã đã hết hạn (sống 10 phút). Hãy tạo mã mới.")
         api_key = gen_api_key()
+        already_linked = row["status"] == "linked" and row["api_key_hash"] is not None
         conn.execute(
             "UPDATE projects SET telegram_chat_id = ?, status = 'linked',"
             " api_key_hash = ?, linked_at = ? WHERE id = ?",
@@ -334,7 +349,8 @@ def complete_pairing(db_path: str, code: str, chat_id: str, gen_api_key, key_has
             "UPDATE pairing_codes SET used_at = ?, api_key_plain = ? WHERE code = ?",
             (now, api_key, code.upper()),
         )
-        return {"project_id": row["id"], "project_name": row["project_name"], "api_key": api_key}
+        return {"project_id": row["id"], "project_name": row["project_name"],
+                "api_key": api_key, "already_linked": already_linked}
 
 
 def pairing_status(db_path: str, code: str) -> Optional[dict]:
@@ -348,7 +364,10 @@ def pairing_status(db_path: str, code: str) -> Optional[dict]:
         if row is None:
             return None
     out: dict[str, Any] = {"status": "pending", "project_name": row["project_name"]}
-    if row["p_status"] == "linked":
+    # Trạng thái đi theo VÒNG ĐỜI CODE, không theo project: dự án đã linked
+    # pair lại vẫn "pending" cho tới khi /confirm dùng code này — agent không
+    # bỏ cuộc sớm khi thấy linked mà chưa có key.
+    if row["used_at"] and row["p_status"] == "linked":
         out["status"] = "linked"
         if row["api_key_plain"]:
             out["api_key"] = row["api_key_plain"]

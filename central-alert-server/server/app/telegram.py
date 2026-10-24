@@ -315,11 +315,14 @@ class PairingBot:
             )
             return
         linked: list[str] = []
+        rotated: list[str] = []
         for r in rows:
             try:
                 res = db.complete_pairing(self.db_path, r["code"], chat_id,
                                           gen_api_key, sha256_hex)
                 linked.append(res["project_name"])
+                if res.get("already_linked"):
+                    rotated.append(res["project_name"])
             except (db.PairingError, ValueError):
                 continue  # hết hạn/giao tranh: request khác vẫn xử lý
         if not linked:
@@ -331,12 +334,22 @@ class PairingBot:
             return
         n = len(db.projects_by_chat(self.db_path, chat_id))
         names = ", ".join(f"<b>{html.escape(x)}</b>" for x in linked)
+        warn = ""
+        if rotated:
+            rnames = ", ".join(f"<b>{html.escape(x)}</b>" for x in rotated)
+            warn = ("\n⚠️ <b>Dự án đã ghép từ trước</b> (" + rnames + "): API key"
+                    " <b>mới</b> vừa được cấp. Máy nào cùng dự án đang chạy bằng"
+                    " key cũ phải cập nhật <code>conf/central.conf</code>, nếu"
+                    " không sẽ gửi alert thất bại. Thêm máy mới vào dự án mà không"
+                    " muốn xoay key? Copy <code>central.conf</code> từ máy đã"
+                    " chạy thay vì pair lại.\n")
         await self.tg.send_message(
             chat_id,
             "✅ <b>Ghép nối thành công!</b> (xác nhận bởi "
             f"{html.escape(who)})\n"
             f"🔌 Đã ghép {len(linked)} server: {names}\n"
             f"📎 Chat này hiện quản lý <b>{n} dự án</b>.\n"
+            + warn +
             "Máy chủ đã tự nhận API key — mọi cảnh báo sẽ về đúng chat này.\n"
             "🗂 <code>/list</code> để xem · ➕ thêm server khác: chạy <code>pair</code>"
             " với Chat ID này rồi <code>/confirm</code>",
