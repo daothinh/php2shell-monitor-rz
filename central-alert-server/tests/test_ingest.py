@@ -256,6 +256,21 @@ def test_telegram_message_matches_compact_template(env):
     assert lines[3] == "🖥 <b>web01</b> / 10.0.0.15"
 
 
+def test_telegram_message_subminute_window_is_escaped(env):
+    """_window_span trả '<1 phút' cho batch <60s — phải escape nếu không
+    Telegram 400 'can't parse entities: Unsupported start tag \"1\"'."""
+    client, cfg, tg = env
+    _, key = _project_with_key(cfg)
+    a = _alert()
+    a["window_start"] = "2026-10-24T00:00:00Z"
+    a["window_end"] = "2026-10-24T00:00:30Z"
+    client.post("/api/v1/ingest-log", headers={"X-API-Key": key},
+                json={"host": "web01", "alerts": [a]})
+    text = tg.sent[0][1]
+    assert "hit / &lt;1 phút" in text
+    assert "<1 phút" not in text
+
+
 def test_telegram_message_without_lan_ip(env):
     client, cfg, tg = env
     _, key = _project_with_key(cfg)

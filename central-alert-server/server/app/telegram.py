@@ -113,7 +113,8 @@ def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
     hits = alert.get("evidence") or []
     total = int(alert.get("hits") or len(hits))
     what = f"<b>{esc(_headline(alert))}</b>"
-    freq = f"{total} hit / {_window_span(alert)}"
+    # _window_span có thể trả "<1 phút" — escape kẻo Telegram parse <1...> thành HTML tag
+    freq = f"{total} hit / {esc(_window_span(alert))}"
 
     host = str(alert.get("host") or alert.get("device") or "?")[:64]
     lan_ip = str(alert.get("lan_ip") or "").strip()[:64]
