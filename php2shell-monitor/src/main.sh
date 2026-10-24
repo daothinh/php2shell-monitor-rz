@@ -30,10 +30,11 @@ Modes:
              alert sinh ra được đẩy Telegram nếu đã pair.
   once       Run a single batch now (same work the supervisor does every 5 min)
   run        Start the background supervisor (batch every BATCH_INTERVAL, default 300s)
-  pair       Pair this project with the Central Alert Server -> Telegram
-             (pair --server <url>); the project name comes from
-             conf/device.conf (PROJECT); alerts are forwarded
-             automatically while the supervisor runs
+  pair       Ghép nối project với Central Alert Server -> Telegram
+             theo Chat ID (pair --server <url> [--chatid <id>]):
+             nhắn /id cho bot để lấy Chat ID, rồi /confirm trong chat đó.
+             Tên dự án lấy từ conf/device.conf (PROJECT); alert được
+             đẩy tự động khi supervisor chạy
   test       Send one test alert to the paired central server
   status     Project/device, plugin health, last batches, last alert
   stop       Stop the supervisor (state preserved)

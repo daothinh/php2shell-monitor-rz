@@ -175,9 +175,15 @@ Test: `bash tests/run_tests.sh` (hoặc `bats tests/unit`).
 
 ## 7. Gửi về central
 
-Monitor chỉ ghi file. `central-alert-server/client/p2s-agent.sh` tail
-`alerts/queue.jsonl` và POST lên server; server lưu theo project/device và
-mirror evidence ra đĩa. Xem `../central-alert-server/README.md`.
+```bash
+sudo bash php2shell-monitor.sh -- pair --server <url-central-server>
+```
+
+Ghép nối theo **Chat ID Telegram** (private hoặc group): nhắn `/id` cho bot
+lấy Chat ID → nhập vào script → bot gửi yêu cầu vào chat → nhắn `/confirm`.
+API key lưu trong `conf/central.conf` (0600); từ đó supervisor tự giữ một
+forwarder (tail `alerts/queue.jsonl`, spool khi mất mạng) POST lên server;
+server đẩy alert vào Telegram chat đã ghép. Xem `../central-alert-server/README.md`.
 
 ---
 

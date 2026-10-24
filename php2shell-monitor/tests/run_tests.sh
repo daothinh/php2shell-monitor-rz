@@ -154,7 +154,81 @@ T "alert: inline evidence capped" "true" "$(jq -r '.evidence_truncated' "$alert"
 T "alert: full evidence still on disk" "3" \
   "$(wc -l <"$w/projects/test-project/devices/test-device/evidence/20261024T001500Z.jsonl" | tr -d ' ')"
 
-rm -rf -- "$w"
+# ---------------------------------------------------------------- pair (chat-id)
+# Fake central server: một stub `curl` đếm lượt poll và trả lời theo kịch bản,
+# giữ test không phụ thuộc server thật hay mạng.
+w2=$(newlab)
+stub=$w2/curlstub
+mkdir -p "$stub"
+cat >"$stub/curl" <<'STUB'
+#!/usr/bin/env bash
+# fake Central Alert Server — emulates the endpoints central.sh calls
+self=$(dirname "$0")
+args=("$@")
+url='' body=''
+for ((i = 0; i < $#; i++)); do
+  case ${args[$i]} in
+    -d|--data) body=${args[$((i + 1))]} ;;
+    http*) url=${args[$i]} ;;
+  esac
+done
+case $url in
+  *register-chatid)
+    printf '%s' "$body" >"$self/register_body"
+    printf '{"pair_ref":"SEC-TEST-REF","chat_id":"812345678","bot":"@test_bot","expires_in":900,"warning":null}'
+    ;;
+  *pairing-status*)
+    n=$(cat "$self/poll_count" 2>/dev/null || echo 0)
+    n=$((n + 1)); printf '%s' "$n" >"$self/poll_count"
+    if ((n < 3)); then
+      printf '{"status":"pending"}'
+    else
+      printf '{"status":"linked","api_key":"p2sk-test-key-42"}'
+    fi
+    ;;
+  *ingest-log)
+    for ((i = 0; i < $#; i++)); do
+      [[ ${args[$i]} == X-API-Key:* ]] && printf '%s' "${args[$i]}" >"$self/ingest_key"
+    done
+    printf '%s' "$body" >"$self/ingest_body"
+    printf '{"received":1,"delivered":1}'
+    ;;
+  *) printf '{"error":"unknown endpoint %s"}' "$url"; exit 1 ;;
+esac
+STUB
+chmod +x "$stub/curl"
+PAIR_ENV=(PATH="$stub:$PATH" WORKDIR="$w2" P2S_PAIR_POLL=1 P2S_PAIR_TIMEOUT=30)
+
+# chat ID sai định dạng -> báo lỗi rồi đọc lại; giá trị hợp lệ ở lần 2 được dùng
+out=$(printf 'abc\n812345678\n' | env "${PAIR_ENV[@]}" \
+      bash "$w2/engine/central.sh" pair --server http://fake-central.test 2>&1)
+T "pair: chatid sai bị từ chối"  "không đúng định dạng" "$out"
+T "pair: đăng ký với chatid nhập lại" '"chat_id":"812345678"' "$(cat "$stub/register_body")"
+N "pair: chatid sai không gửi lên server" '"abc"' "$(cat "$stub/register_body")"
+
+# luồng đầy đủ --chatid: wizard -> register -> poll -> lưu conf
+rm -f "$stub/poll_count"
+out=$(env "${PAIR_ENV[@]}" \
+      bash "$w2/engine/central.sh" pair --server http://fake-central.test --chatid 998877665 2>&1)
+T "pair: wizard hướng dẫn /id"       "Nhắn cho bot:   /id"  "$out"
+T "pair: wizard nhắc /confirm"       "/confirm"            "$out"
+T "pair: đăng ký đúng project"       '"project_name":"test-project"' "$(cat "$stub/register_body")"
+T "pair: thành công sau khi confirm" "GHÉP NỐI THÀNH CÔNG" "$out"
+T "pair: gợi ý bước tiếp theo"        "php2shell-monitor.sh -- test" "$out"
+T "pair: conf lưu server + key"      "SERVER_URL=http://fake-central.test" \
+  "$(cat "$w2/conf/central.conf")"
+T "pair: conf 0600"                  "600" "$(stat -c %a "$w2/conf/central.conf")"
+N "pair: không tự bật agent khi chưa có supervisor" "agent" \
+  "$(ls "$w2/projects/test-project/devices/test-device/run/agent" 2>/dev/null)"
+
+# test mode: gửi 1 alert INFO qua đúng API key đã lưu
+out=$(env "${PAIR_ENV[@]}" bash "$w2/engine/central.sh" test 2>&1)
+T "test: delivered >= 1 trong phản hồi" "delivered" "$out"
+T "test: dùng API key từ conf"          "X-API-Key: p2sk-test-key-42" "$(cat "$stub/ingest_key")"
+T "test: message alert thử nêu device"  "test-device" "$(cat "$stub/ingest_body")"
+T "test: payload là alert thử INFO"     '"severity":"INFO"' "$(cat "$stub/ingest_body")"
+
+rm -rf -- "$w" "$w2"
 
 echo ""
 echo "passed: $PASS  failed: $FAIL"
