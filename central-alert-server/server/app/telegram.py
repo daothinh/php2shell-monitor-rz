@@ -174,7 +174,7 @@ class PairingBot:
 
     Luồng chat-id: /id lấy Chat ID -> script pair nhập Chat ID -> bot gửi yêu
     cầu vào chat đích -> /confirm ở đó để ghép nối. Một chat ghép được NHIỀU
-    server; /list xem tất cả. SEC-<UUID> cũ vẫn là fallback.
+    server; /list xem tất cả.
     """
 
     # Menu lệnh (nút ≡ / gõ "/"). Tên: lowercase a-z0-9_, tối đa 32 ký tự.
@@ -257,9 +257,13 @@ class PairingBot:
 
         # Lệnh (chuẩn hoá: bỏ '/', bỏ @botname, chữ thường)
         cmd = text.split()[0].lstrip("/").split("@")[0].lower() if text else ""
-        m = CODE_RE.search(text)
-        if m:
-            await self._cmd_pair_code(chat_id, f"SEC-{m.group(1)}")
+        if CODE_RE.search(text):
+            await self.tg.send_message(
+                chat_id,
+                "⌛ Mã <code>SEC-&lt;UUID&gt;</code> đã ngừng sử dụng.\n"
+                "Ghép nối bây giờ qua Chat ID: <code>/id</code> để lấy Chat ID →"
+                " nhập vào script <code>pair</code> trên server → <code>/confirm</code> ở đây.",
+            )
         elif cmd == "start":
             await self._cmd_help(chat_id, welcome=True)
         elif cmd == "help":
@@ -362,7 +366,6 @@ class PairingBot:
             "2️⃣ Trên server, chạy <code>sudo p2s-agent.sh pair --server &lt;url&gt;</code>"
             " và nhập Chat ID khi được hỏi\n"
             "3️⃣ Bot gửi yêu cầu vào chat này → nhắn <code>/confirm</code> — xong ✅\n\n"
-            "(Fallback: gửi mã <code>SEC-&lt;UUID&gt;</code> in trên terminal vẫn hoạt động)\n\n"
             + (f"📎 Chat này đang quản lý <b>{n} dự án</b>. Dùng <code>/list</code> để xem chi tiết."
                if n else "📎 Chưa có server nào được ghép với chat này — làm theo"
                          " 3 bước trên để bắt đầu."),
@@ -390,24 +393,3 @@ class PairingBot:
                 + (f", alert gần nhất {last} (UTC)" if last else ", chưa có alert")
             )
         await self.tg.send_message(chat_id, "\n".join(lines))
-
-    async def _cmd_pair_code(self, chat_id: str, code: str) -> None:
-        try:
-            res = db.complete_pairing(self.db_path, code, chat_id, gen_api_key, sha256_hex)
-        except db.PairingError as e:
-            self.guard.record_fail(chat_id)
-            await self.tg.send_message(chat_id, f"❌ Ghép nối thất bại: {html.escape(e.reason)}")
-            return
-        self.guard.record_success(chat_id)
-        n = len(db.projects_by_chat(self.db_path, chat_id))
-        await self.tg.send_message(
-            chat_id,
-            "✅ <b>Ghép nối thành công!</b>\n"
-            f"📦 Dự án: <b>{html.escape(res['project_name'])}</b>\n"
-            f"📎 Chat này hiện quản lý <b>{n} dự án</b>.\n"
-            "Server dự án sẽ tự nhận API key — mọi cảnh báo sẽ được gửi về đúng chat này.\n"
-            "➕ Thêm server khác: chạy <code>pair</code> với Chat ID này rồi"
-            " <code>/confirm</code> · 🗂 Xem tất cả: <code>/list</code>",
-        )
-        log.info("pairing hoàn tất: project=%s chat=%s (chat có %d dự án)",
-                 res["project_id"], chat_id, n)

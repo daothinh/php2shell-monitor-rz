@@ -26,10 +26,6 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9À-ỹ._@\- ]{1,64}$")
 UUID_CODE_RE = r"^SEC-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 
 
-class RegisterBody(BaseModel):
-    project_name: str = Field(min_length=1, max_length=64)
-
-
 class RegisterChatIdBody(BaseModel):
     project_name: str = Field(min_length=1, max_length=64)
     chat_id: str = Field(min_length=1, max_length=20)
@@ -78,28 +74,8 @@ def _read_scope(request: Request, x_api_key: str = Header(default=""),
 
 
 # ------------------------------------------------------------- pairing
-
-@router.post("/register-pairing")
-def register_pairing(body: RegisterBody, request: Request):
-    """Client script xin mã ghép nối (in ra terminal cho user gửi tới bot)."""
-    cfg = _cfg(request)
-    if not _NAME_RE.match(body.project_name):
-        raise HTTPException(422, "project_name 1-64 ký tự, chỉ chữ/số/._-@ và khoảng trắng")
-    ip = _client_ip(request)
-    ok, retry = _limiter.allow(f"reg:{ip}", cfg.register_rate_per_hour, 3600)
-    if not ok:
-        raise HTTPException(429, f"Quá nhiều lượt đăng ký từ IP này; thử lại sau {retry}s")
-    project_id = db.create_project(cfg.database_path, body.project_name)
-    code = db.issue_pairing_code(cfg.database_path, project_id, cfg.pairing_ttl_sec,
-                                 gen_pairing_code)
-    log.info("pairing code phát hành: project=%s code=%s", project_id, code)
-    return {
-        "code": code,
-        "expires_in": cfg.pairing_ttl_sec,
-        "expires_at": db.iso(db.utcnow() + timedelta(seconds=cfg.pairing_ttl_sec)),
-        "instruction": f"Gửi mã {code} cho bot Telegram để hoàn tất ghép nối",
-    }
-
+# (Nhánh feature/chatid-pairing: chỉ còn luồng Chat ID — register-pairing mã
+#  SEC-<UUID> đã bị bỏ, mỗi feature một kiểu pairing riêng.)
 
 @router.post("/register-chatid")
 async def register_chatid(body: RegisterChatIdBody, request: Request):

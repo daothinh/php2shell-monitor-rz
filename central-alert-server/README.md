@@ -127,7 +127,6 @@ Bot **tự đăng ký menu lệnh** (nút **≡** / gõ `/`) khi khởi động.
 | `/confirm` | Đồng ý các yêu cầu ghép nối đang chờ của **chính chat này** (TTL 10 phút; nhóm @botname khi dùng trong group) |
 | `/list` (hoặc `/ids`, `/servers`) | Các server/dự án đã ghép với chat: tên, số thiết bị, ngày ghép, alert gần nhất |
 | `/start`, `/help` | Chào mừng / trợ giúp đầy đủ |
-| Gửi `SEC-<UUID>` trực tiếp | Fallback (luồng mã cũ vẫn hoạt động) |
 
 API: `POST /api/v1/register-chatid` `{project_name, chat_id}` → `{pair_ref, ...}` (bot tự gửi yêu cầu /confirm vào chat đích); agent vẫn poll `GET /pairing-status?code=<pair_ref>` như cũ.
 

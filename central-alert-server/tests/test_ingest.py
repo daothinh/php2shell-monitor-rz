@@ -380,17 +380,6 @@ def _msg(chat_id, text):
     return {"message": {"chat": {"id": chat_id}, "text": text}}
 
 
-def _pending_code(cfg, name, code):
-    """Tạo project pending + mã pairing cố định (giống agent chạy pair)."""
-    pid = db.create_project(cfg.database_path, name)
-    db.issue_pairing_code(cfg.database_path, pid, 600, lambda: code)
-    return pid
-
-
-UUID1 = "3F2504E0-4F89-41D3-9A0C-0305E82C3301"
-UUID2 = "9B8A7C6D-5E4F-43B2-A1C0-D2E3F4A5B6C7"
-
-
 def test_bot_two_servers_one_confirm(env):
     """Một chat ghép 2 server: register-chatid x2 (cùng chat) -> 1 /confirm ghép cả hai."""
     client, cfg, tg = env
@@ -416,16 +405,16 @@ def test_bot_add_new_id_is_gone(env):
 
 
 def test_bot_list_shows_all_servers_of_one_chat(env):
-    _, cfg, tg = env
+    client, cfg, tg = env
     bot = _bot(cfg, tg)
     chat = 8002
 
     asyncio.run(bot.handle_update(_msg(chat, "/list")))
     assert "Chưa có server" in tg.sent[-1][1]
 
-    for name, u in (("alpha", UUID1), ("beta", UUID2)):
-        _pending_code(cfg, name, f"SEC-{u}")
-        asyncio.run(bot.handle_update(_msg(chat, f"SEC-{u}")))
+    for name in ("alpha", "beta"):
+        _register_chatid(client, name, chat)
+    asyncio.run(bot.handle_update(_msg(chat, "/confirm")))
 
     asyncio.run(bot.handle_update(_msg(chat, "/list")))
     text = tg.sent[-1][1]
@@ -463,16 +452,21 @@ def test_bot_command_menu_is_valid():
         assert expected in cmds, expected
 
 
-def test_bot_wrong_code_does_not_create_awaiting_leak(env):
-    """Mã sai vẫn qua attempt-guard; mã đúng sau đó vẫn pair được bình thường."""
-    _, cfg, tg = env
+def test_bot_sec_code_fallback_is_removed(env):
+    """Fallback mã SEC-<UUID> đã bỏ: gửi mã KHÔNG ghép nối được gì, bot trả
+    thông báo đã ngừng và hướng dẫn luồng Chat ID."""
+    client, cfg, tg = env
     bot = _bot(cfg, tg)
     chat = 8004
-    asyncio.run(bot.handle_update(_msg(chat, f"SEC-{UUID1}")))  # không tồn tại
-    assert "thất bại" in tg.sent[-1][1].lower()
-    _pending_code(cfg, "gamma", f"SEC-{UUID2}")
-    asyncio.run(bot.handle_update(_msg(chat, f"SEC-{UUID2}")))
-    assert "Ghép nối thành công" in tg.sent[-1][1]
+    # tạo một pending chat-id cho chat khác; gửi mã internal của nó cho bot
+    res = _register_chatid(client, "gamma", 777)
+    pair_ref = res["pair_ref"]
+    asyncio.run(bot.handle_update(_msg(chat, pair_ref)))
+    assert "ngừng sử dụng" in tg.sent[-1][1]
+    assert "/id" in tg.sent[-1][1] and "/confirm" in tg.sent[-1][1]
+    # không có project nào bị link qua đường mã
+    assert db.pairing_status(cfg.database_path, pair_ref)["status"] == "pending"
+    assert len(db.projects_by_chat(cfg.database_path, str(chat))) == 0
 
 
 # ------------------------------------------------------------ chat-id pairing
