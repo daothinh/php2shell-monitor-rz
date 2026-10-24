@@ -182,18 +182,17 @@ class PairingBot:
         ("start", "Bắt đầu & xem tổng quan"),
         ("id", "Lấy Chat ID của chat này"),
         ("confirm", "Đồng ý ghép nối server đang chờ"),
-        ("add_new_id", "Thêm server mới (nhập chat ID)"),
         ("list", "Danh sách server/dự án đã ghép"),
         ("help", "Trợ giúp đầy đủ"),
     ]
     BOT_DESCRIPTION = (
         "🛡 Central Alert Bot — nhận cảnh báo an ninh (php2shell-monitor) từ các"
         " server của bạn ngay trên Telegram.\n\n"
-        "Một chat quản lý được nhiều server: chạy /add_new_id rồi gửi mã SEC-<UUID>"
-        " in trên terminal server để ghép nối. /list xem tất cả."
+        "Ghép nối: /id lấy Chat ID → nhập vào script pair trên server → /confirm"
+        " ở đây. Chat riêng hoặc group đều được; /list xem tất cả."
     )
-    BOT_SHORT_DESCRIPTION = ("Cảnh báo an ninh server → Telegram. "
-                             "/add_new_id để ghép nối server mới.")
+    BOT_SHORT_DESCRIPTION = ("Cảnh báo an ninh server → Telegram."
+                             " /id rồi /confirm để ghép nối server.")
 
     def __init__(self, cfg: Config, tg: TelegramClient, db_path: str) -> None:
         self.cfg = cfg
@@ -269,8 +268,6 @@ class PairingBot:
             await self._cmd_id(chat_id, msg)
         elif cmd == "confirm":
             await self._cmd_confirm(chat_id, msg)
-        elif cmd == "add_new_id":
-            await self._cmd_add_new_id(chat_id)
         elif cmd in ("list", "ids", "servers"):
             await self._cmd_list(chat_id)
         else:
@@ -336,7 +333,8 @@ class PairingBot:
             f"🔌 Đã ghép {len(linked)} server: {names}\n"
             f"📎 Chat này hiện quản lý <b>{n} dự án</b>.\n"
             "Máy chủ đã tự nhận API key — mọi cảnh báo sẽ về đúng chat này.\n"
-            "🗂 <code>/list</code> để xem · ➕ <code>/add_new_id</code> để thêm server",
+            "🗂 <code>/list</code> để xem · ➕ thêm server khác: chạy <code>pair</code>"
+            " với Chat ID này rồi <code>/confirm</code>",
         )
         log.info("chat-id pairing hoàn tất: chat=%s (%d server, bởi %s)",
                  chat_id, len(linked), who)
@@ -356,32 +354,18 @@ class PairingBot:
             "📋 <b>Lệnh</b> — nhấn <b>≡</b> cạnh ô nhập hoặc gõ <code>/</code> để mở menu:\n"
             "• <code>/id</code> — 🆔 lấy Chat ID của chat này (cần cho script pair)\n"
             "• <code>/confirm</code> — ✅ đồng ý yêu cầu ghép nối đang chờ\n"
-            "• <code>/add_new_id</code> — ➕ hướng dẫn thêm server mới\n"
             "• <code>/list</code> — 🗂 các server/dự án đã ghép với chat này\n"
             "• <code>/help</code> — 📖 trợ giúp này\n\n"
             "🔌 <b>Ghép nối server mới (3 bước)</b>\n"
-            "1️⃣ Ở đây nhấn <code>/id</code> → copy Chat ID\n"
+            f"1️⃣ Ở đây nhấn <code>/id</code> → copy Chat ID (chat này:"
+            f" <code>{html.escape(chat_id)}</code>)\n"
             "2️⃣ Trên server, chạy <code>sudo p2s-agent.sh pair --server &lt;url&gt;</code>"
             " và nhập Chat ID khi được hỏi\n"
             "3️⃣ Bot gửi yêu cầu vào chat này → nhắn <code>/confirm</code> — xong ✅\n\n"
             "(Fallback: gửi mã <code>SEC-&lt;UUID&gt;</code> in trên terminal vẫn hoạt động)\n\n"
             + (f"📎 Chat này đang quản lý <b>{n} dự án</b>. Dùng <code>/list</code> để xem chi tiết."
-               if n else "📎 Chưa có server nào được ghép với chat này — bắt đầu với"
-                         " <code>/add_new_id</code>."),
-        )
-
-    async def _cmd_add_new_id(self, chat_id: str) -> None:
-        n = len(db.projects_by_chat(self.db_path, chat_id))
-        await self.tg.send_message(
-            chat_id,
-            "➕ <b>Thêm server mới vào chat này</b>\n"
-            f"1️⃣ Lấy Chat ID: nhấn <code>/id</code> — Chat ID của chat này là"
-            f" <code>{html.escape(chat_id)}</code>\n"
-            "2️⃣ Trên server mới, chạy <code>sudo p2s-agent.sh pair --server &lt;url&gt;</code>"
-            " và nhập Chat ID đó khi được hỏi\n"
-            "3️⃣ Quay lại đây nhắn <code>/confirm</code> khi nhận yêu cầu ✅\n\n"
-            + (f"📎 Chat này đang quản lý {n} dự án — server mới sẽ thêm vào cùng chỗ."
-               if n else ""),
+               if n else "📎 Chưa có server nào được ghép với chat này — làm theo"
+                         " 3 bước trên để bắt đầu."),
         )
 
     async def _cmd_list(self, chat_id: str) -> None:
@@ -390,7 +374,8 @@ class PairingBot:
             await self.tg.send_message(
                 chat_id,
                 "📭 Chưa có server/dự án nào được ghép với chat này.\n"
-                "Dùng <code>/add_new_id</code> để bắt đầu ghép nối server đầu tiên.",
+                "<code>/id</code> lấy Chat ID → chạy <code>p2s-agent.sh pair</code> trên"
+                " server → <code>/confirm</code> ở đây.",
             )
             return
         lines = [f"🗂 <b>Server/dự án của bạn ({len(rows)})</b>"]
@@ -421,7 +406,8 @@ class PairingBot:
             f"📦 Dự án: <b>{html.escape(res['project_name'])}</b>\n"
             f"📎 Chat này hiện quản lý <b>{n} dự án</b>.\n"
             "Server dự án sẽ tự nhận API key — mọi cảnh báo sẽ được gửi về đúng chat này.\n"
-            "➕ Thêm server khác: <code>/add_new_id</code> · 🗂 Xem tất cả: <code>/list</code>",
+            "➕ Thêm server khác: chạy <code>pair</code> với Chat ID này rồi"
+            " <code>/confirm</code> · 🗂 Xem tất cả: <code>/list</code>",
         )
         log.info("pairing hoàn tất: project=%s chat=%s (chat có %d dự án)",
                  res["project_id"], chat_id, n)

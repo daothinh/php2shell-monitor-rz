@@ -391,22 +391,28 @@ UUID1 = "3F2504E0-4F89-41D3-9A0C-0305E82C3301"
 UUID2 = "9B8A7C6D-5E4F-43B2-A1C0-D2E3F4A5B6C7"
 
 
-def test_bot_add_new_id_then_pair_two_servers(env):
-    """Một chat ghép 2 server: /add_new_id (hướng dẫn mới) -> register-chatid x2 -> /confirm."""
+def test_bot_two_servers_one_confirm(env):
+    """Một chat ghép 2 server: register-chatid x2 (cùng chat) -> 1 /confirm ghép cả hai."""
     client, cfg, tg = env
     bot = _bot(cfg, tg)
     chat = 8001
 
-    asyncio.run(bot.handle_update(_msg(chat, "/add_new_id")))
-    text = tg.sent[-1][1]
-    assert "Thêm server mới" in text and str(chat) in text  # /id inline luôn chat id
-
-    # 2 server đăng ký cùng chat -> 1 /confirm ghép cả hai
     _register_chatid(client, "web-cluster", chat)
     _register_chatid(client, "db-cluster", chat)
     asyncio.run(bot.handle_update(_msg(chat, "/confirm")))
     assert "2 server" in tg.sent[-1][1]
     assert len(db.projects_by_chat(cfg.database_path, str(chat))) == 2
+
+
+def test_bot_add_new_id_is_gone(env):
+    """/add_new_id đã bị bỏ — không còn trong menu và không còn xử lý riêng."""
+    _, cfg, tg = env
+    bot = _bot(cfg, tg)
+    from app.telegram import PairingBot
+    assert "add_new_id" not in [c for c, _ in PairingBot.BOT_COMMANDS]
+    asyncio.run(bot.handle_update(_msg(8009, "/add_new_id")))
+    # rơi vào nhánh else: help (không có pending nào ở chat này)
+    assert "Trợ giúp" in tg.sent[-1][1] or "Chào mừng" in tg.sent[-1][1]
 
 
 def test_bot_list_shows_all_servers_of_one_chat(env):
@@ -431,8 +437,9 @@ def test_bot_help_mentions_commands(env):
     bot = _bot(cfg, tg)
     asyncio.run(bot.handle_update(_msg(8003, "/help")))
     text = tg.sent[-1][1]
-    assert "/add_new_id" in text and "/list" in text and "/id" in text
+    assert "/list" in text and "/id" in text
     assert "/confirm" in text and "Chat ID" in text
+    assert "/add_new_id" not in text  # lệnh đã bỏ
     assert "≡" in text and "3 bước" in text  # gợi ý menu + luồng ghép nối
 
 
@@ -452,7 +459,7 @@ def test_bot_command_menu_is_valid():
     assert len(cmds) == len(set(cmds))
     for c in cmds:
         assert re.fullmatch(r"[a-z0-9_]{1,32}", c), c
-    for expected in ("start", "help", "add_new_id", "list"):
+    for expected in ("start", "help", "id", "confirm", "list"):
         assert expected in cmds, expected
 
 

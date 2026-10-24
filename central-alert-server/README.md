@@ -125,7 +125,6 @@ Bot **tự đăng ký menu lệnh** (nút **≡** / gõ `/`) khi khởi động.
 |---|---|
 | `/id` | Lấy Chat ID của chat hiện tại (cần cho script pair) |
 | `/confirm` | Đồng ý các yêu cầu ghép nối đang chờ của **chính chat này** (TTL 10 phút; nhóm @botname khi dùng trong group) |
-| `/add_new_id` | Hướng dẫn thêm server mới vào chat hiện tại (kèm sẵn Chat ID) |
 | `/list` (hoặc `/ids`, `/servers`) | Các server/dự án đã ghép với chat: tên, số thiết bị, ngày ghép, alert gần nhất |
 | `/start`, `/help` | Chào mừng / trợ giúp đầy đủ |
 | Gửi `SEC-<UUID>` trực tiếp | Fallback (luồng mã cũ vẫn hoạt động) |
