@@ -125,23 +125,6 @@ cmd_pair() {
   local proj=$PROJECT
   local bot=$P2S_BOT botlink="https://t.me/${P2S_BOT#@}"
 
-  # ---------- màn hình hướng dẫn (in TRƯỚC khi hỏi input) ----------
-  cat <<EOF
-
-╔══════════════════════════════════════════════════════════════╗
-║   🛡  GHÉP NỐI TELEGRAM ALERT                               ║
-╚══════════════════════════════════════════════════════════════╝
- Dự án        :  $proj   (device: $DEVICE)
-
- BƯỚC 1 — Lấy Chat ID: mở $botlink → nhắn /id → copy dãy số
-
- BƯỚC 2 — Nhập Chat ID ở dòng bên dưới
-
- BƯỚC 3 — Khi bot gửi yêu cầu ghép nối vào chat, nhắn: /confirm
-
-────────────────────────────────────────────────────────────────
-EOF
-
   # Chat ID: --chatid > P2S_TG_CHATID > prompt tương tác
   chatid=${chatid:-${P2S_TG_CHATID:-}}
   if [[ -z $chatid ]]; then
