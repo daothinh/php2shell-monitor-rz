@@ -608,12 +608,14 @@ def test_repair_same_project_adds_key_silently(env):
     chat = 8010
 
     # lần 1: pair -> auto-link, key1; đúng 1 tin bot (dự án mới)
-    r1 = _register_chatid(client, "bruh", chat, device="may1")
+    # device ở đây là hostname máy — trùng với device mà alert sau đó khai báo,
+    # vì pair và ingest mô tả CÙNG một máy.
+    r1 = _register_chatid(client, "bruh", chat, device="web01")
     key1 = client.get(f"/api/v1/pairing-status?code={r1['pair_ref']}").json()["api_key"]
     assert len(tg.sent) == 1
 
     # lần 2: pair lại CÙNG TÊN, cùng chat (máy 2) -> key2, im lặng
-    r2 = _register_chatid(client, "bruh", chat, device="may2")
+    r2 = _register_chatid(client, "bruh", chat, device="web02")
     assert r2["pair_ref"] != r1["pair_ref"]
     key2 = client.get(f"/api/v1/pairing-status?code={r2['pair_ref']}").json()["api_key"]
     assert key2 and key2 != key1
@@ -779,3 +781,55 @@ def test_merge_keeps_existing_file_on_collision(tmp_path):
 
     merge_user_folders(tmp_path)
     assert (p / "IP-LAN_192.168.0.2_h" / "20261025T100000Z.jsonl").read_text() == "original\n"
+
+
+# ------------------------------------------------- device count at pair time
+def test_pair_registers_device_immediately(monkeypatch, tmp_path):
+    """Pair xong là /list phải đếm được máy, không chờ alert đầu tiên."""
+    from app import db
+
+    dbfile = str(tmp_path / "t.db")
+    db.init_db(dbfile)
+    pid = db.create_project(dbfile, "new-lab-2", telegram_chat_id="1244302311")
+    code = db.issue_pairing_code(dbfile, pid, 600, lambda: "SEC-00000000-0000-0000-0000-000000000001")
+    db.auto_link_code(dbfile, code, lambda: "k" * 40, lambda s: s, "fresh-box-01")
+
+    rows = db.projects_by_chat(dbfile, "1244302311")
+    assert len(rows) == 1
+    assert int(rows[0]["device_count"]) == 1, "thiết bị phải có ngay sau pair"
+
+
+def test_pair_same_device_twice_counts_once(monkeypatch, tmp_path):
+    from app import db
+
+    dbfile = str(tmp_path / "t.db")
+    db.init_db(dbfile)
+    pid = db.create_project(dbfile, "lab", telegram_chat_id="111")
+    for i in range(3):
+        code = db.issue_pairing_code(dbfile, pid, 600,
+                                     lambda i=i: f"SEC-0000000{i}-0000-0000-0000-000000000001")
+        db.auto_link_code(dbfile, code, lambda i=i: f"key{i:0>37}", lambda s: s, "box-01")
+    rows = db.projects_by_chat(dbfile, "111")
+    assert int(rows[0]["device_count"]) == 1
+
+
+def test_backfill_devices_from_api_keys(tmp_path):
+    """Dự án pair trước bản vá: chỉ có api_keys, không có devices."""
+    from app import db, migrate
+
+    dbfile = str(tmp_path / "t.db")
+    db.init_db(dbfile)
+    pid = db.create_project(dbfile, "old-lab", telegram_chat_id="222")
+    # pair trước bản vá: dự án đã linked nhưng chỉ có api_keys, không có devices
+    with db.connect(dbfile) as conn:
+        conn.execute("UPDATE projects SET status='linked', linked_at=? WHERE id=?",
+                     (db.iso(), pid))
+        conn.execute("INSERT INTO api_keys (project_id, key_hash, label, created_at)"
+                     " VALUES (?,?,?,?)", (pid, "h" * 40, "oldbox", db.iso()))
+
+    assert int(db.projects_by_chat(dbfile, "222")[0]["device_count"]) == 0
+    made = migrate.backfill_devices(dbfile)
+    assert made == 1
+    assert int(db.projects_by_chat(dbfile, "222")[0]["device_count"]) == 1
+    # idempotent
+    assert migrate.backfill_devices(dbfile) == 0

@@ -68,6 +68,16 @@ async def lifespan(app: FastAPI):
             app.state.tz = timezone.utc
     db.init_db(cfg.database_path)
 
+    # Projects paired before devices were registered at pair time have an
+    # api_keys row but no devices row: /list showed them as "chưa khả dụng".
+    # Rebuild those device rows from the key label (the machine's hostname).
+    try:
+        made = migrate.backfill_devices(cfg.database_path)
+        if made:
+            log.info("đã tạo %d thiết bị từ api_keys (pair trước bản vá)", made)
+    except Exception as exc:  # noqa: BLE001 — housekeeping must not block startup
+        log.warning("backfill thiết bị thất bại: %s", exc)
+
     # Fold IP-LAN_<ip>_<host>_<user> folders into IP-LAN_<ip>_<host>. Runs on
     # every start but is a no-op once the old layout is gone.
     try:

@@ -94,3 +94,37 @@ def merge_user_folders(root: str | Path) -> list[tuple[str, str, int]]:
     except OSError as exc:
         log.warning("không ghi được marker %s: %s", _MARKER, exc)
     return done
+
+
+def backfill_devices(db_path: str) -> int:
+    """Create device rows for projects paired before devices were registered.
+
+    Pairing used to record only an api_keys row; the device appeared on the
+    first alert. A project that never sent one therefore showed "0 thiết bị —
+    chưa khả dụng" even though a machine was installed and paired. The api_keys
+    label holds that machine's hostname, so the device can be reconstructed
+    from it. Idempotent: devices already present are left untouched.
+    """
+    from . import db as _db
+
+    made = 0
+    with _db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT ak.project_id, ak.label, MIN(ak.created_at) AS first_seen"
+            "  FROM api_keys ak"
+            " WHERE ak.label IS NOT NULL AND TRIM(ak.label) <> ''"
+            " GROUP BY ak.project_id, ak.label"
+        ).fetchall()
+        for r in rows:
+            name = _db.slug(str(r["label"]))
+            if not name:
+                continue
+            cur = conn.execute(
+                "INSERT INTO devices (project_id, device_name, created_at, last_seen_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(project_id, device_name) DO NOTHING",
+                (int(r["project_id"]), name,
+                 r["first_seen"] or _db.iso(), r["first_seen"] or _db.iso()),
+            )
+            made += cur.rowcount
+    return made

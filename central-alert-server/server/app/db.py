@@ -389,6 +389,20 @@ def auto_link_code(db_path: str, code: str, gen_api_key, key_hash,
             " VALUES (?, ?, ?, ?)",
             (row["id"], key_hash(api_key), (device_label or "")[:64], now),
         )
+        # Register the device NOW, not on first alert. Pairing is the moment a
+        # machine joins the project, so /list must count it immediately: waiting
+        # for ingest meant a freshly paired box showed as "chưa khả dụng" until
+        # it happened to produce an alert, which may be never.
+        # slug("") returns "unknown", which would create a phantom device for
+        # every caller that pairs without a hostname. Only register a real one.
+        dev = slug(device_label) if (device_label or "").strip() else ""
+        if dev:
+            conn.execute(
+                "INSERT INTO devices (project_id, device_name, created_at, last_seen_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(project_id, device_name) DO NOTHING",
+                (row["id"], dev, now, now),
+            )
         conn.execute(
             "UPDATE pairing_codes SET used_at = ?, api_key_plain = ? WHERE code = ?",
             (now, api_key, code.upper()),
