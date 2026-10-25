@@ -37,9 +37,11 @@ Tải và xác minh bằng một lệnh:
 ```bash
 curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh
 curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh.sha256
-sha256sum -c php2shell-monitor.sh.sha256
+echo "$(cut -d' ' -f1 php2shell-monitor.sh.sha256)  php2shell-monitor.sh" | sha256sum -c -
 chmod +x php2shell-monitor.sh
 ```
+
+> **Lưu ý:** file `.sha256` được sinh từ pipeline build nên bên trong ghi đường dẫn `dist/php2shell-monitor.sh`. Lệnh trên tự ghép lại checksum với tên file sau khi tải để xác minh đúng.
 
 
 
