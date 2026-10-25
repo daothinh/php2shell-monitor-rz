@@ -27,7 +27,12 @@ P2S_STATE_DIR=${P2S_STATE_DIR:-$WORKDIR/state}
 P2S_ALERT_DIR=${P2S_ALERT_DIR:-$WORKDIR/alerts}
 P2S_EVIDENCE_DIR=${P2S_EVIDENCE_DIR:-$WORKDIR/evidence}
 
-if command -v jq >/dev/null 2>&1; then
+# P2S_JQ đặt sẵn (kể cả rỗng) là override của người vận hành: dùng để trỏ tới
+# jaq ở đường dẫn khác, hoặc để giả lập "không có jq" trong test. Chỉ tự dò khi
+# biến chưa được đặt.
+if [[ ${P2S_JQ+x} ]]; then
+  :
+elif command -v jq >/dev/null 2>&1; then
   P2S_JQ=$(command -v jq)
 elif command -v jaq >/dev/null 2>&1; then
   P2S_JQ=$(command -v jaq)
@@ -38,6 +43,18 @@ export P2S_JQ
 
 have() { command -v "$1" >/dev/null 2>&1; }
 is_root() { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
+
+# jq là TUỲ CHỌN. Rule pack đọc bằng lib/jsonl.awk nên monitor phát hiện bình
+# thường khi không có jq; jq chỉ làm phần hiển thị (status, src_ip của Suricata)
+# gọn hơn. Thiếu jq KHÔNG được chặn batch — chặn batch vì một tiện ích phụ là
+# biến một monitor chạy được thành một monitor chết.
+p2s_jq_ok() { [[ -n ${P2S_JQ:-} ]]; }
+
+# p2s_want_jq — cài jq nếu thiếu (best effort), không bao giờ làm hỏng lượt chạy.
+p2s_want_jq() {
+  source "$(dirname "${BASH_SOURCE[0]}")/deps.sh"
+  p2s_ensure_jq "${1:-}"
+}
 
 utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 utc_epoch() { date -u +%s; }

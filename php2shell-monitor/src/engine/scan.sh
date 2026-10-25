@@ -23,6 +23,10 @@ WINDOW_END=$(utc_epoch)
 WINDOW_START=$(state_last_batch)
 [[ $WINDOW_START -gt 0 ]] || WINDOW_START=$((WINDOW_END - ${BATCH_INTERVAL:-300}))
 
+# jq không bắt buộc (rule pack đọc bằng lib/jsonl.awk). Có thì cài/ dùng cho
+# phần hiển thị; thiếu vẫn chạy bình thường.
+p2s_want_jq --quiet || true
+
 LOCK=$P2S_DEVICE_RUN_DIR/scan.lock
 exec 9>"$LOCK"
 flock -n 9 || { log_info "scan already running; batch skipped"; exit 0; }

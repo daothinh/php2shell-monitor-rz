@@ -94,6 +94,9 @@ _add_access
 _add_error_logs
 _add_auditd
 
+# jq không bắt buộc — chỉ dùng cho phần tóm tắt. Có thì cài (best effort).
+p2s_want_jq --quiet || true
+
 _filter_since <"$STREAM" >"$WORK/stream.window.tsv"
 mv -f -- "$WORK/stream.window.tsv" "$STREAM"
 

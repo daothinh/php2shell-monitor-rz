@@ -20,7 +20,36 @@ MATCHED=$TMP/matched.tsv
 : >"$MATCHED"
 trap 'rm -rf -- "$TMP"' EXIT
 
-_jq() { "$P2S_JQ" -r "$1" <<<"$2" 2>/dev/null; }
+# ---------------------------------------------------------------- rule pack
+# Rule pack đọc bằng lib/jsonl.awk, KHÔNG bằng jq. jq không có trên mọi host
+# (image bất biến, máy offline, container tối giản) và thiếu nó từng làm monitor
+# báo "no-hits" trong khi thực tế không đọc được rule nào. awk thì luôn có.
+# Kết quả parse giống hệt jq — xem tests/run_tests.sh (so sánh từng field).
+RULES_TSV=$TMP/rules.tsv
+ANDS_TSV=$TMP/ands.tsv
+: >"$RULES_TSV"
+: >"$ANDS_TSV"
+
+_rule_files() {
+  local f
+  for f in "$P2S_RULE_DIR/pack/"*.jsonl "$P2S_CONF_DIR"/rules.d/*.jsonl; do
+    [[ -e $f ]] || continue
+    printf '%s\n' "$f"
+  done
+}
+
+if _rf=$(_rule_files) && [[ -n $_rf ]]; then
+  # shellcheck disable=SC2086
+  awk -f "$SRCROOT/lib/jsonl.awk" \
+    rules="$RULES_TSV" ands="$ANDS_TSV" $_rf 2>/dev/null
+fi
+
+# Không parse được rule nào = monitor mù. Nói thẳng thay vì lặng lẽ no-hits.
+if [[ ! -s $RULES_TSV ]]; then
+  log_error "không đọc được rule pack trong $P2S_RULE_DIR/pack — batch bỏ qua"
+  printf 'rule-error\tno-rules-parsed\t0 hit(s)\n' >>"$P2S_DEVICE_RUN_DIR/batches.log"
+  exit 1
+fi
 
 # Field name -> awk column.
 _fi() { stream_field_index "$1"; }
@@ -121,27 +150,26 @@ _dedup_events() { # <in> <out>
 }
 
 rules_run() {
-  local line id sev enabled needs src mtype field pcre min
+  local id sev impact enabled needs src mtype field pcre min
   local -A seen=()
-  local f
 
-  for f in "$P2S_RULE_DIR/pack/"*.jsonl "$P2S_CONF_DIR"/rules.d/*.jsonl; do
-    [[ -e $f ]] || continue
-    while IFS= read -r line; do
-      [[ -z ${line//[[:space:]]/} || $line == \#* ]] && continue
-      id=$(_jq '.id' "$line")
-      [[ -z $id ]] && continue
-      seen[$id]=$line
-    done <"$f"
-  done
+  # Rule pack đã được parse thành TSV ở trên. Dòng sau ghi đè dòng trước cùng id
+  # (rules.d/ thắng pack/), giữ đúng thứ tự xuất hiện để log dễ đọc.
+  local -a order=()
+  while IFS=$'\037' read -r id sev impact enabled needs src mtype field pcre min; do
+    [[ -z $id ]] && continue
+    [[ -n ${seen[$id]+x} ]] || order+=("$id")
+    seen[$id]="$sev"$'\037'"$impact"$'\037'"$enabled"$'\037'"$needs"$'\037'"$src"$'\037'"$mtype"$'\037'"$field"$'\037'"$pcre"$'\037'"$min"
+  done <"$RULES_TSV"
 
-  for id in "${!seen[@]}"; do
-    line=${seen[$id]}
-    enabled=$(_jq '.enabled // true' "$line")
+  local key
+  for key in "${order[@]}"; do
+    IFS=$'\037' read -r sev impact enabled needs src mtype field pcre min <<<"${seen[$key]}"
+    id=$key
+
     [[ $enabled == true || $enabled == 1 ]] || continue
 
     # capability gate: every listed need must be present
-    needs=$(_jq '.needs | join(",")' "$line")
     if [[ -n $needs ]]; then
       local need bad=0
       IFS=, read -ra _needs <<<"$needs"
@@ -152,16 +180,11 @@ rules_run() {
       (( bad )) && continue
     fi
 
-    sev=$(_jq '.severity // "MEDIUM"' "$line" | tr '[:lower:]' '[:upper:]')
-    impact=$(_jq -r '.impact // ""' "$line" 2>/dev/null)
-    mtype=$(_jq '.match.type // "regex"' "$line")
-    field=$(_jq '.match.field // "msg"' "$line")
-    pcre=$(_jq '.match.pcre // empty' "$line")
-    min=$(_jq '.match.min // 1' "$line")
+    sev=${sev^^}
+    [[ -n $sev ]] || sev=MEDIUM
+    [[ -n $min ]] || min=1
     [[ -z $pcre ]] && continue
     [[ $mtype == regex || $mtype == literal || $mtype == fs || $mtype == proc ]] || continue
-
-    src=$(_jq '.source | join(",")' "$line")
 
     local hits="$TMP/hits.$id" cur="$TMP/cur.$id"
     : >"$hits"
@@ -175,23 +198,20 @@ rules_run() {
     _intersect "$hits" "$cur"
 
     # additional AND conditions, each possibly negated
-    local n_and i cfield cpcre cneg
-    n_and=$("$P2S_JQ" -r '.match.and | length // 0' <<<"$line" 2>/dev/null)
-    for ((i = 0; i < ${n_and:-0}; i++)); do
-      cfield=$("$P2S_JQ" -r ".match.and[$i].field" <<<"$line" 2>/dev/null)
-      cpcre=$("$P2S_JQ" -r ".match.and[$i].pcre" <<<"$line" 2>/dev/null)
-      cneg=$("$P2S_JQ" -r ".match.and[$i].neg // false" <<<"$line" 2>/dev/null)
+    local cfield cpcre cneg inv
+    while IFS=$'\037' read -r _aid cfield cpcre cneg; do
+      [[ $_aid == "$id" ]] || continue
       [[ -z $cfield || -z $cpcre ]] && continue
-      local inv=0
-      [[ $cneg == true ]] && inv=1
+      inv=0
+      [[ $cneg == 1 ]] && inv=1
       _field_hits "$cfield" "$cpcre" "$cur" "$inv"
       _intersect "$hits" "$cur"
-    done
+    done <"$ANDS_TSV"
 
     local n
     n=$(_hit_count "$hits")
     (( n == 0 )) && continue
-    if (( n < ${min:-1} )); then
+    if (( n < min )); then
       printf 'suppressed\t%s\t%d hit(s) < min %s\n' "$id" "$n" "$min" \
         >>"$P2S_DEVICE_RUN_DIR/batches.log"
       continue

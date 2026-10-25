@@ -187,6 +187,12 @@ if [[ $mode != setup ]]; then
   p2s_device_init || die "không tạo được thư mục dữ liệu dưới $WORKDIR"
 fi
 
+# jq là tuỳ chọn: rule pack đọc bằng lib/jsonl.awk nên thiếu jq vẫn phát hiện
+# bình thường. Ở đây chỉ cố cài thêm nếu host cho phép — không chặn lượt chạy.
+case $mode in
+  setup|once|run|retro) p2s_want_jq ;;
+esac
+
 case $mode in
   setup)
     # 1) pair (idempotent: central.sh skips when conf already matches)

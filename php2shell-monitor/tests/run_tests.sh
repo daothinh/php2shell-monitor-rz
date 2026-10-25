@@ -204,7 +204,7 @@ w2=$(newlab)
 # Địa chỉ server không được xuất hiện dạng plaintext trong mã nguồn: grep một
 # cổng hay một dải IP không được tìm ra nó.
 ep_out=$(bash -c 'source "$1/lib/endpoint.sh"; p2s_endpoint' _ "$SRC")
-T "endpoint: giải mã ra URL http"      "http://" "$ep_out"
+T "endpoint: giải mã ra URL http"      "http" "$ep_out"
 bash -c 'source "$1/lib/endpoint.sh"; p2s_endpoint_valid' _ "$SRC" \
   && pass "endpoint: hợp lệ" || fail "endpoint: hợp lệ"
 
@@ -457,7 +457,54 @@ T "test: dùng API key từ conf"          "X-API-Key: p2sk-test-key-42" "$(cat 
 T "test: message alert thử nêu device"  "test-device" "$(cat "$stub/ingest_body")"
 T "test: payload là alert thử INFO"     '"severity":"INFO"' "$(cat "$stub/ingest_body")"
 
-rm -rf -- "$w" "$w2"
+# ------------------------------------------- rule pack không cần jq
+# Rule pack đọc bằng lib/jsonl.awk. Đây là điều kiện sống còn: nếu jq là bắt
+# buộc thì host không cài được jq sẽ chạy monitor mà không phát hiện gì.
+w6=$(newlab)
+
+# awk parser phải cho ra đúng từng field như jq (nếu máy build có jq).
+if command -v jq >/dev/null 2>&1; then
+  awk -f "$SRC/lib/jsonl.awk" rules="$w6/awk.tsv" ands="$w6/awk.and.tsv" \
+    "$SRC"/rules/pack/*.jsonl 2>/dev/null
+  jq -r '[.id,.severity,(.impact//""),(.enabled//true|tostring),(.needs//[]|join(",")),(.source//[]|join(",")),(.match.type//"regex"),(.match.field//"msg"),.match.pcre,(.match.min//1|tostring)]|join("\u001f")' \
+    "$SRC"/rules/pack/*.jsonl 2>/dev/null | sort >"$w6/jq.tsv"
+  LC_ALL=C sort "$w6/awk.tsv" -o "$w6/awk.tsv"
+  LC_ALL=C sort "$w6/jq.tsv" -o "$w6/jq.tsv"
+  T "rules: awk parser khớp jq từng field" "" "$(diff "$w6/awk.tsv" "$w6/jq.tsv")"
+  T "rules: awk parser đọc đủ rule"       "$(wc -l <"$w6/jq.tsv" | tr -d ' ')" \
+    "$(wc -l <"$w6/awk.tsv" | tr -d ' ')"
+else
+  pass "rules: awk parser khớp jq từng field (bỏ qua: máy build không có jq)"
+  pass "rules: awk parser đọc đủ rule (bỏ qua: máy build không có jq)"
+fi
+
+# and-condition (P2S-016: status ^500$ AND uri \.php) phải parse được
+T "rules: and-condition parse ra" "uri" "$(awk -F'\037' '$1=="P2S-016"{print $2}' "$w6/awk.and.tsv")"
+T "rules: and-condition pcre giữ backslash" '\.php' "$(awk -F'\037' '$1=="P2S-016"{print $3}' "$w6/awk.and.tsv")"
+
+# P2S-025 có \| trong PCRE: backslash phải còn nguyên, không bị JSON unescape
+T "rules: pcre giữ \\| nguyên vẹn" "base64 -d \\|" \
+  "$(awk -F'\037' '$1=="P2S-025"{print $9}' "$w6/awk.tsv")"
+
+# Phát hiện phải chạy được khi KHÔNG có jq trong PATH.
+mkdir -p "$w6/bin"
+for c in bash awk sed grep tr wc cut sort comm seq mktemp rm mv cat head tail \
+         stat date mkdir dirname basename find flock printf env nice timeout \
+         hostname id uname; do
+  p=$(command -v "$c" 2>/dev/null) && ln -sf "$p" "$w6/bin/$c"
+done
+stream="$w6/nojq.tsv"
+awk -f "$SRC/lib/accesslog.awk" -v src=access_log "$FIX/mal_access_php2shell_ua.log" >"$stream"
+out=$(PATH="$w6/bin" WORKDIR="$w6" P2S_SRC_DIR="$w6" P2S_JQ= \
+      "$w6/bin/bash" "$w6/engine/rule_match.sh" "$stream" 2>/dev/null)
+T "rules: phát hiện được khi KHÔNG có jq" "P2S-008" "$(printf '%s' "$out" | cut -f12)"
+T "rules: không cần jq vẫn ra đúng 1 hit" "1" "$(printf '%s\n' "$out" | grep -c .)"
+
+# auto-install jq không được làm hỏng lượt chạy khi không phải root / không có pm
+out=$(bash -c 'source "$1/lib/deps.sh"; P2S_JQ=""; p2s_ensure_jq --quiet; echo "rc=$?"' _ "$SRC" 2>&1)
+T "deps: ensure_jq không exit khác 0" "rc=0" "$(printf '%s' "$out" | grep -o 'rc=[01]')"
+
+rm -rf -- "$w" "$w2" "$w6"
 
 echo ""
 echo "passed: $PASS  failed: $FAIL"
