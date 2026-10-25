@@ -24,9 +24,22 @@ Hệ thống giám sát thời gian thực bằng bash script, giúp phát hiệ
 
 ### 1. Chuẩn bị
 
-*   **Tải công cụ:** <Thay thế bằng link release Github của bạn tại đây>
+*   **Tải công cụ:** [php2shell-monitor.sh (bản mới nhất)](https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh)
+
+*   **Checksum xác minh:** [php2shell-monitor.sh.sha256](https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh.sha256)
+
+*   **Trang Release:** [github.com/daothinh/php2shell-monitor-rz/releases](https://github.com/daothinh/php2shell-monitor-rz/releases)
 
 *   **Bot Telegram hỗ trợ:** [t.me/p2shell_bot](https://t.me/p2shell_bot)
+
+Tải và xác minh bằng một lệnh:
+
+```bash
+curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh
+curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh.sha256
+sha256sum -c php2shell-monitor.sh.sha256
+chmod +x php2shell-monitor.sh
+```
 
 
 
