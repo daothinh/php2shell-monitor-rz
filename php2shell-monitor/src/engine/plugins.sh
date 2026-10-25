@@ -3,9 +3,7 @@
 # A failing plugin never aborts the batch; it is logged and skipped.
 set -u
 WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/paths.sh"
 p2s_device_init || exit 1
 

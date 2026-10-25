@@ -4,15 +4,10 @@
 set -u
 WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
 export WORKDIR
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/log.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/paths.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/state.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/stream.sh"
 
 p2s_device_init || exit 1

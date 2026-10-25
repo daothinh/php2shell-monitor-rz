@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # docker_logs.sh - container stdout/stderr via `docker logs`. Read-only.
 set -u
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=docker_logs

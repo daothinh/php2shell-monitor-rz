@@ -45,8 +45,12 @@ docker compose up -d
 
 ```bash
 cd central-alert-server/client
-sudo ./p2s-agent.sh pair --name khach-hang-A --server https://alert.example.com
-# → in mã SEC-<UUID> → user copy mã nhắn cho bot → bot trả lời "Ghép nối thành công"
+# Chat ID: nhắn /id cho bot. Cả 3 tham số đều bắt buộc, không có mặc định.
+sudo ./p2s-agent.sh \
+  --server  http://<IP-central-server>:8000 \
+  --project khach-hang-A \
+  --chatid  812345678
+# → ghép nối TỰ ĐỘNG (không /confirm); bot nhắn 1 tin xác nhận cho dự án mới
 sudo ./p2s-agent.sh test    # alert thử phải hiện trên Telegram
 sudo ./p2s-agent.sh run     # chạy thường trực (systemd unit kèm sẵn)
 ```

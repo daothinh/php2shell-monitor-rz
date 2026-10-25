@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # accesslog_nginx.sh - nginx access logs. Read-only tail by offset.
 set -u
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=accesslog_nginx

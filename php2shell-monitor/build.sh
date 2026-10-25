@@ -58,6 +58,12 @@ if command -v makeself >/dev/null 2>&1; then
   makeself --sha256 --nox11 --noprogress --gzip --needroot --target "$INSTALL_DIR" \
     "$PAYLOAD" "$DIST/php2shell-monitor.sh" \
     "PHP2Shell Monitor $VERSION" ./bootstrap.sh
+
+  # Lenh chinh cua tool la "php2shell-monitor.sh --server ... --project ...
+  # --chatid ...": makeself mac dinh tu choi flag la va doi dau "--" phan cach.
+  # Vá stub de flag duoc chuyen thang xuong script.
+  python3 tools/patch_makeself.py "$DIST/php2shell-monitor.sh"
+
   sha256sum "$DIST/php2shell-monitor.sh" >"$DIST/php2shell-monitor.sh.sha256"
   echo "built: $DIST/php2shell-monitor.sh (installs into $INSTALL_DIR)"
 else

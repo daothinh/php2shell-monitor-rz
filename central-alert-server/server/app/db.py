@@ -12,7 +12,8 @@ Tables
 ------
 projects    one customer/site, owns an API key and one Telegram chat
 devices     one monitored host inside a project
-alerts      one row per batch alert (severity = highest of its hits)
+alerts      one row per batch alert (severity = CRITICAL only on RCE evidence,
+            MODERATE at >=5000 events, INFO below)
 alert_hits  one row per raw log line that matched a rule (file + line + raw)
 """
 import json

@@ -77,6 +77,7 @@ def _alert(batch="20261024T000000Z"):
         "project": "khach-hang-a",
         "device": "web01",
         "host": "web01",
+        "user": "root",
         "window_start": "2026-10-23T23:55:00Z",
         "window_end": "2026-10-24T00:00:00Z",
         "severity": "CRITICAL",
@@ -141,7 +142,7 @@ def test_ingest_mirrors_evidence_to_disk(env):
     stored = r.json()["alerts"][0]["evidence_file"]
     path = Path(stored)
     assert path.is_file(), f"missing evidence mirror at {path}"
-    assert path.parent.name == "IP-LAN_unknown_web01_unknown"
+    assert path.parent.name == "IP-LAN_unknown_web01"
     assert path.parent.parent.name == "khach-hang-a"
     assert path.name == "20261024T000000Z.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines()]
@@ -251,13 +252,14 @@ def test_telegram_message_matches_compact_template(env):
     assert len(tg.sent) == 1
     text = tg.sent[0][1]
     lines = text.split("\n")
-    assert len(lines) == 4, text
-    assert lines[0] == "🛡 <b>Central Security Alert</b> - 24/10/2026"
-    # CRITICAL wins over the HIGH hit; P2S-020 (RCE_RULES) sets the RCE headline
-    assert lines[1].startswith("🚨 <b>CRITICAL</b> · <b>Server bị chiếm quyền (RCE)</b>")
-    assert "3 hit / 5 phút" in lines[1]
+    assert len(lines) == 5, text
+    assert lines[0].startswith("🛡 <b>Central Security Alert</b> - 24/10/2026 - ")
+    # P2S-020 carries impact=rce -> CRITICAL, headline must say the box is owned
+    assert lines[1].startswith("🚨 <b>CRITICAL</b> · Server bị chiếm quyền (RCE)")
+    assert "3 events" in lines[1]
     assert lines[2] == "📦 Dự án: <b>khach-hang-a</b>"
-    assert lines[3] == "🖥 <b>web01</b> / 10.0.0.15"
+    assert lines[3] == "🚨 User: <b>root</b> - Hostname: <b>web01</b>"
+    assert lines[4] == "🖥 IP LAN: <b>10.0.0.15</b>"
 
 
 def test_telegram_message_subminute_window_is_escaped(env):
@@ -271,7 +273,8 @@ def test_telegram_message_subminute_window_is_escaped(env):
     client.post("/api/v1/ingest-log", headers={"X-API-Key": key},
                 json={"host": "web01", "alerts": [a]})
     text = tg.sent[0][1]
-    assert "hit / &lt;1 phút" in text
+    # Số event thay cho "hit / phút"; không còn ký tự < nào lọt vào HTML.
+    assert "3 events" in text
     assert "<1 phút" not in text
 
 
@@ -280,7 +283,8 @@ def test_telegram_message_without_lan_ip(env):
     _, key = _project_with_key(cfg)
     client.post("/api/v1/ingest-log", headers={"X-API-Key": key},
                 json={"host": "web01", "alerts": [_alert()]})
-    assert tg.sent[0][1].split("\n")[3] == "🖥 <b>web01</b>"
+    # Không rõ IP LAN thì ghi rõ "không rõ", không bỏ dòng (giữ shape 5 dòng).
+    assert tg.sent[0][1].split("\n")[4] == "🖥 IP LAN: <b>không rõ</b>"
 
 
 def test_ingest_requires_valid_key(env):
@@ -391,8 +395,8 @@ def test_bot_add_new_id_is_gone(env):
     from app.telegram import PairingBot
     assert "add_new_id" not in [c for c, _ in PairingBot.BOT_COMMANDS]
     asyncio.run(bot.handle_update(_msg(8009, "/add_new_id")))
-    # rơi vào nhánh else: help (không có pending nào ở chat này)
-    assert "Trợ giúp" in tg.sent[-1][1] or "Chào mừng" in tg.sent[-1][1]
+    # rơi vào nhánh else: help ngắn (không còn xử lý riêng cho add_new_id)
+    assert "Trợ giúp" in tg.sent[-1][1]
 
 
 def test_bot_list_shows_all_servers_of_one_chat(env):
@@ -401,15 +405,29 @@ def test_bot_list_shows_all_servers_of_one_chat(env):
     chat = 8002
 
     asyncio.run(bot.handle_update(_msg(chat, "/list")))
-    assert "Chưa có server" in tg.sent[-1][1]
+    assert "Chưa có dự án" in tg.sent[-1][1]
 
     for name in ("alpha", "beta"):
         _register_chatid(client, name, chat)
-    asyncio.run(bot.handle_update(_msg(chat, "/confirm")))
+
+    # alpha: 2 thiết bị, beta: 1 thiết bị
+    rows = db.projects_by_chat(cfg.database_path, str(chat))
+    pids = {r["project_name"]: r["id"] for r in rows}
+    db.upsert_device(cfg.database_path, pids["alpha"], "web01")
+    db.upsert_device(cfg.database_path, pids["alpha"], "web02")
+    db.upsert_device(cfg.database_path, pids["beta"], "db01")
 
     asyncio.run(bot.handle_update(_msg(chat, "/list")))
     text = tg.sent[-1][1]
-    assert "2" in text and "alpha" in text and "beta" in text
+    assert "alpha" in text and "beta" in text
+    # mỗi dự án kèm số thiết bị riêng
+    assert text.count("Số thiết bị: <b>") == 2
+    assert "Số thiết bị: <b>2</b>" in text and "Số thiết bị: <b>1</b>" in text
+    assert "Dự án: <b>2</b>" in text and "khả dụng <b>2</b>" in text
+    assert "Thiết bị: <b>3</b>" in text
+    # không còn hướng dẫn dư thừa
+    for junk in ("/add_new_id", "p2s-agent.sh", "Dùng ", "ghép ", "alert gần nhất"):
+        assert junk not in text, junk
 
 
 def test_bot_help_mentions_commands(env):
@@ -421,14 +439,18 @@ def test_bot_help_mentions_commands(env):
     assert "/unlink" in text and "Chat ID" in text
     assert "/confirm" not in text          # luồng confirm đã bỏ
     assert "/add_new_id" not in text       # lệnh đã bỏ
-    assert "≡" in text and "2 bước" in text  # gợi ý menu + luồng tự động
+    assert len(text.splitlines()) <= 7     # ngắn gọn
+    assert "≡" not in text and "2 bước" not in text
 
 
 def test_bot_welcome_on_start(env):
     _, cfg, tg = env
     bot = _bot(cfg, tg)
     asyncio.run(bot.handle_update(_msg(8005, "/start")))
-    assert "Chào mừng" in tg.sent[-1][1]
+    text = tg.sent[-1][1]
+    assert text.startswith("👋 Central Alert Bot")
+    assert "php2Shell" in text
+    assert len(text.splitlines()) == 1
 
 
 def test_bot_command_menu_is_valid():
@@ -624,3 +646,136 @@ def test_repair_same_name_different_chat_creates_separate_project(env):
     with db.connect(cfg.database_path) as conn:
         n = conn.execute("SELECT COUNT(*) FROM projects WHERE project_name='web'").fetchone()[0]
     assert n == 2
+
+
+# ---------------------------------------------------------------- alert format
+def test_headline_only_critical_on_rce_evidence():
+    """CRITICAL = server đã bị chiếm quyền. Chỉ bằng chứng RCE mới được nói vậy."""
+    from app.telegram import _headline
+
+    def h(rule_id, sev="CRITICAL"):
+        return _headline({"severity": sev, "evidence": [{"rule_id": rule_id}]})
+
+    # có shell trên đĩa / lệnh đã chạy
+    for rid in ("P2S-020", "P2S-021", "P2S-022", "P2S-024", "P2S-025", "P2S-056"):
+        assert h(rid) == "Server bị chiếm quyền (RCE)", rid
+
+    # chỉ là dò quét / đang khai thác, chưa chứng minh được gì
+    assert h("P2S-050", "MODERATE") == "Server đang bị khai thác php2shell"
+    assert h("P2S-051", "MODERATE") == "Server đang bị khai thác php2shell"
+    assert h("P2S-054", "MODERATE") == "Server đang bị khai thác php2shell"
+    assert h("P2S-050", "INFO") == "Dấu hiệu dò quét php2shell"
+
+
+def test_merged_rule_id_still_detects_rce():
+    """De-dup gộp rule thành "P2S-050,P2S-056": phải tách ra mới thấy RCE."""
+    from app.telegram import is_rce
+
+    assert is_rce({"evidence": [{"rule_id": "P2S-050,P2S-056"}]}) is True
+    assert is_rce({"evidence": [{"rule_id": "P2S-050,P2S-051"}]}) is False
+    # counters path (payload không kèm evidence[])
+    assert is_rce({"rules": [{"rule_id": "P2S-056", "hits": 1}]}) is True
+
+
+def test_format_alert_matches_template():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert
+
+    alert = {
+        "batch_id": "20261025T165000Z",
+        "severity": "MODERATE", "hits": 6740,
+        "host": "web-01", "user": "www-data", "hostname": "ip-10-0-1-5",
+        "lan_ip": "10.0.1.5",
+        "ts_utc": "2026-10-25T16:50:00Z",
+        "evidence": [{"rule_id": "P2S-050", "impact": ""}],
+    }
+    lines = format_alert("prod-shop", alert,
+                         ZoneInfo("Asia/Ho_Chi_Minh")).split("\n")
+    assert len(lines) == 5
+    assert lines[0] == "🛡 <b>Central Security Alert</b> - 25/10/2026 - 23:50"
+    assert lines[1] == ("🟡 <b>MODERATE</b> · Server đang bị khai thác php2shell"
+                        " · 6740 events")
+    assert lines[2] == "📦 Dự án: <b>prod-shop</b>"
+    assert lines[3] == "🟡 User: <b>www-data</b> - Hostname: <b>ip-10-0-1-5</b>"
+    assert lines[4] == "🖥 IP LAN: <b>10.0.1.5</b>"
+
+
+def test_format_alert_critical_uses_rce_headline():
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert
+
+    alert = {"severity": "CRITICAL", "hits": 3, "host": "web-01",
+             "user": "www-data", "hostname": "web-01", "lan_ip": "10.0.1.5",
+             "ts_utc": "2026-10-25T16:50:00Z",
+             "evidence": [{"rule_id": "P2S-056", "impact": "rce"}]}
+    msg = format_alert("prod", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
+    assert "🚨 <b>CRITICAL</b> · Server bị chiếm quyền (RCE) · 3 events" in msg
+
+
+# ------------------------------------------------------------ evidence layout
+def test_device_label_is_ip_and_hostname_only():
+    """Thư mục evidence: IP + hostname. Account không phải một phần danh tính máy."""
+    from app.evidence import device_label
+
+    a = {"lan_ip": "192.168.0.2", "hostname": "d2ad89e61d7b", "user": "root"}
+    assert device_label(a) == "IP-LAN_192.168.0.2_d2ad89e61d7b"
+
+    # đổi account không được tạo thư mục khác
+    b = dict(a, user="www-data")
+    assert device_label(a) == device_label(b)
+
+    # thiếu hostname thì lùi về device
+    assert device_label({"lan_ip": "10.0.0.5", "device": "web01"}) == "IP-LAN_10.0.0.5_web01"
+
+
+def test_merge_user_folders_collapses_accounts(tmp_path):
+    from app.migrate import merge_user_folders
+
+    p = tmp_path / "lab-1"
+    for user, batch in (("root", "20261025T100000Z"), ("root", "20261025T100500Z"),
+                        ("www-data", "20261025T101000Z")):
+        d = p / f"IP-LAN_192.168.0.2_host1_{user}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{batch}.jsonl").write_text(f"{user}-{batch}\n")
+
+    merged = merge_user_folders(tmp_path)
+    assert len(merged) == 2
+
+    target = p / "IP-LAN_192.168.0.2_host1"
+    assert sorted(f.name for f in target.iterdir()) == [
+        "20261025T100000Z.jsonl", "20261025T100500Z.jsonl", "20261025T101000Z.jsonl"]
+    assert not (p / "IP-LAN_192.168.0.2_host1_root").exists()
+    assert not (p / "IP-LAN_192.168.0.2_host1_www-data").exists()
+
+
+def test_merge_is_idempotent_and_never_eats_hostname_underscores(tmp_path):
+    """Hostname có "_" (web_01_prod) không được bị gộp lại lần nữa."""
+    from app.migrate import merge_user_folders
+
+    p = tmp_path / "lab-2"
+    d = p / "IP-LAN_10.0.0.5_web_01_prod_www-data"
+    d.mkdir(parents=True)
+    (d / "20261025T110000Z.jsonl").write_text("x\n")
+
+    assert len(merge_user_folders(tmp_path)) == 1
+    target = p / "IP-LAN_10.0.0.5_web_01_prod"
+    assert target.is_dir()
+    # chạy lại nhiều lần phải không đổi gì
+    for _ in range(3):
+        assert merge_user_folders(tmp_path) == []
+    assert (target / "20261025T110000Z.jsonl").read_text() == "x\n"
+
+
+def test_merge_keeps_existing_file_on_collision(tmp_path):
+    """Cùng batch id ở hai account: giữ bản đã có, không ghi đè."""
+    from app.migrate import merge_user_folders
+
+    p = tmp_path / "lab-1"
+    for user, body in (("root", "original\n"), ("www-data", "duplicate\n")):
+        d = p / f"IP-LAN_192.168.0.2_h_{user}"
+        d.mkdir(parents=True)
+        (d / "20261025T100000Z.jsonl").write_text(body)
+
+    merge_user_folders(tmp_path)
+    assert (p / "IP-LAN_192.168.0.2_h" / "20261025T100000Z.jsonl").read_text() == "original\n"

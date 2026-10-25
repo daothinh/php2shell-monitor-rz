@@ -81,7 +81,7 @@ central-alert-server/
 │   ├── docker-compose.yml
 │   └── .env.example
 ├── client/
-│   ├── p2s-agent.sh      # pair | run | test
+│   ├── p2s-agent.sh      # ghép nối (mặc định) | run | test
 │   └── p2s-agent.service
 └── tests/
     ├── test_ingest.py    # lưu trữ, idempotency, evidence, Telegram
@@ -110,7 +110,7 @@ ALERT_RETENTION_DAYS=90
 
 > Nhánh `feature/chatid-pairing`: pairing theo **Chat ID** thay vì mã `SEC-<UUID>` — alert đi được về **chat riêng của một user hoặc cả group** (cả team cùng nhận).
 >
-> Bot chính thức của hệ thống: **@p2shell_bot** (script `pair` in sẵn link và hướng dẫn từng bước).
+> Bot chính thức của hệ thống: **@p2shell_bot** (lệnh ghép nối in sẵn link và hướng dẫn từng bước).
 
 Bot **tự đăng ký menu lệnh** (nút **≡** / gõ `/`) khi khởi động.
 
@@ -118,10 +118,14 @@ Bot **tự đăng ký menu lệnh** (nút **≡** / gõ `/`) khi khởi động.
 
 ```
 1️⃣ Telegram → bot → /id          → bot trả Chat ID (chat riêng: số dương; group: số âm)
-2️⃣ Server:   sudo p2s-agent.sh pair
-             → script hỏi Chat ID → nhập số vừa copy → GHÉP NỐI NGAY
-             (server trung tâm đã hardcode sẵn trong script; muốn trỏ server
-              khác thì thêm --server <url> hoặc set P2S_SERVER_URL)
+2️⃣ Server:   sudo p2s-agent.sh \
+                --server  <url central server> \
+                --project <tên dự án> \
+                --chatid  <Chat ID vừa copy>
+             → GHÉP NỐI NGAY (tự động, không /confirm)
+
+Cả 3 tham số đều BẮT BUỘC, không có mặc định: tên dự án không lấy từ hostname
+(hostname là danh tính THIẾT BỊ, agent tự gửi kèm khi ingest).
 ```
 
 - Bot chỉ nhắn **1 tin** "✅ Đã tự động ghép nối" vào chat cho dự án **mới**
@@ -132,10 +136,15 @@ Bot **tự đăng ký menu lệnh** (nút **≡** / gõ `/`) khi khởi động.
 
 | Lệnh (menu ≡) | Chức năng |
 |---|---|
+| `/start` | Một dòng giới thiệu bot |
 | `/id` | Lấy Chat ID của chat hiện tại (cần cho script pair) |
-| `/list` (hoặc `/ids`, `/servers`) | Các server/dự án đã ghép với chat: tên, số thiết bị, ngày ghép, alert gần nhất |
+| `/list` (hoặc `/ids`, `/servers`) | Dự án đang quản lý + **số thiết bị của từng dự án** (dòng tổng: số dự án, số dự án khả dụng, tổng thiết bị) |
 | `/unlink <tên>` | Ngắt một dự án khỏi chat: alert dừng gửi ngay, lịch sử vẫn lưu |
-| `/start`, `/help` | Chào mừng / trợ giúp đầy đủ |
+| `/help` | Trợ giúp ngắn: 4 lệnh + 1 dòng cách ghép nối |
+
+Nghiệp vụ: dự án khả dụng luôn có **≥ 1 thiết bị**; dự án chưa nhận alert nào
+được `/list` đánh dấu `0 — chưa khả dụng` thay vì ẩn đi. `/confirm` và
+`/add_new_id` không còn trong menu (ghép nối tự động qua Chat ID).
 
 API: `POST /api/v1/register-chatid` `{project_name, chat_id, device?}` → `{pair_ref, auto_linked, ...}` — ghép nối và cấp key NGAY; agent poll `GET /pairing-status?code=<pair_ref>` nhận `linked` + `api_key` ở lần đầu tiên.
 
@@ -307,11 +316,29 @@ Chi tiết rule/evidence vẫn tra qua `GET /api/v1/alerts/{id}`.
 ## 5. Client agent
 
 ```bash
-sudo ./p2s-agent.sh pair    # server mặc định đã hardcode sẵn trong script
-sudo ./p2s-agent.sh pair --server https://alert.example.com   # trỏ server khác
+# Ghép nối: BẮT BUỘC đủ 3 tham số — không có giá trị mặc định
+sudo ./p2s-agent.sh \
+  --server  http://192.168.22.191:8000 \
+  --project khach-hang-A \
+  --chatid  812345678
+
 sudo ./p2s-agent.sh test
 sudo ./p2s-agent.sh run
 ```
+
+| Tham số | Bắt buộc | Ý nghĩa |
+|---|---|---|
+| `--server` | ✅ | URL central server (không hardcode trong script) |
+| `--project` | ✅ | tên dự án khách hàng, `[A-Za-z0-9._-]{1,64}` |
+| `--chatid` | ✅ | Chat ID Telegram từ `/id` (chat riêng dương, group âm) |
+
+Thiếu bất kỳ tham số nào → script dừng và liệt kê đúng tham số còn thiếu.
+Không có chữ `pair`: truyền thẳng 3 tham số là ghép nối. `--device` **không**
+phải tham số — thiết bị luôn là `hostname` của máy chạy agent (danh tính thiết
+bị, không phải tên dự án).
+
+Thêm thiết bị khác vào cùng dự án: chạy lại lệnh trên máy đó với **cùng**
+`--project` + `--chatid` — mỗi máy nhận API key riêng, bot không nhắn lại.
 
 `run`:
 
@@ -329,9 +356,11 @@ sudo ./p2s-agent.sh run
 |---|---|---|
 | `P2S_AGENT_CONF` | `/etc/php2shell/agent.conf` | `SERVER_URL`, `API_KEY`, `PROJECT_NAME` (0600) |
 | `P2S_AGENT_STATE` | `/var/lib/php2shell-agent` | offset + spool |
-| `P2S_ALERT_FILE` | `/var/lib/php2shell/projects/default/devices/<host>/alerts/queue.jsonl` | queue của monitor |
+| `P2S_ALERT_FILE` | `/var/lib/php2shell/projects/<PROJECT_NAME>/devices/<hostname>/alerts/queue.jsonl` | queue của monitor (suy ra từ project + hostname) |
 | `P2S_AGENT_POLL` | `5` | giây/chu kỳ |
-| `P2S_PROJECT_NAME` | hostname | tên dự án gửi khi `pair` |
+| `P2S_SERVER_URL` | — | thay cho `--server` |
+| `P2S_PROJECT_NAME` | — | thay cho `--project` (không mặc định hostname) |
+| `P2S_TG_CHATID` | — | thay cho `--chatid` |
 
 ---
 
@@ -397,7 +426,7 @@ Khôi phục: giữ `.env` + `data/alerts.db` + `data/evidence/`.
 | `accepted: 0` mọi lần | kiểm `batch_id` trong payload; alert không có `batch_id` bị từ chối |
 | Dòng 2 ghi `không xác định rule` | payload không có `rule_id`/`rules[]`/`evidence[]` |
 | Thiếu LAN IP ở dòng 4 | agent không dò được IP (host chỉ loopback) — kiểm `ip -4 route get 1.1.1.1` |
-| 409 `chưa có telegram_chat_id` | dự án chưa pair; chạy `p2s-agent.sh pair` |
+| 409 `chưa có telegram_chat_id` | dự án chưa ghép nối; chạy `p2s-agent.sh --server … --project … --chatid …` |
 | DB lớn nhanh | giảm `ALERT_RETENTION_DAYS`, dọn `data/evidence` theo ngày |
 
 ---

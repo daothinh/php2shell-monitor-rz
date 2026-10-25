@@ -1,21 +1,14 @@
 #!/usr/bin/env bash
 # rule_match.sh - match the rule pack against the stream.
 #
-# Each rule is `{id, severity, source[], needs[], match{field,pcre,and[],neg}, min}`.
-# Matching is done on the FIELD VALUE only (not the whole TSV line), so anchored
-# patterns like ^500$ behave as written.
-#
-# Output: stream records that matched, one line per (record, rule), with
-#   field 12 = rule id, field 13 = severity.
-# Rules whose hit count in this batch is below `min` are dropped entirely.
+# Rule: {id, severity, impact, source[], match{field,pcre,and[],neg,min}}.
+# Matching runs on the FIELD VALUE, not the TSV line, so anchored patterns hold.
+# Output: matched records, field 12 = rule id, 13 = severity, 14 = impact.
 set -u
 WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
 SRCROOT=${P2S_SRC_DIR:-$WORKDIR}
-# shellcheck source=/dev/null
 source "$SRCROOT/lib/common.sh"
-# shellcheck source=/dev/null
 source "$SRCROOT/lib/paths.sh"
-# shellcheck source=/dev/null
 source "$SRCROOT/lib/stream.sh"
 
 STREAM=$1
@@ -23,6 +16,8 @@ STREAM=$1
 p2s_device_init || exit 0
 
 TMP=$(mktemp -d "$P2S_TMP_DIR/rules.XXXXXX") || exit 1
+MATCHED=$TMP/matched.tsv
+: >"$MATCHED"
 trap 'rm -rf -- "$TMP"' EXIT
 
 _jq() { "$P2S_JQ" -r "$1" <<<"$2" 2>/dev/null; }
@@ -69,12 +64,60 @@ _intersect() { # <base> <other>
 _hit_count() { wc -l <"$1" | tr -d ' '; }
 
 # Emit the matching records for one rule.
-_emit_rule() { # <hitsfile> <rule> <severity>
-  local hits=$1 rule=$2 sev=$3
-  awk -F'\t' -v OFS='\t' -v rule="$rule" -v sev="$sev" '
+# One rule can match the same stream line several ways (and several rules can
+# match the same line), which inflates "hits" without adding information. A
+# hit is unique per (source, file, line, rule) — the same raw log line is
+# reported once per rule that fired on it.
+_emit_rule() { # <hitsfile> <rule> <severity> <impact>
+  local hits=$1 rule=$2 sev=$3 impact=${4:-}
+  awk -F'\t' -v OFS='\t' -v rule="$rule" -v sev="$sev" -v impact="$impact" '
     NR == FNR { want[$1] = 1; next }
-    FNR in want { $12 = rule; $13 = sev; print }
-  ' "$hits" "$STREAM"
+    FNR in want { $12 = rule; $13 = sev; $14 = impact; print }
+  ' "$hits" "$STREAM" >>"$MATCHED"
+}
+
+# Collapse to ONE event per raw log line. The same access-log line can satisfy
+# several rules (LFI path + php:// wrapper, etc.); counting it twice inflates
+# the event total and the Telegram message. Rules are merged into a comma list
+# and the highest severity wins.
+_dedup_events() { # <in> <out>
+  awk -F'\t' -v OFS='\t' '
+    function rank(s) {
+      if (s == "CRITICAL") return 4
+      if (s == "HIGH") return 3
+      if (s == "MEDIUM") return 2
+      if (s == "LOW") return 1
+      return 0
+    }
+    {
+      key = $2 SUBSEP $3 SUBSEP $4
+      if (key in sev) {
+        if (index("," rules[key] ",", "," $12 ",") == 0) rules[key] = rules[key] "," $12
+        if (rank($13) > rank(sev[key])) sev[key] = $13
+        # impact is sticky: one line proving RCE marks the whole event
+        if ($14 == "rce") impact[key] = "rce"
+        next
+      }
+      order[++n] = key
+      sev[key] = $13
+      rules[key] = $12
+      impact[key] = $14
+      line[key] = $0
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        k = order[i]
+        nf = split(line[k], f, "\t")
+        f[12] = rules[k]
+        f[13] = sev[k]
+        f[14] = impact[k]
+        nf = (nf < 14) ? 14 : nf
+        out = f[1]
+        for (j = 2; j <= nf; j++) out = out "\t" f[j]
+        print out
+      }
+    }
+  ' "$1" >"$2"
 }
 
 rules_run() {
@@ -110,6 +153,7 @@ rules_run() {
     fi
 
     sev=$(_jq '.severity // "MEDIUM"' "$line" | tr '[:lower:]' '[:upper:]')
+    impact=$(_jq -r '.impact // ""' "$line" 2>/dev/null)
     mtype=$(_jq '.match.type // "regex"' "$line")
     field=$(_jq '.match.field // "msg"' "$line")
     pcre=$(_jq '.match.pcre // empty' "$line")
@@ -152,8 +196,12 @@ rules_run() {
         >>"$P2S_DEVICE_RUN_DIR/batches.log"
       continue
     fi
-    _emit_rule "$hits" "$id" "$sev"
+    _emit_rule "$hits" "$id" "$sev" "$impact"
   done
+
+  # de-dup: 1 dòng log = 1 event, severity cao nhất, rule gộp bằng dấu phẩy
+  _dedup_events "$MATCHED" "$TMP/events.tsv"
+  cat -- "$TMP/events.tsv"
 }
 
 rules_run

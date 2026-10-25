@@ -13,15 +13,23 @@ log = logging.getLogger("alert-server.evidence")
 
 
 def device_label(alert: dict) -> str:
-    """Human-readable device folder name: IP-LAN_<lan_ip>_<hostname>_<user>."""
+    """Device folder name: IP-LAN_<lan_ip>_<hostname>.
+
+    The OS account is deliberately NOT part of the path. The monitor runs as
+    whatever account installed it, and that can change (root today, a service
+    account after a hardening pass) without the machine being a different
+    machine. Including it split one box's evidence across two folders. The user
+    is still recorded on every hit and shown in the Telegram alert.
+    """
     ip = str(alert.get("lan_ip") or "").strip() or "unknown"
-    host = str(alert.get("host") or alert.get("device") or "unknown").strip() or "unknown"
-    user = str(alert.get("user") or "").strip() or "unknown"
-    return db.slug(f"IP-LAN_{ip}_{host}_{user}")
+    host = (str(alert.get("hostname") or "").strip()
+            or str(alert.get("host") or alert.get("device") or "").strip()
+            or "unknown")
+    return db.slug(f"IP-LAN_{ip}_{host}")
 
 
 def evidence_path(cfg: Config, project: str, label: str, batch_id: str) -> Path:
-    """<root>/<project>/IP-LAN_<ip>_<host>_<user>/<batch>.jsonl — one file per batch.
+    """<root>/<project>/IP-LAN_<ip>_<hostname>/<batch>.jsonl — one file per batch.
 
     batch_id already carries the UTC timestamp (YYYYMMDDTHHMMSSZ), so no day
     folder is needed.

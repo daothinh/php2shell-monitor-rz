@@ -11,7 +11,8 @@ Environment=P2S_ALERT_FILE=/var/lib/php2shell/projects/default/devices/%H/alerts
 ExecStart=/usr/local/bin/p2s-agent.sh run
 Restart=always
 RestartSec=10
-# File cấu hình /etc/php2shell/agent.conf (0600, root) do lệnh 'p2s-agent.sh pair' tạo ra
+# File cấu hình /etc/php2shell/agent.conf (0600, root) do lệnh ghép nối tạo ra
+#   p2s-agent.sh --server <url> --project <tên> --chatid <id>
 User=root
 UMask=077
 

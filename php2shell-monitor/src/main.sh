@@ -1,166 +1,221 @@
 #!/usr/bin/env bash
-# main.sh - CLI dispatcher. Runs with cwd=WORKDIR (bootstrap cd's).
-#
-# Storage model:
-#   WORKDIR/projects/<project>/devices/<device>/{alerts,evidence,state,run}
-# PROJECT and DEVICE come from conf/device.conf (one monitor install = one device).
+# main.sh - CLI dispatcher. Runs with cwd=WORKDIR.
 set -u
 export WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
 P2S_SRC_DIR=$WORKDIR
 export P2S_SRC_DIR
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/log.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/paths.sh"
+source "$WORKDIR/lib/endpoint.sh"
 
 usage() {
   cat <<'EOF'
-php2shell-monitor — one alert per 5-minute batch, full raw evidence kept
+php2shell-monitor — cảnh báo an ninh php2Shell
 
-Usage: sudo bash php2shell-monitor.sh -- <mode>
+TRIỂN KHAI (một lệnh duy nhất):
 
-The archive unpacks into /opt/php2shell-monitor and every byte the tool writes
-(code, config, offsets, alerts, evidence, temp files) stays under that directory.
-Nothing else on the host is created or modified.
+  sudo php2shell-monitor.sh --project <tên-dự-án> --chatid <id>
 
-Modes:
-  (mặc định) Mọi lần chạy đều tự bật supervisor nền: rà log mỗi 5 phút,
-             alert sinh ra được đẩy Telegram nếu đã pair.
-  once       Run a single batch now (same work the supervisor does every 5 min)
-  run        Start the background supervisor (batch every BATCH_INTERVAL, default 300s)
-  (mặc định) Chạy không arg → wizard tương tác, hỏi từng bước:
-             TÊN DỰ ÁN → Chat ID → ghép nối TỰ ĐỘNG (không /confirm).
-               sudo php2shell-monitor.sh
-             Automation (không hỏi): tên dự án đứng đầu hoặc --project,
-             --chatid truyền sẵn, --server ghi đè mặc định
-             (http://45.124.93.136:8000); --device bỏ qua (tự detect).
-  test       Send one test alert to the paired central server
-  status     Project/device, plugin health, last batches, last alert
-  stop       Stop the supervisor (state preserved)
-  discover   Read-only host discovery -> reports/log-map-actual.md
-  retro      One-shot hunt over rotated logs (produces one alert for the window)
-  export     Copy alert queue + evidence to export/ as JSON
-  clean      stop + remove /opt/php2shell-monitor entirely
+    --project  tên dự án khách hàng, ví dụ khach-hang-A
+    --chatid   Chat ID Telegram: nhắn /id cho bot để lấy
+               (chat riêng: số dương; group: số âm)
 
-Alert model:
-  * at most ONE alert per batch, severity = highest severity among the hits
-  * every raw hit line is kept in <device>/evidence/<batch>.jsonl with file:line
-  * the alert itself embeds those hits (capped by MAX_EVIDENCE_INLINE)
+  Lệnh này ghi conf/device.conf, ghép nối với central server, lấy API key,
+  rồi bật supervisor rà log mỗi 5 phút + forwarder đẩy alert về Telegram.
+
+  Thiết bị đã thiết lập rồi thì chạy lại sẽ báo "THIẾT BỊ ĐÃ ĐƯỢC THIẾT LẬP"
+  và thoát — không ghi đè conf, không cấp key mới.
+
+  Muốn ĐỔI cấu hình: thêm --force.
+    sudo php2shell-monitor.sh --force --project <tên> --chatid <id>
+
+Chế độ khác:
+  once       Chạy một batch ngay
+  run        Bật supervisor nền
+  test       Gửi một alert thử
+  status     Trạng thái thiết bị và batch gần nhất
+  stop       Dừng supervisor
+  discover   Rà host read-only
+  retro      Săn một lượt trên log đã rotate
+  export     Copy alert queue + evidence ra export/
+  clean      stop + xoá toàn bộ /opt/php2shell-monitor
 EOF
+}
+
+die() { printf 'php2shell-monitor: %s\n' "$*" >&2; exit 2; }
+
+# Banner ASCII "VCCSEC" — printed once at the top of the deploy run.
+banner() {
+  cat <<'BANNER'
+ __     __   ____   ____  ____   _____   ____
+ \ \   / /  / ___| / ___|/ ___| | ____| / ___|
+  \ \ / /  | |    | |    \___ \ |  _|  | |
+   \ V /   | |___ | |___  ___) || |___ | |___
+    \_/     \____| \____||____/ |_____| \____|
+BANNER
 }
 
 # makeself passes the script args verbatim, so callers may write `-- once`.
 [[ ${1:-} == -- ]] && shift
 
-# Chạy không arg / arg là flag: pair wizard TƯƠNG TÁC — script hỏi từng bước
-# (tên dự án trước, rồi Chat ID). Giữ mode tường minh cho cron/automation:
-#   sudo php2shell-monitor.sh <tên-dự-án> --chatid <chat-id> [--server url]
-# `--device` được chấp nhận nhưng BỎ QUA (auto-detect hostname).
-P2S_DEFAULT_SERVER=${P2S_DEFAULT_SERVER:-http://45.124.93.136:8000}
-
 valid_project() { [[ $1 =~ ^[A-Za-z0-9._-]{1,64}$ ]]; }
+valid_chatid()  { [[ $1 =~ ^-?[1-9][0-9]{2,14}$ ]]; }
+
+mode=
+opt_project=
+opt_chatid=
+opt_force=0
+positional=()
 
 first=${1:-}
-mode=
-pair_args=() want_project=
+case $first in
+  help|-h|--help) mode=help ;;
+  once|run|test|status|stop|discover|retro|export|clean) mode=$first ;;
+esac
+[[ -n $mode ]] && shift
 
-if [[ $first == help || $first == -h || $first == --help ]]; then
-  mode=help
-elif [[ $first =~ ^(once|run|pair|test|status|stop|discover|retro|export|clean)$ ]]; then
-  mode=$first
-  [[ -n $1 ]] && shift
-else
-  mode=pair
-  # tên dự án: arg đầu (không phải flag) hoặc --project; nếu thiếu → hỏi sau
-  if [[ -n $first && $first != -* ]]; then
-    want_project=$first; shift
-  fi
-  while (($#)); do
-    case $1 in
-      --chatid)  pair_args+=(--chatid "${2:-}"); shift 2 ;;
-      --server)  pair_args+=(--server "${2:-}"); shift 2 ;;
-      --project) want_project=${2:-}; shift 2 ;;
-      --device)  shift 2 ;;   # bỏ qua — device luôn tự detect qua hostname
-      --detach)  pair_args+=(--detach); shift ;;
-      *) echo "tham số không hợp lệ: $1" >&2; usage; exit 2 ;;
-    esac
-  done
-  # server mặc định: chỉ thêm khi caller không truyền --server
-  has_server=0
-  for a in "${pair_args[@]}"; do [[ $a == --server ]] && has_server=1; done
-  ((has_server)) || pair_args=(--server "$P2S_DEFAULT_SERVER" "${pair_args[@]}")
+# ---- tham số của lệnh triển khai ----
+while (($#)); do
+  case $1 in
+    --server)  shift 2 ;;   # bỏ: endpoint nằm trong mã nguồn
+    --project) [[ -n ${2:-} ]] || die "--project cần tên dự án"; opt_project=$2; shift 2 ;;
+    --chatid)  [[ -n ${2:-} ]] || die "--chatid cần Chat ID"; opt_chatid=$2; shift 2 ;;
+    --force)   opt_force=1; shift ;;
+    --) shift; positional+=("$@"); break ;;
+    -*) die "tham số không hợp lệ: $1 (xem: php2shell-monitor.sh help)" ;;
+    *)  positional+=("$1"); shift ;;
+  esac
+done
+
+# tên dự án đứng đầu (kiểu cũ) vẫn nhận: php2shell-monitor.sh <tên> --chatid ...
+if [[ -z $opt_project && ${#positional[@]} -gt 0 ]]; then
+  opt_project=${positional[0]}
 fi
-
-apply_project() { # <tên> — ghi conf/device.conf trước khi p2s_device_init đọc
-  local name=$1 conf=$WORKDIR/conf/device.conf
-  if [[ -e $conf ]] && grep -q '^PROJECT=' "$conf" && [[ $(grep '^PROJECT=' "$conf") != "PROJECT=\"$name\"" ]]; then
-    sed -i "s|^PROJECT=.*|PROJECT=\"$name\"|" "$conf"
-  elif [[ ! -e $conf ]] || ! grep -q '^PROJECT=' "$conf"; then
-    printf '# php2shell-monitor — device identity\nPROJECT="%s"\nDEVICE="$(hostname 2>/dev/null || echo unknown)"\n' "$name" >"$conf"
-  fi
-  # re-init để các path dữ liệu dùng project mới
-  P2S_DATA_DIR='' p2s_device_init || true
-}
 
 [[ $mode == help ]] && { usage; exit 0; }
 
-# ---- pair wizard tương tác: hỏi TỪNG BƯỚC khi thiếu thông tin ----
-if [[ $mode == pair ]] && [[ -z $want_project || ${pair_args[*]#--chatid} == "${pair_args[*]}" ]]; then
-  cat <<'EOF'
+# Không có mode tường minh -> đây là lệnh triển khai.
+[[ -z $mode ]] && mode=setup
+
+# Banner only for deploy; other modes keep their output parseable.
+[[ $mode == setup ]] && banner
+
+# Một lệnh: validate -> ghi identity -> ghép nối -> bật supervisor.
+if [[ $mode == setup ]]; then
+  # No wizard, no prompt: missing parameters are reported and the run stops.
+  missing=()
+  [[ -n $opt_project ]] || missing+=(--project)
+  [[ -n $opt_chatid  ]] || missing+=(--chatid)
+  if ((${#missing[@]})); then
+    die "thiếu tham số bắt buộc: ${missing[*]}
+  sudo php2shell-monitor.sh --project <tên-dự-án> --chatid <chat-id>"
+  fi
+
+  opt_project=$(printf '%s' "$opt_project" | tr -d ' ')
+  valid_project "$opt_project" ||
+    die "--project không hợp lệ: chỉ A-Z a-z 0-9 . _ - (1-64 ký tự)"
+  opt_chatid=$(printf '%s' "$opt_chatid" | tr -d ' ')
+  valid_chatid "$opt_chatid" ||
+    die "--chatid không hợp lệ: phải là số Telegram (chat riêng dương, group âm)"
+  opt_server=$(p2s_endpoint) || die "không đọc được endpoint trong mã nguồn"
+  [[ $opt_server =~ ^https?:// ]] || die "endpoint trong mã nguồn không hợp lệ"
+fi
+
+# ---- guard: is this device already configured? ----
+# Re-running deploy on a configured device would overwrite conf/device.conf,
+# issue a new API key and move the alert chat. Report and exit instead, unless
+# --force was given.
+already_setup() {
+  local dconf=$WORKDIR/conf/device.conf cconf=$WORKDIR/conf/central.conf
+  local cur_proj='' cur_dev='' cur_key=''
+  [[ -r $dconf ]] && {
+    cur_proj=$(sed -n 's/^PROJECT="\(.*\)"$/\1/p' "$dconf" | head -1)
+    cur_dev=$(sed -n 's/^DEVICE="\(.*\)"$/\1/p' "$dconf" | head -1)
+  }
+  [[ -r $cconf ]] && cur_key=$(sed -n 's/^API_KEY=//p' "$cconf" | head -1)
+  # Configured = a real project (not "default") AND an API key.
+  [[ -n $cur_proj && $cur_proj != default && -n $cur_key ]] || return 1
+  ALREADY_PROJ=$cur_proj ALREADY_DEV=$cur_dev
+  return 0
+}
+
+report_already_setup() {
+  cat <<EOF
 
 ╔══════════════════════════════════════════════════════════════╗
-║   🛡  GHÉP NỐI TELEGRAM ALERT                               ║
+║   ℹ️   THIẾT BỊ ĐÃ ĐƯỢC THIẾT LẬP MONITOR php2Shell          ║
 ╚══════════════════════════════════════════════════════════════╝
+ Máy này đã cài đặt và ghép nối xong — không chạy lại lệnh triển khai.
+
+ Dự án      :  ${ALREADY_PROJ}
+ Thiết bị    :  ${ALREADY_DEV:-$(hostname 2>/dev/null || echo unknown)}
+
+ Muốn xem trạng thái :  sudo php2shell-monitor.sh status
+ Muốn gửi alert thử :  sudo php2shell-monitor.sh test
+ Muốn dừng monitor   :  sudo php2shell-monitor.sh stop
+
+ Muốn ĐỔI cấu hình (dự án / server / chat khác), thêm --force:
+   sudo php2shell-monitor.sh --force --project <tên> --chatid <id>
+   (lệnh này cấp API key mới và đổi chat nhận alert của thiết bị này)
 EOF
+}
+
+# ---- write identity: PROJECT from the flag, DEVICE is always the hostname ----
+# Must run before p2s_device_init: paths.sh reads conf/device.conf.
+apply_project() { # <tên dự án>
+  local name=$1 conf=$WORKDIR/conf/device.conf dev
+  dev=$(hostname 2>/dev/null || echo unknown)
+  (umask 077 && mkdir -p -- "$WORKDIR/conf")
+  (umask 077 && printf '# php2shell-monitor — device identity (do lệnh triển khai ghi)\nPROJECT="%s"\nDEVICE="%s"\n' \
+    "$name" "$dev" >"$conf")
+  # recompute every path that was derived from the previous conf
+  unset P2S_DATA_DIR P2S_ALERT_DIR P2S_EVIDENCE_DIR P2S_STATE_DIR P2S_DEVICE_RUN_DIR
+  p2s_device_init || die "không tạo được thư mục dữ liệu dưới $WORKDIR"
+}
+
+if [[ $mode == setup ]]; then
+  if already_setup && (( ! opt_force )); then
+    report_already_setup
+    exit 0
+  fi
+  apply_project "$opt_project"
 fi
 
-if [[ $mode == pair && -z $want_project ]]; then
-  printf '\n BƯỚC 1 — Nhập TÊN DỰ ÁN (vd: khach-hang-a): '
-  IFS= read -r want_project || exit 1
-  want_project=$(printf '%s' "$want_project" | tr -d ' ')
-  until valid_project "$want_project"; do
-    printf '❌ Tên không hợp lệ (chỉ A-Z a-z 0-9 . _ - độ dài 1-64). Nhập lại: '
-    IFS= read -r want_project || exit 1
-    want_project=$(printf '%s' "$want_project" | tr -d ' ')
-  done
-  apply_project "$want_project"
-fi
-
-if [[ $mode == pair ]] && [[ ${pair_args[*]#--chatid} == "${pair_args[*]}" ]]; then
-  cat <<'EOF'
-
- BƯỚC 2 — Lấy Chat ID: mở https://t.me/p2shell_bot → nhắn /id → copy dãy số
-EOF
-  printf '\n BƯỚC 3 — Nhập Chat ID Telegram của bạn: '
-  IFS= read -r in_chatid || exit 1
-  in_chatid=$(printf '%s' "$in_chatid" | tr -d ' ')
-  until [[ $in_chatid =~ ^-?[1-9][0-9]{2,14}$ ]]; do
-    printf '❌ Chat ID không đúng (nhắn /id cho bot, copy NGUYÊN dãy số). Nhập lại: '
-    IFS= read -r in_chatid || exit 1
-    in_chatid=$(printf '%s' "$in_chatid" | tr -d ' ')
-  done
-  pair_args=(--chatid "$in_chatid" "${pair_args[@]}")
-fi
-
-p2s_device_init || { echo "cannot initialise data dirs under $WORKDIR" >&2; exit 1; }
-
-# Auto-start: any invocation keeps the 5-minute monitor running (idempotent —
-# a live supervisor is left alone, `stop`/`clean` below still win).
-if [[ $mode != stop && $mode != clean ]]; then
-  bash "$WORKDIR/engine/supervisor.sh" start >/dev/null 2>&1 || true
+# Các mode khác cần path hợp lệ; setup đã init ở trên.
+if [[ $mode != setup ]]; then
+  p2s_device_init || die "không tạo được thư mục dữ liệu dưới $WORKDIR"
 fi
 
 case $mode in
+  setup)
+    # 1) pair (idempotent: central.sh skips when conf already matches)
+    bash "$WORKDIR/engine/central.sh" pair \
+      --server "$opt_server" --chatid "$opt_chatid" || exit $?
+
+    # 2) start the supervisor; it spawns the forwarder itself. Output is shown
+    #    only on failure — the pid line is not operator-facing.
+    sup_out=$(bash "$WORKDIR/engine/supervisor.sh" start 2>&1) || {
+      printf '%s\n' "$sup_out" >&2
+      exit 1
+    }
+
+    # 3) summary — operator-facing only, no server or chat details
+    cat <<EOF
+
+✅ GHÉP NỐI THÀNH CÔNG
+
+ Dự án     :  $PROJECT
+ Thiết bị   :  $DEVICE
+
+ Kiểm tra trạng thái:   sudo php2shell-monitor.sh status
+EOF
+    ;;
   once)
     bash "$WORKDIR/engine/scan.sh"
     ;;
   run)
     bash "$WORKDIR/engine/supervisor.sh" start
-    ;;
-  pair)
-    bash "$WORKDIR/engine/central.sh" pair ${pair_args+"${pair_args[@]}"}
     ;;
   test)
     bash "$WORKDIR/engine/central.sh" test
@@ -172,10 +227,10 @@ case $mode in
     bash "$WORKDIR/engine/supervisor.sh" stop
     ;;
   discover)
-    bash "$WORKDIR/discovery/discovery.sh" "${2:-}"
+    bash "$WORKDIR/discovery/discovery.sh" "${positional[0]:-}"
     ;;
   retro)
-    bash "$WORKDIR/discovery/retro_hunt.sh" "${2:-}"
+    bash "$WORKDIR/discovery/retro_hunt.sh" "${positional[0]:-}"
     ;;
   export)
     bash "$WORKDIR/export/export_json.sh"

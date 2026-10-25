@@ -10,7 +10,6 @@
 # A device is one monitored host. PROJECT/DEVICE come from conf/device.conf.
 [[ -n ${P2S_PATHS_SH:-} ]] && return 0
 P2S_PATHS_SH=1
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 # Keep ids filesystem-safe: letters, digits, dot, underscore, dash.

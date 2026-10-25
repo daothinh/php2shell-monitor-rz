@@ -67,3 +67,17 @@ csv_has() {
   for x in $1; do [[ $x == "$2" ]] && return 0; done
   return 1
 }
+
+# LAN IP: source address of the default route, then first global IPv4, then
+# `hostname -I`. Never loopback; never `hostname -i` (reverse DNS can block).
+lan_ip() {
+  local ip
+  if have ip; then
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+    [[ -n $ip ]] || ip=$(ip -4 -o addr show scope global 2>/dev/null |
+      awk '{ sub(/\/.*/, "", $4); if ($4 !~ /^127\./) { print $4; exit } }')
+  fi
+  [[ -n $ip ]] || ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\./ && !/^127\./ { print; exit }')
+  [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ip=""
+  printf '%s' "$ip"
+}

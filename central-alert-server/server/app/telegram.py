@@ -21,22 +21,48 @@ CODE_RE = re.compile(
 )
 
 _SEV_EMOJI = {
-    "CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "🟡", "LOW": "ℹ️", "INFO": "ℹ️",
+    "CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "🟡", "MODERATE": "🟡",
+    "LOW": "ℹ️", "INFO": "ℹ️",
 }
-_SEV_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+_SEV_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "MODERATE": 3, "LOW": 2, "INFO": 1}
 
 # Alert headline: exactly two messages.
 #   "Server bị chiếm quyền (RCE)" — any hit from an exploitation-success rule
 #   (T3: webshell dropped, backdoor, host exec, fpm child shell, reverse shell).
 #   "Server đang bị khai thác php2shell" — everything else, i.e. any batch with
 #   more than 2 distinct rules (T1 pre-exploit probes / T2 in-progress signals).
+# CRITICAL = the server IS compromised, not "is being attacked". A rule belongs
+# here only when its own evidence proves code execution already happened or a
+# payload is already sitting on disk / in a session file. Anything that is still
+# just a probe stays out, however loud it is.
 RCE_RULES = frozenset({
-    "P2S-020",  # webroot file written/changed
-    "P2S-021",  # host process exec (auditd)
-    "P2S-022",  # auto_prepend_file injected (backdoor)
-    "P2S-024",  # php-fpm spawned shell child
-    "P2S-025",  # reverse shell / post-exploitation
+    "P2S-020",  # webroot file written/changed        -> shell landed
+    "P2S-021",  # host process exec (auditd)           -> command ran
+    "P2S-022",  # auto_prepend_file injected           -> persistent backdoor
+    "P2S-024",  # php-fpm spawned shell child          -> command ran
+    "P2S-025",  # reverse shell / post-exploitation    -> channel open
+    "P2S-056",  # webshell pattern inside webroot      -> shell on disk
 })
+# Deliberately NOT here: P2S-050 / P2S-051 / P2S-054. Those fire on every LFI
+# *attempt* (a request URI naming a session file or a php:// wrapper). They are
+# the attack in progress, not proof it worked — including them would paint every
+# noisy batch CRITICAL and bury the one batch where a shell really landed.
+
+
+def _split_ids(raw: Any) -> set[str]:
+    """Split a rule_id field into individual ids.
+
+    The monitor de-duplicates events: one raw log line that satisfies several
+    rules carries them merged as "P2S-050,P2S-051". Treating that as a single
+    string silently broke RCE detection (a merged "P2S-050,P2S-051" never
+    matched the RCE set), so always split on the comma.
+    """
+    out: set[str] = set()
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if part:
+            out.add(part)
+    return out
 
 
 def _alert_rule_ids(alert: dict) -> set[str]:
@@ -44,23 +70,19 @@ def _alert_rule_ids(alert: dict) -> set[str]:
     ids: set[str] = set()
     for h in alert.get("evidence") or []:
         if isinstance(h, dict) and h.get("rule_id"):
-            ids.add(str(h["rule_id"]))
+            ids |= _split_ids(h["rule_id"])
     if not ids:  # payload without evidence[]: fall back to the rule counters
         for r in alert.get("rules") or []:
             if isinstance(r, dict) and r.get("rule_id"):
-                ids.add(str(r["rule_id"]))
+                ids |= _split_ids(r["rule_id"])
         if alert.get("rule_id"):
-            ids.add(str(alert["rule_id"]))
+            ids |= _split_ids(alert["rule_id"])
     return ids
 
 
-def _headline(alert: dict) -> str:
-    """One of the two allowed messages for the alert headline."""
-    ids = _alert_rule_ids(alert)
-    if ids & RCE_RULES:
-        return "Server bị chiếm quyền (RCE)"
-    return "Server đang bị khai thác php2shell"
-DEFAULT_WINDOW_MIN = 5   # monitor BATCH_INTERVAL
+def is_rce(alert: dict) -> bool:
+    """True when the evidence proves the box is already compromised."""
+    return bool(_alert_rule_ids(alert) & RCE_RULES)
 
 
 def _sev(a: dict) -> str:
@@ -81,50 +103,52 @@ def _parse_ts(ts_raw: Any) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _window_span(alert: dict) -> str:
-    """Batch window as a short duration: '5 phút' / '<1 phút' (5 min default)."""
-    start = _parse_ts(alert.get("window_start"))
-    end = _parse_ts(alert.get("window_end"))
-    if not (start and end and end > start):
-        return f"{DEFAULT_WINDOW_MIN} phút"
-    secs = int((end - start).total_seconds())
-    if secs < 60:
-        return "<1 phút"
-    return f"{max(1, round(secs / 60))} phút"
-
-
+def _headline(alert: dict) -> str:
+    """What the alert says happened. Driven by the alert's own severity."""
+    sev = _sev(alert)
+    if sev == "CRITICAL" or is_rce(alert):
+        return "Server bị chiếm quyền (RCE)"
+    if sev == "INFO":
+        return "Dấu hiệu dò quét php2shell"
+    return "Server đang bị khai thác php2shell"
 def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
-    """One batch alert -> one 4-line Telegram message.
+    """One batch alert -> one 5-line Telegram message.
 
-    🛡 Central Security Alert - DD/MM/YYYY
-    <emoji> SEVERITY · <what happened> · <hits>/<window>
+    🛡 Central Security Alert - dd/mm/yyyy - hh:mm
+    <emoji> <SEVERITY> · <what happened> · <n> events
     📦 Dự án: <project>
-    🖥 <hostname> / <LAN IP>
+    <emoji> User: <user> - Hostname: <hostname>
+    🖥 IP LAN: <lan ip>
 
     Full evidence (every raw hit with file:line) stays on the server
     (`GET /api/v1/alerts/<id>`) and in the evidence mirror.
     """
     esc = html.escape
     sev = _sev(alert)
+    emoji = _SEV_EMOJI[sev]
 
     when = (_parse_ts(alert.get("ts_utc") or alert.get("ts") or alert.get("window_end"))
             or datetime.now(tz)).astimezone(tz)
 
     hits = alert.get("evidence") or []
     total = int(alert.get("hits") or len(hits))
-    what = f"<b>{esc(_headline(alert))}</b>"
-    # _window_span có thể trả "<1 phút" — escape kẻo Telegram parse <1...> thành HTML tag
-    freq = f"{total} hit / {esc(_window_span(alert))}"
+    what = esc(_headline(alert))
+    freq = f"{total} events"
 
-    host = str(alert.get("host") or alert.get("device") or "?")[:64]
-    lan_ip = str(alert.get("lan_ip") or "").strip()[:64]
-    where = f"🖥 <b>{esc(host)}</b>" + (f" / {esc(lan_ip)}" if lan_ip else "")
+    # "User" is the OS account the monitor runs as — the account that would own
+    # any dropped shell. "Hostname" is what the machine calls itself. Both come
+    # from the device envelope, so a renamed box or a service account is visible
+    # straight from the alert.
+    user = str(alert.get("user") or "").strip()[:64] or "không rõ"
+    hostname = str(alert.get("hostname") or alert.get("host") or alert.get("device") or "?")[:64]
+    lan_ip = str(alert.get("lan_ip") or "").strip()[:64] or "không rõ"
 
     return "\n".join([
-        f"🛡 <b>Central Security Alert</b> - {when:%d/%m/%Y}",
-        f"{_SEV_EMOJI[sev]} <b>{esc(sev)}</b> · {what} · {freq}",
+        f"🛡 <b>Central Security Alert</b> - {when:%d/%m/%Y} - {when:%H:%M}",
+        f"{emoji} <b>{esc(sev)}</b> · {what} · {freq}",
         f"📦 Dự án: <b>{esc(project_name[:64])}</b>",
-        where,
+        f"{emoji} User: <b>{esc(user)}</b> - Hostname: <b>{esc(hostname)}</b>",
+        f"🖥 IP LAN: <b>{esc(lan_ip)}</b>",
     ])
 
 
@@ -179,12 +203,27 @@ class PairingBot:
 
     # Menu lệnh (nút ≡ / gõ "/"). Tên: lowercase a-z0-9_, tối đa 32 ký tự.
     BOT_COMMANDS = [
-        ("start", "Bắt đầu & xem tổng quan"),
+        ("start", "Bắt đầu"),
         ("id", "Lấy Chat ID của chat này"),
-        ("list", "Danh sách server/dự án đã ghép"),
+        ("list", "Dự án & số thiết bị"),
         ("unlink", "Ngắt một dự án khỏi chat này"),
-        ("help", "Trợ giúp đầy đủ"),
+        ("help", "Trợ giúp"),
     ]
+    # /start — đúng một câu, không kèm menu/hướng dẫn.
+    START_TEXT = (
+        "👋 Central Alert Bot — cảnh báo an ninh tấn công khai thác lỗ hổng "
+        "php2Shell từ các server của bạn ngay trên Telegram."
+    )
+    # /help — ngắn gọn: danh sách lệnh + 1 dòng ghép nối.
+    HELP_TEXT = (
+        "🤖 <b>Central Alert Bot — Trợ giúp</b>\n"
+        "• <code>/id</code> — lấy Chat ID của chat này\n"
+        "• <code>/list</code> — dự án &amp; số thiết bị\n"
+        "• <code>/unlink &lt;tên&gt;</code> — ngắt một dự án\n"
+        "• <code>/help</code> — trợ giúp \n\n"
+    )
+    # /list khi chat chưa ghép dự án nào — không kèm hướng dẫn.
+    LIST_EMPTY_TEXT = "📭 Chưa có dự án nào được ghép với chat này."
     BOT_DESCRIPTION = (
         "🛡 Central Alert Bot — nhận cảnh báo an ninh (php2shell-monitor) từ các"
         " server của bạn ngay trên Telegram.\n\n"
@@ -288,10 +327,8 @@ class PairingBot:
         kind = "nhóm" if chat.get("type") in ("group", "supergroup") else "riêng tư"
         await self.tg.send_message(
             chat_id,
-            f"🆔 <b>Chat ID của chat này: <code>{html.escape(chat_id)}</code></b>\n"
+            f"🆔 <b>Chat ID: <code>{html.escape(chat_id)}</code></b>\n"
             f"📎 Loại: {kind}\n"
-            "Copy số này và nhập vào script <code>p2s-agent.sh pair</code> khi được"
-            " hỏi Chat ID.\n"
             + ("⚠️ Trong nhóm, bot cần được thêm làm <b>thành viên</b> để gửi"
                " cảnh báo vào đây." if kind == "nhóm" else ""),
         )
@@ -353,51 +390,33 @@ class PairingBot:
     # ------------------------------------------------------------- lệnh
 
     async def _cmd_help(self, chat_id: str, welcome: bool = False) -> None:
-        n = len(db.projects_by_chat(self.db_path, chat_id))
-        head = ("👋 <b>Chào mừng!</b> Đây là <b>Central Alert Bot</b> — nhận cảnh báo"
-                " an ninh từ các server của bạn ngay trên Telegram."
-                if welcome else "🤖 <b>Central Alert Bot — Trợ giúp</b>")
-        await self.tg.send_message(
-            chat_id,
-            head + "\n"
-            "Cảnh báo từ các server về <b>đúng chat này</b> — chat riêng hoặc"
-            " <b>group</b> (cả team cùng nhận) đều được.\n\n"
-            "📋 <b>Lệnh</b> — nhấn <b>≡</b> cạnh ô nhập hoặc gõ <code>/</code> để mở menu:\n"
-            "• <code>/id</code> — 🆔 lấy Chat ID của chat này (cần cho script pair)\n"
-            "• <code>/list</code> — 🗂 các server/dự án đã ghép với chat này\n"
-            "• <code>/unlink &lt;tên&gt;</code> — 🚫 ngắt một dự án khỏi chat\n"
-            "• <code>/help</code> — 📖 trợ giúp này\n\n"
-            "🔌 <b>Ghép nối server mới (2 bước, TỰ ĐỘNG)</b>\n"
-            f"1️⃣ Ở đây nhấn <code>/id</code> → copy Chat ID (chat này:"
-            f" <code>{html.escape(chat_id)}</code>)\n"
-            "2️⃣ Trên server, chạy <code>sudo p2s-agent.sh pair</code>"
-            " và nhập Chat ID khi được hỏi — ghép xong NGAY, không cần xác nhận"
-            " (máy nào chạy pair sẽ tự nhận API key riêng; thêm bao nhiêu máy"
-            " cũng im lặng, không spam chat)\n\n"
-            + (f"📎 Chat này đang quản lý <b>{n} dự án</b>. Dùng <code>/list</code> để xem chi tiết."
-               if n else "📎 Chưa có server nào được ghép với chat này — làm theo"
-                         " 2 bước trên để bắt đầu."),
-        )
+        # /start: đúng một dòng giới thiệu, không kèm hướng dẫn.
+        if welcome:
+            await self.tg.send_message(chat_id, self.START_TEXT)
+            return
+        await self.tg.send_message(chat_id, self.HELP_TEXT)
 
     async def _cmd_list(self, chat_id: str) -> None:
+        """Dự án đang quản lý + số thiết bị từng dự án. Không kèm hướng dẫn.
+
+        Nghiệp vụ: một dự án khả dụng luôn có >= 1 thiết bị; dự án 0 thiết bị
+        được đánh dấu "chưa khả dụng" thay vì ẩn đi.
+        """
         rows = db.projects_by_chat(self.db_path, chat_id)
         if not rows:
-            await self.tg.send_message(
-                chat_id,
-                "📭 Chưa có server/dự án nào được ghép với chat này.\n"
-                "<code>/id</code> lấy Chat ID → chạy <code>p2s-agent.sh pair</code> trên"
-                " server — ghép tự động ngay.",
-            )
+            await self.tg.send_message(chat_id, self.LIST_EMPTY_TEXT)
             return
-        lines = [f"🗂 <b>Server/dự án của bạn ({len(rows)})</b>"]
-        for i, r in enumerate(rows, 1):
-            when = (r["linked_at"] or "")[:10]
-            n_dev = r["device_count"]
-            last = (r["last_alert_at"] or "")[:16].replace("T", " ")
-            status = "✅" if r["status"] == "linked" else "⏸"
-            lines.append(
-                f"{i}. {status} <b>{html.escape(r['project_name'])}</b>"
-                f" — {n_dev} thiết bị, ghép {when}"
-                + (f", alert gần nhất {last} (UTC)" if last else ", chưa có alert")
-            )
+
+        counts = [int(r["device_count"]) for r in rows]
+        active = sum(1 for c in counts if c)
+        lines = [
+            "🗂 <b>Dự án đang quản lý</b>",
+            f"📦 Dự án: <b>{len(rows)}</b> (khả dụng <b>{active}</b>)"
+            f" · Thiết bị: <b>{sum(counts)}</b>",
+            "",
+        ]
+        for i, (r, n_dev) in enumerate(zip(rows, counts), 1):
+            lines.append(f"{i}. <b>{html.escape(r['project_name'])}</b>")
+            lines.append(f"    🖥 Số thiết bị: <b>{n_dev}</b>"
+                         + ("" if n_dev else " — chưa khả dụng"))
         await self.tg.send_message(chat_id, "\n".join(lines))

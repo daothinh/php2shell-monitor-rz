@@ -2,7 +2,6 @@
 # modsec.sh - ingest lines that ModSecurity / njs / Suricata already logged.
 # The monitor does not run WAF rules; it only reads their output.
 set -u
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=modsec
@@ -16,7 +15,8 @@ emit_waf() { # <line> <file> <line_no>
   local line=$1 file=$2 no=$3 ts ip
   ts=$(t_extract_access_ts "$line" || t_extract_journal_ts "$line" || utc_now)
   P2S_TS=$ts; export P2S_TS
-  ip=$(printf '%s' "$line" | grep -oP '\[client \K[0-9a-f:.]+' | head -1)
+  ip=''
+  if [[ $line =~ \[client\ ([0-9a-f:.]+) ]]; then ip=${BASH_REMATCH[1]}; fi
   emit_record modsec "$file" "$no" "$ip" "" "" "" "" "" "$line" "-"
 }
 

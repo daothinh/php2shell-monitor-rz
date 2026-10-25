@@ -16,11 +16,9 @@
 #  11  msg        the RAW line, verbatim (tabs/newlines replaced by spaces)
 #  12  rule_hint  rule id the parser is certain about, else "-"
 #
-# msg carries the raw line so an alert can quote exactly what matched and the
-# analyst can find it again with `sed -n '<line>p' <file>`.
+# msg carries the raw line so an alert can quote exactly what matched.
 [[ -n ${P2S_STREAM_SH:-} ]] && return 0
 P2S_STREAM_SH=1
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 STREAM_FIELDS=(ts source file line ip method uri status ua pid msg rule)
@@ -40,10 +38,22 @@ stream_field_index() {
 emit_record() {
   local source=$1 file=$2 line=$3 ip=$4 method=$5 uri=$6 status=$7 ua=$8 pid=$9
   local msg=${10} rule=${11}
+  # Sanitize in place. `$(...)` forks a subshell, and 12 of them per record made
+  # a 100k-line log take minutes — long enough to trip the plugin timeout.
+  _s source; _s file; _s line; _s ip; _s method; _s uri
+  _s status; _s ua; _s pid; _s msg; _s rule
+  local ts=${P2S_TS:-}
+  [[ -n $ts ]] || ts=$(utc_now)
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "${P2S_TS:-$(utc_now)}" "$(_s "$source")" "$(_s "$file")" "$(_s "$line")" \
-    "$(_s "$ip")" "$(_s "$method")" "$(_s "$uri")" "$(_s "$status")" \
-    "$(_s "$ua")" "$(_s "$pid")" "$(_s "$msg")" "$(_s "${rule:--}")"
+    "$ts" "$source" "$file" "$line" "$ip" "$method" "$uri" \
+    "$status" "$ua" "$pid" "$msg" "${rule:--}"
 }
 
-_s() { sanitize_field "${1-}"; }
+# _s <varname> — sanitize a variable in place (no subshell, no fork).
+_s() {
+  local __v=${!1-}
+  __v=${__v//$'\t'/ }
+  __v=${__v//$'\n'/ }
+  __v=${__v//$'\r'/ }
+  printf -v "$1" '%s' "$__v"
+}

@@ -1,9 +1,0 @@
-PHP2Shell Monitor — third-party notices
-
-- Lexsah/php2shell-detection (MIT): rule logic for P2S-008/017/021/024/040, fixtures.
-- break-the-build/php-uploadprogress-waf (MIT): ingest strings, correlation design, thresholds.
-- AhmetPayaslioglu/web-log-anomaly-detector (MIT): cmdi regex selections.
-- SigmaHQ: detection selectors rewritten (license: DRL 1.1 — verify before redistribution).
-- jaiswalakshansh/Reversing-Vulnerabilities: thresholds only (no LICENSE; facts rewritten).
-- detqt blog / cybaverse: log strings and thresholds as facts, rewritten.
-- NSA nsacyber/Mitigating-Web-Shells: public domain, rare-URI heuristic.

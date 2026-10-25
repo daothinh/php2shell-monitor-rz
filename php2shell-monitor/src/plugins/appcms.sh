@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # appcms.sh - application logs: WordPress debug, Laravel, mail (web uid only).
 set -u
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=appcms
@@ -24,7 +23,7 @@ appcms_files() {
 parse_appcms_line() { # <line>
   local line=$1 ts
   printf '%s' "$line" | grep -qP "$APP_RE" || return 0
-  ts=$(t_extract_journal_ts "$line" || t_syslog_noyear_to_utc "$(printf '%s' "$line" | cut -c1-15)" || utc_now)
+  ts=$(t_extract_journal_ts "$line" || t_syslog_noyear_to_utc "${line:0:15}" || utc_now)
   P2S_TS=$ts; export P2S_TS
   emit_record appcms "$P2S_FILE" "$P2S_LINE" "" "" "" "" "" "" "$line" "-"
 }

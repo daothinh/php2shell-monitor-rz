@@ -2,7 +2,6 @@
 # proc_tree.sh - /proc scan: web-worker parent spawning shells/interpreters.
 # Root only. Emits one record per suspicious process, raw cmdline preserved.
 set -u
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=proc_tree

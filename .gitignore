@@ -21,9 +21,14 @@ php2shell-monitor/repos/
 # ---- dev artifacts ----
 proxy_requests_anthropic.json
 *.log
+# test fixtures are sample logs by design — they must be committed
+!php2shell-monitor/tests/fixtures/*.log
 php2shell-monitor/dist/payload/
 
 # ---- OS / editor ----
 .DS_Store
 Thumbs.db
 *.swp
+
+data-server/*
+docker-lab/*

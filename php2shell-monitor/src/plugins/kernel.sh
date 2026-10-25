@@ -2,7 +2,6 @@
 # kernel.sh - kernel segfault/OOM via journald or rsyslog files.
 # Prefilter is deliberately broad: the rule pack decides severity and id.
 set -u
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=kernel
@@ -12,10 +11,12 @@ KERNEL_RE='segfault at|Out of memory|Killed process|exited on signal|signal 11'
 parse_kernel_line() { # <line> (P2S_FILE/P2S_LINE set by batch_read)
   local line=$1 ts
   printf '%s' "$line" | grep -qP "$KERNEL_RE" || return 0
-  ts=$(t_extract_journal_ts "$line" || t_syslog_noyear_to_utc "$(printf '%s' "$line" | cut -c1-15)" || utc_now)
+  ts=$(t_extract_journal_ts "$line" || t_syslog_noyear_to_utc "${line:0:15}" || utc_now)
   P2S_TS=$ts; export P2S_TS
+  local kpid=''
+  if [[ $line =~ \[([0-9]+)\] ]]; then kpid=${BASH_REMATCH[1]}; fi
   emit_record kernel "$P2S_FILE" "$P2S_LINE" "" "" "" "" "" \
-    "$(printf '%s' "$line" | grep -oP '\[\K[0-9]+(?=\])' | head -1)" "$line" "-"
+    "$kpid" "$line" "-"
 }
 
 last=$(state_last_batch)

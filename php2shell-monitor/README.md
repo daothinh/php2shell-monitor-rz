@@ -173,19 +173,76 @@ Test: `bash tests/run_tests.sh` (hoặc `bats tests/unit`).
 
 ---
 
-## 7. Gửi về central
+## 7. Triển khai + gửi về central — MỘT lệnh
 
 ```bash
-sudo bash php2shell-monitor.sh ten-du-an --chatid <chat-id>   # hoặc không arg -> wizard
+sudo bash php2shell-monitor.sh \
+  --project khach-hang-A \
+  --chatid  812345678
 ```
 
-Ghép nối theo **Chat ID Telegram** (private hoặc group): nhắn `/id` cho bot
-lấy Chat ID → nhập vào script → ghép nối **TỰ ĐỘNG ngay** (không cần
-/confirm — triển khai nhiều máy không spam chat; mỗi máy chạy pair được một
-API key riêng, key cũ vẫn sống). API key lưu trong `conf/central.conf`
-(0600); từ đó supervisor tự giữ một forwarder (tail `alerts/queue.jsonl`,
-spool khi mất mạng) POST lên server; server đẩy alert vào Telegram chat đã
-ghép. Xem `../central-alert-server/README.md`.
+Một lệnh làm hết, không cần bước nào khác:
+
+1. ghi `conf/device.conf`: `PROJECT` theo `--project`, `DEVICE` = hostname máy;
+2. ghép nối với central server theo **Chat ID Telegram** (private hoặc group)
+   — lấy Chat ID bằng cách nhắn `/id` cho bot; ghép nối **TỰ ĐỘNG ngay**
+   (không /confirm, nhiều máy không spam chat; mỗi máy nhận một API key
+   riêng, key cũ vẫn sống), lưu vào `conf/central.conf` (0600);
+3. bật supervisor rà log mỗi 5 phút + forwarder đẩy alert lên server
+   (tail `alerts/queue.jsonl`, spool khi mất mạng);
+4. in bảng tổng kết dự án / thiết bị.
+
+| Tham số | Bắt buộc | Ý nghĩa |
+|---|---|---|
+| `--project` | ✅ | tên dự án khách hàng, `[A-Za-z0-9._-]{1,64}` |
+| `--chatid` | ✅ | Chat ID Telegram (chat riêng dương, group âm) |
+
+Địa chỉ central server nằm sẵn trong mã nguồn (đã obfuscate), người dùng
+không cần và không nên truyền. `--server` vẫn được nhận nhưng bị bỏ qua để
+không phá các lệnh cũ.
+
+Thiếu tham số nào → script dừng và liệt kê đúng tham số còn thiếu.
+**Hostname là danh tính THIẾT BỊ**, không phải tên dự án: không có tham số
+`--device`, và tên dự án không bao giờ lấy từ hostname.
+
+**Chạy lại khi thiết bị đã thiết lập** → không làm gì cả, chỉ báo và thoát:
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║   ℹ️   THIẾT BỊ ĐÃ ĐƯỢC THIẾT LẬP MONITOR php2Shell          ║
+╚══════════════════════════════════════════════════════════════╝
+ Máy này đã cài đặt và ghép nối xong — không chạy lại lệnh triển khai.
+
+ Dự án      :  khach-hang-A
+ Thiết bị    :  egghead
+```
+
+Điều kiện "đã thiết lập": `conf/device.conf` có `PROJECT` thật (khác
+`default`) **và** `conf/central.conf` có `API_KEY`. Khi đó lệnh triển khai
+**không** ghi đè conf, **không** gọi `register-chatid`, **không** cấp key mới,
+**không** đổi chat nhận alert — kể cả khi bạn truyền `--project`/`--chatid`
+khác. Cấu hình đang chạy là bất biến ngoài ý muốn.
+
+Pair dở dang (có project nhưng mất `API_KEY`, hoặc chưa có `central.conf`)
+thì **không** bị chặn: chạy lại sẽ ghép nối tiếp.
+
+Muốn đổi dự án / chat → thêm `--force`:
+
+```bash
+sudo php2shell-monitor.sh --force \
+  --project khach-hang-B \
+  --chatid  999888777
+```
+
+```bash
+sudo bash php2shell-monitor.sh status   # trạng thái
+sudo bash php2shell-monitor.sh test     # alert thử lên Telegram
+sudo bash php2shell-monitor.sh stop     # dừng
+```
+
+Chạy trần `sudo bash php2shell-monitor.sh` (không tham số) → báo thiếu tham số
+và dừng. Không có wizard, không prompt: không có giá trị mặc định nào để hỏi.
+Xem `../central-alert-server/README.md`.
 
 ---
 

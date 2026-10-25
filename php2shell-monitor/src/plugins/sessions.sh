@@ -2,7 +2,6 @@
 # sessions.sh - session dir anomalies (upload_progress keys, oversized files).
 # Never stores session contents: only key names, sizes and counts.
 set -u
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=sessions

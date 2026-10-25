@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 
-from . import db
+from . import db, migrate
 from .config import Config, load_config
 from .routes import router
 from .telegram import PairingBot, TelegramClient
@@ -67,6 +67,15 @@ async def lifespan(app: FastAPI):
             from datetime import timezone
             app.state.tz = timezone.utc
     db.init_db(cfg.database_path)
+
+    # Fold IP-LAN_<ip>_<host>_<user> folders into IP-LAN_<ip>_<host>. Runs on
+    # every start but is a no-op once the old layout is gone.
+    try:
+        merged = migrate.merge_user_folders(cfg.evidence_root)
+        if merged:
+            log.info("đã gộp %d thư mục evidence kiểu cũ", len(merged))
+    except Exception as exc:  # noqa: BLE001 — never block startup on housekeeping
+        log.warning("gộp thư mục evidence thất bại: %s", exc)
 
     tg = getattr(app.state, "telegram", None) or TelegramClient(cfg.bot_token or "unset")
     app.state.telegram = tg

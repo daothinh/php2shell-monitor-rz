@@ -4,15 +4,10 @@
 # every raw hit line kept in evidence/.
 set -u
 WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/log.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/stream.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/time_utc.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/paths.sh"
 p2s_device_init || exit 1
 [[ -f $WORKDIR/conf/default.conf ]] && source "$WORKDIR/conf/default.conf"

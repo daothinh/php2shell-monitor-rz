@@ -1,31 +1,14 @@
 #!/usr/bin/env bash
-# central.sh - Central Alert Server integration: pair once, forward alerts.
+# central.sh - ghép nối với central server và đẩy alert lên đó.
 #
-#   central.sh pair  [--server <url>] [--chatid <chat-id>] [--detach]
-#     Ghép nối theo CHAT ID Telegram cho PROJECT trong conf/device.conf:
-#     hỏi Chat ID (hoặc nhận --chatid), gọi register-chatid — ghép nối
-#     TỰ ĐỘNG (không /confirm): key được cấp ngay, mỗi lần chạy cấp thêm
-#     một key riêng (key cũ vẫn sống — thêm N máy không spam chat).
-#     API key lưu trong conf/central.conf (0600).
-#
+#   central.sh pair  --chatid <chat-id>
 #   central.sh agent
-#     Long-running forwarder: tails <device>/alerts/queue.jsonl (inode+byte
-#     offset, spool on network loss) and POSTs to /api/v1/ingest-log. Started
-#     automatically by supervisor.sh when conf/central.conf exists; flock keeps
-#     it a singleton.
-#
 #   central.sh test
-#     Sends one INFO test alert; the reply must show delivered >= 1.
-#
-# Everything is stored under WORKDIR (conf/central.conf, <device>/run/agent/):
-# no /etc, no /var, nothing outside the install directory. Credentials are only
-# the API key; the server keeps the Telegram chat_id on its side.
 set -u
 WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/paths.sh"
+source "$WORKDIR/lib/endpoint.sh"
 
 CONF_PATH=$WORKDIR/conf/central.conf
 POLL_INTERVAL=${P2S_AGENT_POLL:-5}
@@ -43,20 +26,6 @@ reinit_device() { # (re)compute device paths — also called after conf changes
   p2s_device_init || die "cannot initialise data dirs under $WORKDIR"
 }
 reinit_device
-
-# LAN IP: source address of the default route, then first global IPv4, then
-# `hostname -I`. Never loopback; never `hostname -i` (reverse DNS can block).
-lan_ip() {
-  local ip
-  if have ip; then
-    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
-    [[ -n $ip ]] || ip=$(ip -4 -o addr show scope global 2>/dev/null |
-      awk '{ sub(/\/.*/, "", $4); if ($4 !~ /^127\./) { print $4; exit } }')
-  fi
-  [[ -n $ip ]] || ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\./ && !/^127\./ { print; exit }')
-  [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ip=""
-  printf '%s' "$ip"
-}
 
 # json_get <json> <key> — jq nếu có, fallback grep (đủ với JSON phẳng của server)
 json_get() {
@@ -76,73 +45,70 @@ json_escape() { # chuỗi -> chuỗi JSON an toàn (không có dấu " \ và con
 }
 
 load_conf() {
-  [[ -r $CONF_PATH ]] || die "chưa ghép nối — chạy: sudo php2shell-monitor.sh --chatid <chat-id> (server trung tâm đã cấu hình sẵn)"
+  [[ -r $CONF_PATH ]] || die "chưa ghép nối — chạy:
+  sudo php2shell-monitor.sh --project <tên-dự-án> --chatid <chat-id>"
   # shellcheck disable=SC1090
   source "$CONF_PATH"
-  [[ ${SERVER_URL:-} =~ ^https?:// ]] || die "SERVER_URL trong conf không hợp lệ"
+  [[ ${SERVER_URL:-} =~ ^https?:// ]] || SERVER_URL=$(p2s_endpoint)
+  [[ ${SERVER_URL:-} =~ ^https?:// ]] || die "không xác định được central server"
   [[ -n ${API_KEY:-} ]] || die "API_KEY trống trong conf — chạy pair lại"
 }
 
-supervisor_pid() { # "0" khi chưa có pidfile — callers phải so khác 0 trước
-  local pid
-  pid=$(cat "$P2S_DEVICE_RUN_DIR/supervisor.pid" 2>/dev/null || echo 0)
-  [[ $pid =~ ^[0-9]+$ ]] || pid=0
-  printf '%s' "$pid"
-}
-
-start_agent() { # spawn the forwarder unless it is already running
-  local pid
-  pid=$(cat "$P2S_DEVICE_RUN_DIR/agent/agent.pid" 2>/dev/null ||
-        cat "$P2S_DEVICE_RUN_DIR/agent.pid" 2>/dev/null || echo 0)
-  if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-    return 0
-  fi
-  (umask 077 && mkdir -p -- "$P2S_DEVICE_RUN_DIR")
-  setsid bash "$WORKDIR/engine/central.sh" agent \
-    >>"$P2S_DEVICE_RUN_DIR/agent.log" 2>&1 &
-}
-
-# ============================================================ pair
 # Bot hệ thống (hiển thị trong hướng dẫn); server có thể trả tên bot thật
 # trong response của register-chatid và sẽ ghi đè giá trị này.
 P2S_BOT=${P2S_BOT:-@p2shell_bot}
 
-# Server trung tâm mặc định — main.sh tự inject; dùng trực tiếp central.sh
-# cũng chạy được luôn (override: --server / P2S_DEFAULT_SERVER).
-P2S_DEFAULT_SERVER=${P2S_DEFAULT_SERVER:-http://45.124.93.136:8000}
+# Đã ghép nối đúng bộ ba server/project/chatid chưa? -> in trạng thái, trả 0.
+already_paired() { # <server> <chatid>
+  local server=$1 chatid=$2
+  [[ -r $CONF_PATH ]] || return 1
+  local c_server c_key c_proj c_chat
+  c_server=$(sed -n 's/^SERVER_URL=//p' "$CONF_PATH" | head -1)
+  c_key=$(sed -n 's/^API_KEY=//p' "$CONF_PATH" | head -1)
+  c_proj=$(sed -n 's/^PROJECT_NAME=//p' "$CONF_PATH" | head -1)
+  c_chat=$(sed -n 's/^CHAT_ID=//p' "$CONF_PATH" | head -1)
+  # conf without CHAT_ID is not a match: pair again once
+  [[ -n $c_key && $c_server == "$server" && $c_proj == "$PROJECT" && $c_chat == "$chatid" ]]
+}
 
 cmd_pair() {
-  local server='' chatid='' detach=0
+  local server='' chatid=''
   while [[ $# -gt 0 ]]; do
     case $1 in
-      --server) server=${2:?}; shift 2 ;;
-      --chatid) chatid=${2:?}; shift 2 ;;
-      --detach) detach=1; shift ;;
-      *) die "tham số không hợp lệ: $1 (pair [--server <url>] [--chatid <id>])" ;;
+      --server) shift 2 ;;   # bỏ: endpoint nằm trong mã nguồn
+      --chatid) [[ -n ${2:-} ]] || die "--chatid cần Chat ID"; chatid=$2; shift 2 ;;
+      *) die "tham số không hợp lệ: $1 (dùng: pair --chatid <id>)" ;;
     esac
   done
-  server=${server:-$P2S_DEFAULT_SERVER}
-  [[ $server =~ ^https?:// ]] || die "--server phải là URL http(s)://..."
-  local proj=$PROJECT
-  local bot=$P2S_BOT botlink="https://t.me/${P2S_BOT#@}"
 
-  # Chat ID: --chatid > P2S_TG_CHATID > prompt tương tác
-  chatid=${chatid:-${P2S_TG_CHATID:-}}
-  if [[ -z $chatid ]]; then
-    printf 'BƯỚC 2️⃣  Nhập Chat ID Telegram của bạn: '
-    IFS= read -r chatid || die "không đọc được input — dùng --chatid <chat_id>"
+  local missing=()
+  [[ -n $chatid  ]] || missing+=(--chatid)
+  if ((${#missing[@]})); then
+    die "thiếu tham số bắt buộc: ${missing[*]}
+  sudo php2shell-monitor.sh --project <tên-dự-án> --chatid <chat-id>"
   fi
-  chatid=$(printf '%s' "$chatid" | tr -d ' ')
-  [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] || {
-    printf '\n❌ Chat ID "%s" không đúng định dạng.\n' "$chatid" >&2
-    printf '   Hãy nhắn /id cho %s và copy NGUYÊN dãy số (chat riêng: dương,\n' "$bot" >&2
-    printf '   group: âm, ví dụ -1001234567890). Nhập lại: ' >&2
-    IFS= read -r chatid || die "không đọc được input — dùng --chatid <chat_id>"
-    chatid=$(printf '%s' "$chatid" | tr -d ' ')
-    [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] || die "Chat ID vẫn không hợp lệ: '$chatid'"
-  }
 
-  printf '\n⏳ Đang đăng ký server "%s" với central server...\n' "$proj"
+  server=$(p2s_endpoint) || die "không đọc được endpoint trong mã nguồn"
+  [[ $server =~ ^https?:// ]] || die "endpoint trong mã nguồn không hợp lệ"
+  chatid=$(printf '%s' "$chatid" | tr -d ' ')
+  [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] \
+    || die "--chatid không hợp lệ: phải là số Telegram (chat riêng dương, group âm)"
+
+  local proj=$PROJECT
+  [[ -n ${proj:-} && ${proj:-} != default ]] \
+    || die "thiếu tên dự án — chạy: sudo php2shell-monitor.sh --project <tên> --chatid <id>"
+
+  # ---- idempotent: chạy lại cùng tham số không ghép nối lại, không spam chat ----
+  if already_paired "$server" "$chatid"; then
+    printf 'Đã ghép nối trước đó — giữ nguyên API key trong %s\n' "$CONF_PATH"
+    printf ' Dự án: %s · Thiết bị: %s\n' "$proj" "$DEVICE"
+    return 0
+  fi
+
+  local ip
+  ip=$(lan_ip)
+  printf '\n⏳ Đang đăng ký thiết bị %s | %s cho dự án "%s" (thiết bị %s)\n' \
+    "$DEVICE" "${ip:-không rõ IP}" "$proj" "$DEVICE"
   local resp pair_ref warn rbot
   resp=$("${CURL[@]}" -X POST "$server/api/v1/register-chatid" \
     -H 'Content-Type: application/json' \
@@ -150,22 +116,21 @@ cmd_pair() {
     || die "không gọi được $server — kiểm tra đường mạng/URL: $server"
   pair_ref=$(json_get "$resp" pair_ref)
   [[ -n $pair_ref ]] || die "server trả về không có pair_ref: $resp"
+  local bot=$P2S_BOT
   rbot=$(json_get "$resp" bot)
-  [[ -n $rbot && $rbot != null ]] && bot=$rbot && botlink="https://t.me/${rbot#@}"
+  [[ -n $rbot && $rbot != null ]] && bot=$rbot
   warn=$(json_get "$resp" warning)
   if [[ -n $warn && $warn != null ]]; then
     cat >&2 <<EOF
 
 ⚠️  Bot chưa nhắn được vào chat $chatid (chưa được START).
-   Cách xử lý: mở $botlink → nhấn START (thêm bot vào group nếu là group).
+   Cách xử lý: mở https://t.me/${bot#@} → nhấn START (thêm bot vào group nếu là group).
    Dự án VẪN đã ghép nối và API key vẫn được cấp — nhưng alert chỉ tới
    sau khi bot nhắn được vào chat, nên hãy START trước.
 EOF
   fi
 
-  printf '\n⏳ Đang nhận API key (ghép nối TỰ ĐỘNG — không cần /confirm)...\n'
-
-  local i st status api_key elapsed
+  local i st status api_key
   for ((i = 0; i < PAIR_TIMEOUT; i += PAIR_POLL)); do
     sleep "$PAIR_POLL"
     if ! st=$("${CURL[@]}" "$server/api/v1/pairing-status?code=$pair_ref"); then
@@ -176,46 +141,38 @@ EOF
     if [[ $status == linked ]]; then
       api_key=$(json_get "$st" api_key)
       [[ -n $api_key ]] || continue   # đã linked nhưng hết cửa sổ reveal
-      (umask 077 && printf 'SERVER_URL=%q\nAPI_KEY=%q\nPROJECT_NAME=%q\n' \
-        "$server" "$api_key" "$proj" >"$CONF_PATH")
-      cat <<EOF
-
-╔══════════════════════════════════════════════════════════════╗
-║   ✅  GHÉP NỐI THÀNH CÔNG!                                  ║
-╚══════════════════════════════════════════════════════════════╝
- Alert bảo mật của server này sẽ về Telegram chat $chatid.
-EOF
-      local spid
-      spid=$(supervisor_pid)
-      if ((detach)) || { [[ $spid =~ ^[0-9]+$ ]] && ((spid > 0)) && \
-                         kill -0 "$spid" 2>/dev/null; }; then
-        start_agent
-      else
-        cat <<EOF
- Chạy thường trực:  sudo bash php2shell-monitor.sh -- run
-EOF
-      fi
+      (umask 077 && printf 'SERVER_URL=%q\nAPI_KEY=%q\nPROJECT_NAME=%q\nCHAT_ID=%q\n' \
+        "$server" "$api_key" "$proj" "$chatid" >"$CONF_PATH")
       return 0
     fi
     if (( (i + PAIR_POLL) % 30 == 0 )); then
       printf '  ... vẫn đang chờ server phản hồi (đã %d giây)\n' "$((i + PAIR_POLL))"
     fi
   done
-  die "hết thời gian chờ server cấp key — chạy lại lệnh pair"
+  die "hết thời gian chờ server cấp key — chạy lại lệnh triển khai"
 }
 
-# ============================================================ forwarder
+# Ghi payload ra file rồi dùng --data-binary @file: argv có giới hạn
+# (MAX_ARG_STRLEN ~128 KiB) nên một batch nhiều hit sẽ chết với
+# "curl: Argument list too long" và alert kẹt lại trong spool.
 post_alerts() { # các dòng JSON làm tham số -> 0 nếu server nhận
-  local payload
-  payload=$(printf '{"host":"%s","device":"%s","lan_ip":"%s","user":"%s","alerts":[%s]}' \
-    "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" \
-    "$(json_escape "$DEVICE")" \
-    "$(json_escape "$(lan_ip)")" \
-    "$(json_escape "$(id -un 2>/dev/null || echo unknown)")" \
-    "$(printf '%s\n' "$@" | paste -sd, -)")
+  local payload_file
+  payload_file=$P2S_TMP_DIR/payload.$$.json
+  {
+    printf '{"host":"%s","device":"%s","lan_ip":"%s","user":"%s","alerts":[' \
+      "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" \
+      "$(json_escape "$DEVICE")" \
+      "$(json_escape "$(lan_ip)")" \
+      "$(json_escape "$(id -un 2>/dev/null || echo unknown)")"
+    printf '%s\n' "$@" | paste -sd, -
+    printf ']}'
+  } >"$payload_file" || { rm -f -- "$payload_file"; return 1; }
+  local rc=0
   "${CURL[@]}" -X POST "$SERVER_URL/api/v1/ingest-log" \
     -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
-    --data "$payload" >/dev/null
+    --data-binary "@$payload_file" >/dev/null || rc=$?
+  rm -f -- "$payload_file"
+  return $rc
 }
 
 # Đọc dòng mới hoàn chỉnh từ $ALERT_FILE; rotation-aware theo inode.
@@ -289,7 +246,7 @@ cmd_agent() {
   load_conf
   STATE_DIR=$P2S_DEVICE_RUN_DIR/agent
   mkdir -p -- "$STATE_DIR"
-  # singleton: supervisor cũng tự bật agent khi có conf; lần sau thoát im lặng
+  # singleton: the supervisor also starts an agent; later runs exit silently
   exec 9>"$STATE_DIR/agent.lock"
   flock -n 9 || exit 0
   echo $$ >"$STATE_DIR/agent.pid"
@@ -318,7 +275,6 @@ cmd_agent() {
   done
 }
 
-# ============================================================ test
 cmd_test() {
   load_conf
   local ts payload resp
@@ -339,5 +295,5 @@ case ${1:-help} in
   pair)  shift; cmd_pair "$@" ;;
   agent) cmd_agent ;;
   test)  cmd_test ;;
-  *) die "central.sh {pair [--server <url>]} | agent | test" ;;
+  *) die "central.sh {pair --chatid <id>} | agent | test" ;;
 esac

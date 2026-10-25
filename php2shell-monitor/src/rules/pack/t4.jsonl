@@ -1,0 +1,8 @@
+{"id":"P2S-050","severity":"CRITICAL","source":["access_log"],"match":{"type":"regex","field":"uri","pcre":"(?i)(page|file|path|include|inc|doc|document|template|tpl|view|load|read|src|url|target|pg|p)=(/var/lib/php/sessions/|/tmp/|/var/tmp/|/dev/shm/|/var/lib/php5/|/var/customers/)[^\\s]*"}}
+{"id":"P2S-051","severity":"CRITICAL","source":["access_log"],"match":{"type":"regex","field":"uri","pcre":"(?i)/var/lib/php/sessions/sess_|/var/lib/php5/sess_|/tmp/sess_[a-z0-9]{10,}"}}
+{"id":"P2S-052","severity":"HIGH","source":["access_log"],"match":{"type":"regex","field":"uri","pcre":"(?i)(\\.\\./|\\.\\.\\\\|%2e%2e%2f|%2e%2e/|\\.\\.%2f|\\.\\.%5c)"},"min":3}
+{"id":"P2S-053","severity":"HIGH","source":["access_log"],"match":{"type":"regex","field":"uri","pcre":"(?i)(/etc/(passwd|shadow|hosts|group|issue)|/proc/self/(environ|cmdline)|/root/\\.(bash|ssh))"}}
+{"id":"P2S-054","severity":"CRITICAL","source":["access_log"],"match":{"type":"regex","field":"uri","pcre":"(?i)(php|data|expect|phar|zip|glob|compress\\.zlib)://"}}
+{"id":"P2S-055","severity":"HIGH","source":["access_log"],"match":{"type":"regex","field":"raw","pcre":"request_length=1[0-9]{7,}"},"min":3}
+{"id":"P2S-056","severity":"CRITICAL","source":["webroot"],"match":{"type":"regex","field":"msg","pcre":"(?i)(system|exec|passthru|shell_exec|popen|proc_open|assert|eval|create_function|call_user_func)\\s*\\(\\s*\\$_(REQUEST|GET|POST|COOKIE|SERVER)"},"impact":"rce"}
+{"id":"P2S-058","severity":"HIGH","source":["sessions"],"match":{"type":"regex","field":"msg","pcre":"(?i)upload_progress"}}

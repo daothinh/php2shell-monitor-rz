@@ -2,8 +2,8 @@
 # p2s-agent.sh — agent đẩy alert php2shell-monitor về Central Alert Server.
 #
 # Luồng:
-#   1. pair : xin mã ghép nối -> in ra terminal -> user gửi mã cho bot Telegram
-#             -> agent poll tới khi linked -> lưu api_key vào file conf (0600)
+#   1. ghép nối (mặc định) : đăng ký theo Chat ID Telegram (tự động, không /confirm)
+#             -> nhận api_key ngay -> lưu file conf (0600)
 #   2. run  : tail file alert JSONL của monitor (mặc định
 #             /var/lib/php2shell/projects/<project>/devices/<device>/alerts/queue.jsonl),
 #             batch và POST về server; lỗi mạng -> spool đĩa, thử lại ở chu kỳ sau
@@ -14,12 +14,13 @@ set -u
 
 CONF_PATH=${P2S_AGENT_CONF:-/etc/php2shell/agent.conf}
 STATE_DIR=${P2S_AGENT_STATE:-/var/lib/php2shell-agent}
-# Central server mặc định — chạy "pair" là ăn ngay, khỏi gõ --server.
-# Muốn trỏ server khác: --server <url> hoặc P2S_SERVER_URL.
-DEFAULT_SERVER="http://45.124.93.136:8000"
+# KHÔNG có central server mặc định: ghép nối bắt buộc --server (hoặc P2S_SERVER_URL).
+# Không hardcode IP nào trong script — mỗi môi trường tự chỉ định server.
 # Default queue of the monitor on this host. The monitor stores per
 # project/device; set P2S_ALERT_FILE when the project/device name differs.
-ALERT_FILE=${P2S_ALERT_FILE:-/var/lib/php2shell/projects/default/devices/$(hostname 2>/dev/null || echo unknown)/alerts/queue.jsonl}
+# Queue của monitor: suy ra từ PROJECT_NAME (conf) + hostname (thiết bị).
+# P2S_ALERT_FILE ghi đè hoàn toàn khi cần trỏ file khác.
+ALERT_FILE=${P2S_ALERT_FILE:-}
 POLL_INTERVAL=${P2S_AGENT_POLL:-5}
 BATCH_MAX=20
 PAIR_TIMEOUT=900          # 15 phút
@@ -66,26 +67,32 @@ usage() {
   cat <<EOF
 $PROG — agent Central Alert Server cho php2shell-monitor
 
-Usage:
-  $PROG pair   [--server <url-central-server>] [--chatid <chat-id-telegram>]
-  $PROG run    [--file <alerts.jsonl>]
+GHÉP NỐI (mặc định — không cần chữ "pair"):
+  $PROG --server <url> --project <tên-dự-án> --chatid <chat-id>
+
+  Cả 3 tham số BẮT BUỘC, không có giá trị mặc định:
+    --server   URL central server, ví dụ http://192.168.22.191:8000
+    --project  tên dự án khách hàng, ví dụ khach-hang-A
+               (hostname là thông tin THIẾT BỊ, không phải tên dự án)
+    --chatid   Chat ID Telegram: nhắn /id cho bot để lấy
+               (chat riêng: số dương; group: số âm)
+
+  Ghép nối TỰ ĐỘNG ngay khi chạy — không cần /confirm. Mỗi lần chạy cấp
+  một API key riêng cho thiết bị này (key cũ vẫn sống).
+
+LỆNH KHÁC:
   $PROG test
+  $PROG run  [--file <alerts.jsonl>]
+  $PROG help
 
-pair KHÔNG cần --server: mặc định trỏ sẵn $DEFAULT_SERVER
-(chỉ dùng --server / P2S_SERVER_URL khi muốn trỏ server khác).
-
-pair sẽ HỎI Chat ID Telegram (hoặc nhận qua --chatid / P2S_TG_CHATID).
-Lấy Chat ID: nhắn /id cho bot (trong chat riêng HOẶC group — group để cả
-team cùng nhận alert). Ghép nối TỰ ĐỘNG ngay sau khi nhập — không cần
-/confirm; mỗi lần chạy cấp một API key riêng (key cũ vẫn sống).
-
-Tên dự án gửi lên server lấy từ P2S_PROJECT_NAME (mặc định: hostname).
-
-Biến môi trường (ghi đè mặc định):
+Biến môi trường (dùng thay tham số khi chạy automation):
+  P2S_SERVER_URL=<url central server>
+  P2S_PROJECT_NAME=<tên dự án>
+  P2S_TG_CHATID=<chat id Telegram>
   P2S_AGENT_CONF=$CONF_PATH
   P2S_AGENT_STATE=$STATE_DIR
-  P2S_TG_CHATID=<chat id Telegram>
-  P2S_ALERT_FILE=<queue.jsonl> (mặc định: /var/lib/php2shell/projects/default/devices/<host>/alerts/queue.jsonl)
+  P2S_ALERT_FILE=<queue.jsonl>
+      (mặc định: /var/lib/php2shell/projects/<PROJECT_NAME>/devices/<hostname>/alerts/queue.jsonl)
   P2S_AGENT_POLL=$POLL_INTERVAL (giây)
 EOF
 }
@@ -96,72 +103,43 @@ EOF
 P2S_BOT=${P2S_BOT:-@p2shell_bot}
 
 cmd_pair() {
-  # --server / P2S_SERVER_URL là tuỳ chọn: mặc định đã hardcode sẵn
-  local server=${P2S_SERVER_URL:-} chatid=
+  local server=${P2S_SERVER_URL:-} project=${P2S_PROJECT_NAME:-} chatid=${P2S_TG_CHATID:-}
   while [[ $# -gt 0 ]]; do
     case $1 in
-      --server) server=${2:?}; shift 2 ;;
-      --chatid) chatid=${2:?}; shift 2 ;;
-      *) die "tham số không hợp lệ: $1 (xem $PROG help)" ;;
+      --server)  [[ $# -ge 2 && -n $2 ]] || die "--server cần giá trị URL"; server=$2; shift 2 ;;
+      --project) [[ $# -ge 2 && -n $2 ]] || die "--project cần tên dự án"; project=$2; shift 2 ;;
+      --chatid)  [[ $# -ge 2 && -n $2 ]] || die "--chatid cần Chat ID Telegram"; chatid=$2; shift 2 ;;
+      *) die "tham số không hợp lệ: $1 (dùng: $PROG --server <url> --project <tên> --chatid <id>)" ;;
     esac
   done
-  server=${server:-$DEFAULT_SERVER}
-  [[ $server =~ ^https?:// ]] || die "--server phải là URL http(s)://..."
 
-  local bot=$P2S_BOT botlink="https://t.me/${P2S_BOT#@}"
-
-  # ---------- màn hình hướng dẫn (in TRƯỚC khi hỏi input) ----------
-  cat <<EOF
-
-╔══════════════════════════════════════════════════════════════╗
-║   🛡  GHÉP NỐI SERVER VỚI TELEGRAM ALERT — HƯỚNG DẪN        ║
-╚══════════════════════════════════════════════════════════════╝
- Bot hệ thống :  $bot
- Mở nhanh     :  $botlink
- Central server :  $server
-
- Bạn sẽ làm 2 bước (khoảng 1 phút) — ghép nối TỰ ĐỘNG, không cần /confirm:
-
- BƯỚC 1️⃣ — Lấy Chat ID trên Telegram
-   • Mở $botlink  → nhấn  START  (bắt buộc nếu chưa từng nhấn)
-   • Nhắn cho bot:   /id
-   • Bot trả lời kèm  🆔 Chat ID  → nhớ/số copy dãy số đó
-   💡 Chat riêng của bạn: số DƯƠNG  (ví dụ  812345678)
-   💡 Muốn CẢ TEAM cùng nhận alert: thêm bot vào group Telegram,
-      rồi nhắn /id ngay trong group — Chat ID group là số ÂM
-      (ví dụ  -1001234567890)
-
- BƯỚC 2️⃣ — Nhập Chat ID vào dòng script sẽ hỏi ngay bên dưới
-   → xong: server ghép nối NGAY, bot nhắn 1 tin xác nhận vào chat,
-     script tự nhận API key và lưu cấu hình — bạn không phải gõ gì thêm.
-   💡 Thêm máy khác vào cùng dự án sau này: chạy lại lệnh này trên máy đó
-     (tên dự án + Chat ID giữ nguyên) — tự động, không spam chat.
-
-────────────────────────────────────────────────────────────────
-EOF
-
-  # Chat ID: --chatid > P2S_TG_CHATID > prompt tương tác
-  chatid=${chatid:-${P2S_TG_CHATID:-}}
-  if [[ -z $chatid ]]; then
-    printf 'BƯỚC 2️⃣  Nhập Chat ID Telegram của bạn: '
-    IFS= read -r chatid || die "không đọc được input — dùng --chatid <chat_id>"
+  # ---------- bắt buộc đủ 3 tham số, không có mặc định ----------
+  local missing=()
+  [[ -n $server  ]] || missing+=(--server)
+  [[ -n $project ]] || missing+=(--project)
+  [[ -n $chatid  ]] || missing+=(--chatid)
+  if (( ${#missing[@]} )); then
+    die "thiếu tham số bắt buộc: ${missing[*]}
+  $PROG --server <url> --project <tên-dự-án> --chatid <chat-id>
+  Lấy Chat ID: nhắn /id cho bot Telegram (chat riêng: dương, group: âm)."
   fi
-  chatid=$(printf '%s' "$chatid" | tr -d ' ')
-  [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] || {
-    printf '\n❌ Chat ID "%s" không đúng định dạng.\n' "$chatid" >&2
-    printf '   Hãy nhắn /id cho %s và copy NGUYÊN dãy số (chat riêng: dương,\n' "$bot" >&2
-    printf '   group: âm, ví dụ -1001234567890). Nhập lại: ' >&2
-    IFS= read -r chatid || die "không đọc được input — dùng --chatid <chat_id>"
-    chatid=$(printf '%s' "$chatid" | tr -d ' ')
-    [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] || die "Chat ID vẫn không hợp lệ: '$chatid'"
-  }
 
-  printf '\n⏳ Đang đăng ký server "%s" với central server...\n' "${P2S_PROJECT_NAME:-$(hostname 2>/dev/null || echo unknown)}"
-  local resp pair_ref name warn rbot
-  name=${P2S_PROJECT_NAME:-$(hostname 2>/dev/null || echo unknown)}
+  [[ $server =~ ^https?:// ]] || die "--server phải là URL http(s)://..."
+  project=$(printf '%s' "$project" | tr -d ' ')
+  [[ $project =~ ^[A-Za-z0-9._-]{1,64}$ ]] \
+    || die "--project không hợp lệ: chỉ A-Z a-z 0-9 . _ - (1-64 ký tự)"
+  chatid=$(printf '%s' "$chatid" | tr -d ' ')
+  [[ $chatid =~ ^-?[1-9][0-9]{2,14}$ ]] \
+    || die "--chatid không hợp lệ: phải là số Telegram (chat riêng dương, group âm, ví dụ -1001234567890)"
+
+  local bot=$P2S_BOT botlink="https://t.me/${P2S_BOT#@}" device
+  device=$(hostname 2>/dev/null || echo unknown)   # hostname = THIẾT BỊ, không phải dự án
+
+  printf '\n⏳ Đăng ký dự án "%s" (thiết bị %s) với %s ...\n' "$project" "$device" "$server"
+  local resp pair_ref warn rbot
   resp=$("${CURL[@]}" -X POST "$server/api/v1/register-chatid" \
     -H 'Content-Type: application/json' \
-    -d "{\"project_name\":\"$(json_escape "$name")\",\"chat_id\":\"$(json_escape "$chatid")\",\"device\":\"$(json_escape "$(hostname 2>/dev/null || echo unknown)")\"}") \
+    -d "{\"project_name\":\"$(json_escape "$project")\",\"chat_id\":\"$(json_escape "$chatid")\",\"device\":\"$(json_escape "$device")\"}") \
     || die "không gọi được $server — kiểm tra đường mạng/URL: $server"
   pair_ref=$(json_get "$resp" pair_ref)
   [[ -n $pair_ref ]] || die "server trả về không có pair_ref: $resp"
@@ -172,7 +150,7 @@ EOF
     cat >&2 <<EOF
 
 ⚠️  Bot chưa nhắn được vào chat $chatid (chưa được START).
-   Cách xử lý: mở $botlink → nhấn START (bot vào group nếu là group chat).
+   Cách xử lý: mở $botlink → nhấn START (thêm bot vào group nếu là group).
    Dự án VẪN đã ghép nối và API key vẫn được cấp — nhưng alert chỉ tới
    sau khi bot nhắn được vào chat, nên hãy START trước.
 EOF
@@ -192,15 +170,17 @@ EOF
       api_key=$(json_get "$st" api_key)
       [[ -n $api_key ]] || continue   # hết cửa sổ reveal -> poll tiếp vô ích
       mkdir -p -- "$(dirname -- "$CONF_PATH")"
-      (umask 077 && printf 'SERVER_URL=%q\nAPI_KEY=%q\nPROJECT_NAME=%q\n' \
-        "$server" "$api_key" "$name" >"$CONF_PATH")
+      (umask 077 && printf 'SERVER_URL=%q\nAPI_KEY=%q\nPROJECT_NAME=%q\nDEVICE=%q\n' \
+        "$server" "$api_key" "$project" "$device" >"$CONF_PATH")
       cat <<EOF
 
 ╔══════════════════════════════════════════════════════════════╗
 ║   ✅  GHÉP NỐI THÀNH CÔNG!                                  ║
 ╚══════════════════════════════════════════════════════════════╝
- Cấu hình đã lưu:  $CONF_PATH   (chỉ root đọc được)
- Từ giờ mọi alert bảo mật của server này sẽ về Telegram chat $chatid.
+ Dự án      :  $project
+ Thiết bị    :  $device
+ Chat nhận   :  $chatid
+ Cấu hình    :  $CONF_PATH   (chỉ root đọc được)
 
  BƯỚC TIẾP THEO — kiểm tra & chạy thật:
    1) Gửi alert thử (xem Telegram có nhận không):
@@ -210,9 +190,9 @@ EOF
       hoặc cài service (khởi động cùng máy chủ):
         sudo cp p2s-agent.service /etc/systemd/system/
         sudo systemctl enable --now p2s-agent
-   3) Trên Telegram, nhắn  /list  cho $bot để xem các server đang quản lý.
-   4) Thêm máy khác vào CÙNG dự án: chạy lại lệnh pair này trên máy đó
-      (tên dự án + Chat ID giữ nguyên) — tự động, không spam chat.
+   3) Trên Telegram, nhắn  /list  cho $bot để xem các dự án đang quản lý.
+   4) Thêm THIẾT BỊ khác vào CÙNG dự án: chạy lại lệnh này trên máy đó
+      với --project và --chatid giữ nguyên — tự động, không spam chat.
 EOF
       return 0
     fi
@@ -225,11 +205,17 @@ EOF
 
 # ============================================================ helpers run
 load_conf() {
-  [[ -r $CONF_PATH ]] || die "chưa có cấu hình $CONF_PATH — chạy '$PROG pair' trước"
+  [[ -r $CONF_PATH ]] || die "chưa có cấu hình $CONF_PATH — ghép nối trước:
+  $PROG --server <url> --project <tên-dự-án> --chatid <chat-id>"
   # shellcheck disable=SC1090
   source "$CONF_PATH"
   [[ ${SERVER_URL:-} =~ ^https?:// ]] || die "SERVER_URL trong conf không hợp lệ"
   [[ -n ${API_KEY:-} ]] || die "API_KEY trống trong conf — ghép nối lại"
+  [[ -n ${PROJECT_NAME:-} ]] || die "PROJECT_NAME trống trong conf — ghép nối lại"
+  # queue mặc định: <root>/projects/<PROJECT_NAME>/devices/<hostname>/alerts/queue.jsonl
+  if [[ -z ${ALERT_FILE:-} ]]; then
+    ALERT_FILE=/var/lib/php2shell/projects/$PROJECT_NAME/devices/$(hostname 2>/dev/null || echo unknown)/alerts/queue.jsonl
+  fi
 }
 
 # Device name: derived from the monitor's data layout
@@ -378,10 +364,13 @@ cmd_test() {
 }
 
 # ============================================================ main
+# Không có chữ "pair": truyền thẳng --server/--project/--chatid là ghép nối.
 case ${1:-help} in
-  pair) shift; cmd_pair "$@" ;;
   run)  shift; cmd_run "$@" ;;
   test) shift; cmd_test "$@" ;;
   help|-h|--help) usage ;;
-  *) die "mode không hợp lệ: $1 (pair | run | test)" ;;
+  --*)  cmd_pair "$@" ;;          # mặc định = ghép nối
+  pair) die "bỏ chữ \"pair\" — truyền thẳng tham số:
+  $PROG --server <url> --project <tên-dự-án> --chatid <chat-id>" ;;
+  *) die "tham số không hợp lệ: $1 (xem: $PROG help)" ;;
 esac

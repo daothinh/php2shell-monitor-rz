@@ -9,7 +9,8 @@ một alert**, severity = cao nhất trong batch, kèm toàn bộ dòng log gố
 
 ```
 src/
-├── main.sh                 CLI: once | run | status | stop | discover | retro | export | clean
+├── main.sh                 CLI: (mặc định) triển khai+pair một lệnh | once | run
+│                           | test | status | stop | discover | retro | export | clean
 ├── bootstrap.sh            makeself entry: root check, seed conf/, prune cũ, exec main.sh
 │                           (archive giải nén thẳng vào /opt/php2shell-monitor)
 ├── conf/
@@ -53,7 +54,7 @@ src/
 ## Kiểm thử
 
 ```bash
-SRC=$PWD/src bash tests/run_tests.sh   # 33 assertion, không cần bats
+SRC=$PWD/src bash tests/run_tests.sh   # 50 assertion, không cần bats
 bats tests/unit                        # parser tests
 shellcheck -x src/lib/*.sh src/engine/*.sh src/plugins/*.sh
 ./build.sh                             # shellcheck + tests + makeself

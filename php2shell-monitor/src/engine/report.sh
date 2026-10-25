@@ -17,11 +17,8 @@ BATCH=${2:-$(date -u +%Y%m%dT%H%M%SZ)}
 WINDOW_START=${3:-0}
 WINDOW_END=${4:-$(utc_epoch)}
 
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/json.sh"
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/paths.sh"
 p2s_device_init || exit 0
 [[ -f $WORKDIR/conf/default.conf ]] && source "$WORKDIR/conf/default.conf"
@@ -48,46 +45,28 @@ EVIDENCE=$P2S_EVIDENCE_DIR/$BATCH.jsonl
 ALERT=$P2S_ALERT_DIR/queue.jsonl
 
 # ------------------------------------------------- 1. evidence (full, raw)
-# Field layout: ts source file line ip method uri status ua pid msg rule severity
-# Bash `read` collapses runs of IFS whitespace (tab included), which would shift
-# every empty field. Normalize to the unit separator first.
-NORM=$P2S_TMP_DIR/report.$BATCH.norm.tsv
-awk -F'\t' -v OFS='\037' '{ print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13 }' "$HITS" >"$NORM"
-top_rank=0
-top_sev=INFO
+# One JSON object per event, written by a single awk process. The bash loop
+# called json_obj (a subshell + fork) per hit: an 80k-hit batch took minutes
+# and never finished inside the batch window.
+COUNTS=$P2S_TMP_DIR/report.$BATCH.counts.tsv
+: >"$COUNTS"
+awk -f "$WORKDIR/lib/evidence.awk" -v outcounts="$COUNTS" "$HITS" >"$EVIDENCE"
+
 total=0
+top_sev=INFO
+rce_hits=0
 declare -A per_rule=()
 declare -A per_sev=()
-
-: >"$EVIDENCE"
-while IFS=$'\037' read -r ts source file line ip method uri status ua pid msg rule sev; do
-  [[ -z $rule ]] && continue
-  [[ -z $sev ]] && sev=INFO
-  total=$((total + 1))
-  per_rule[$rule]=$(( ${per_rule[$rule]:-0} + 1 ))
-  per_sev[$sev]=$(( ${per_sev[$sev]:-0} + 1 ))
-  r=$(_rank "$sev")
-  if (( r > top_rank )); then
-    top_rank=$r
-    top_sev=${sev^^}
-  fi
-  rec=$(json_obj \
-    "ts_utc" "$(json_str "$ts")" \
-    "rule_id" "$(json_str "$rule")" \
-    "severity" "$(json_str "${sev^^}")" \
-    "source" "$(json_str "$source")" \
-    "file" "$(json_str "$file")" \
-    "line" "$(json_num "$line")" \
-    "ip" "$(json_str "$ip")" \
-    "method" "$(json_str "$method")" \
-    "uri" "$(json_str "$uri")" \
-    "status" "$(json_str "$status")" \
-    "ua" "$(json_str "$ua")" \
-    "pid" "$(json_str "$pid")" \
-    "raw" "$(json_str "$msg")")
-  printf '%s\n' "$rec" >>"$EVIDENCE"
-done <"$NORM"
-rm -f -- "$NORM"
+if [[ -s $COUNTS ]]; then
+  while IFS=$'\t' read -r kind a b; do
+    case $kind in
+      R) per_rule[$a]=${b:-0} ;;
+      S) per_sev[$a]=${b:-0} ;;
+      *) total=${kind:-0}; top_sev=${a:-INFO}; rce_hits=${b:-0} ;;
+    esac
+  done <"$COUNTS"
+fi
+rm -f -- "$COUNTS"
 
 # ------------------------------------------------- 2. counts (stable order)
 _rule_counts_json() {
@@ -124,10 +103,12 @@ alert=$(json_obj \
   "batch_id" "$(json_str "$BATCH")" \
   "project" "$(json_str "$PROJECT")" \
   "device" "$(json_str "$DEVICE")" \
-  "host" "$(json_str "$_host")" \
+  "host" "$(json_str "$DEVICE")" \
+  "hostname" "$(json_str "$_host")" \
   "window_start" "$(json_str "$(epoch_to_utc "${WINDOW_START:-0}" 2>/dev/null || utc_now)")" \
   "window_end" "$(json_str "$(epoch_to_utc "$WINDOW_END")")" \
   "severity" "$(json_str "$top_sev")" \
+  "rce" "$(json_num "$rce_hits")" \
   "hits" "$(json_num "$total")" \
   "rules" "$(_rule_counts_json)" \
   "severities" "$(_sev_counts_json)" \

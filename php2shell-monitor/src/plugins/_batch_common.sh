@@ -2,14 +2,10 @@
 # _batch_common.sh - shared helpers for batch plugins: offset/inode-safe tail
 # with line tracking, plus the fast access-log parser.
 set -u
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/stream.sh"
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/paths.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/state.sh"
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/time_utc.sh"
 
 p2s_device_init || exit 1
@@ -102,6 +98,52 @@ parse_access_file() {
     # accesslog.awk prints FILENAME/FNR; override both with the real path and
     # an absolute line number derived from the stored counter.
     awk -f "$P2S_SRC_DIR/lib/accesslog.awk" -v src="$src" \
+        -v realfile="$file" -v startline="$line_no" "$chunk" | tee "$chunk.out"
+    emitted=$(wc -l <"$chunk.out")
+  fi
+  rm -f -- "$chunk" "$chunk.out"
+
+  state_offset_set "$file" "$ino" "$newpos" "$((line_no + emitted))"
+  return 0
+}
+
+# batch_parse_awk <file> <source> <awkfile>
+# Bulk-parses new bytes of an error-style log through a pure-awk parser.
+# The per-line bash path (batch_read + parse_fn) forks ~2.5ms per line, so a
+# 100k-line FPM log after an attack burst ran past the plugin timeout and the
+# batch never finished. awk does the same work in one process.
+batch_parse_awk() {
+  local file=$1 src=$2 awkf=$3
+  [[ -f $file && -r $file ]] || return 0
+  local ino size pos line_no
+  ino=$(stat -c '%i' -- "$file") || return 0
+  size=$(stat -c '%s' -- "$file") || return 0
+  IFS=$'\t' read -r pos line_no <<<"$(state_offset_get "$file" "$ino")"
+  (( pos <= size )) || { pos=0; line_no=0; }
+  (( size > pos )) || return 0
+
+  local chunk="$P2S_TMP_DIR/awk.chunk.$$"
+  tail -c +"$((pos + 1))" -- "$file" 2>/dev/null >"$chunk"
+  local newpos
+  if [[ $(tail -c1 -- "$chunk" 2>/dev/null | wc -l) -eq 0 ]]; then
+    # last line has no newline yet: leave it for the next batch
+    local complete_bytes
+    complete_bytes=$(LC_ALL=C awk '{ n += length($0) + 1 } END { print n - 1 }' "$chunk" 2>/dev/null)
+    [[ -z $complete_bytes || $complete_bytes -le 0 ]] && complete_bytes=0
+    if (( complete_bytes > 0 )); then
+      head -c "$complete_bytes" -- "$chunk" >"$chunk.full"
+      mv -f -- "$chunk.full" "$chunk"
+    else
+      : >"$chunk"
+    fi
+    newpos=$((pos + complete_bytes))
+  else
+    newpos=$size
+  fi
+
+  local emitted=0
+  if [[ -s $chunk ]]; then
+    awk -f "$P2S_SRC_DIR/lib/$awkf" -v src="$src" \
         -v realfile="$file" -v startline="$line_no" "$chunk" | tee "$chunk.out"
     emitted=$(wc -l <"$chunk.out")
   fi

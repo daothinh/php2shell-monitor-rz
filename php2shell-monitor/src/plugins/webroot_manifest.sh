@@ -6,12 +6,12 @@
 # persistent condition does not re-alert every 5 minutes. auto_prepend_file is
 # checked only for those same files.
 set -u
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 
 plugin_name=webroot
 export plugin_name
 MANIFEST=$P2S_STATE_DIR/webroot.manifest.tsv
+SEEN=$P2S_STATE_DIR/webroot.seen.tsv
 
 webroot_dirs() {
   local -a out=()
@@ -73,6 +73,29 @@ while IFS=$'\t' read -r path sz mt own; do
     fi
   fi
 done <"$tmp"
+
+# Content scan: a webshell already present when the baseline was adopted is
+# never "NEW", so a diff-only plugin stays blind to it forever. Scan the code
+# itself every batch and report the CODE, not just the path, so the analyst
+# sees what the shell does without opening the file.
+while IFS=$'\t' read -r path _sz _mt _own; do
+  [[ -n $path ]] || continue
+  [[ $path == *.user.ini || $path == */.htaccess ]] && continue
+  [[ -r $path ]] || continue
+  # cap: never read more than 256 KiB of a single file
+  hit=$(head -c 262144 -- "$path" 2>/dev/null | grep -aoiE \
+    '(system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec|assert|eval|create_function|call_user_func(_array)?|preg_replace)[[:space:]]*\([^)]*\$_(REQUEST|GET|POST|COOKIE|SERVER|FILES)' \
+    | head -1)
+  [[ -n $hit ]] || continue
+  # De-dup on path+size+mtime: an unchanged shell must not re-alert every batch.
+  sig="$path\t$_sz\t$_mt"
+  grep -qxF -- "$sig" "$SEEN" 2>/dev/null && continue
+  printf '%s\n' "$sig" >>"$SEEN"
+  P2S_TS=$(utc_now); export P2S_TS
+  emit_record webroot "$path" 0 "" "" "" "" "" "" \
+    "webroot webshell pattern: $path contains '$hit'" "-"
+done <"$tmp"
+
 
 { printf '# path\tsize\tmtime\towner\n'; sort -u "$tmp"; } >"$MANIFEST.tmp.$$" &&
   mv -f -- "$MANIFEST.tmp.$$" "$MANIFEST"

@@ -5,7 +5,6 @@
 #   0 = patched (or no PHP), 1 = likely vulnerable, 2 = unknown
 set -u
 WORKDIR=${WORKDIR:-/opt/php2shell-monitor}
-# shellcheck source=/dev/null
 source "$WORKDIR/lib/common.sh"
 
 status=0

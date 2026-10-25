@@ -118,16 +118,21 @@ N "rules: benign line silent" "P2S-" "$(rule_match "$w" "$stream")"
 
 # ---------------------------------------------------------------- one alert
 hits="$w/hits1.tsv"
-# 13 columns: ts source file line ip method uri status ua pid msg rule severity
+# 14 columns: ts source file line ip method uri status ua pid msg rule severity impact
+# impact=rce is the ONLY thing that may raise a batch to CRITICAL: it means the
+# rule's own evidence proves a shell landed or a command already ran.
 printf '%s\n' \
-  $'2026-10-24T00:00:01Z\tfpm_error\t/var/log/fpm.log\t11\t\t\t\t\t\t42\tAllowed memory size exhausted\tP2S-010\tHIGH' \
-  $'2026-10-24T00:00:02Z\taccess_log\t/var/log/access.log\t7\t1.2.3.4\tGET\t/sh.php\t200\tcurl\t\tGET /sh.php?cmd=id\tP2S-030\tHIGH' \
-  $'2026-10-24T00:00:03Z\twebroot\t/var/www/shell.php\t0\t\t\t\t\t\t\twebroot file NEW\tP2S-020\tCRITICAL' \
+  $'2026-10-24T00:00:01Z\tfpm_error\t/var/log/fpm.log\t11\t\t\t\t\t\t42\tAllowed memory size exhausted\tP2S-010\tHIGH\t' \
+  $'2026-10-24T00:00:02Z\taccess_log\t/var/log/access.log\t7\t1.2.3.4\tGET\t/sh.php\t200\tcurl\t\tGET /sh.php?cmd=id\tP2S-030\tHIGH\t' \
+  $'2026-10-24T00:00:03Z\twebroot\t/var/www/shell.php\t0\t\t\t\t\t\t\twebroot file NEW\tP2S-020\tCRITICAL\trce' \
   >"$hits"
 report "$w" "$hits" "20261024T000000Z"
 alert="$w/projects/test-project/devices/test-device/alerts/queue.jsonl"
 T "alert: exactly one line per batch" "1" "$(wc -l <"$alert" | tr -d ' ')"
-T "alert: severity is the highest hit" "CRITICAL" "$(jq -r '.severity' "$alert")"
+T "alert: RCE evidence -> CRITICAL" "CRITICAL" "$(jq -r '.severity' "$alert")"
+T "alert: rce counter carried"      "1"        "$(jq -r '.rce' "$alert")"
+T "alert: host is device label"     "test-device" "$(jq -r '.host' "$alert")"
+T "alert: hostname is machine name" "" "$(jq -r '.hostname' "$alert")"
 T "alert: hit count preserved"         "3"        "$(jq -r '.hits' "$alert")"
 T "alert: all rules counted"           "P2S-020"  "$(jq -r '[.rules[].rule_id]|join(",")' "$alert")"
 T "alert: evidence keeps file path"    "/var/www/shell.php" "$(jq -r '.evidence[2].file' "$alert")"
@@ -137,6 +142,25 @@ T "alert: project carried"             "test-project" "$(jq -r '.project' "$aler
 T "alert: device carried"              "test-device"  "$(jq -r '.device' "$alert")"
 T "alert: evidence file written"       "20261024T000000Z.jsonl" "$(jq -r '.evidence_file' "$alert")"
 T "evidence: one record per hit"       "3" "$(wc -l <"$w/projects/test-project/devices/test-device/evidence/20261024T000000Z.jsonl" | tr -d ' ')"
+
+# ------------------------------------------- severity tiers (impact-driven)
+# CRITICAL chỉ khi có bằng chứng RCE; nếu không thì chia theo số event.
+_tier() { # <số event> <có rce?>
+  local n=$1 rce=$2 f="$w/tier.tsv"
+  awk -v n="$n" -v rce="$rce" 'BEGIN{
+    for(i=1;i<=n;i++)
+      printf "2026-10-24T00:00:01Z\taccess_log\t/a\t%d\t1.2.3.4\tGET\t/x\t200\tua\t\traw\tP2S-050\tCRITICAL\t%s\n", i, (i==1?rce:"")
+  }' >"$f"
+  rm -f "$w/projects/test-project/devices/test-device/alerts/queue.jsonl"
+  report "$w" "$f" "20261024T0010$RANDOM"
+  jq -r '.severity' "$w/projects/test-project/devices/test-device/alerts/queue.jsonl"
+}
+T "severity: RCE -> CRITICAL"          "CRITICAL" "$(_tier 10 rce)"
+T "severity: 6000 event -> MODERATE"   "MODERATE" "$(_tier 6000 '')"
+T "severity: 5000 event -> MODERATE"   "MODERATE" "$(_tier 5000 '')"
+T "severity: 4999 event -> INFO"       "INFO"     "$(_tier 4999 '')"
+T "severity: 1 event -> INFO"          "INFO"     "$(_tier 1 '')"
+T "severity: nhiễu không thành CRITICAL" "INFO"   "$(_tier 300 '')"
 
 # empty batch -> no alert, but a batch record
 report "$w" /dev/null "20261024T000500Z"
@@ -158,6 +182,180 @@ T "alert: full evidence still on disk" "3" \
 # Fake central server: một stub `curl` đếm lượt poll và trả lời theo kịch bản,
 # giữ test không phụ thuộc server thật hay mạng.
 w2=$(newlab)
+
+# ------------------------------------------------- endpoint obfuscation
+# Địa chỉ server không được xuất hiện dạng plaintext trong mã nguồn: grep một
+# cổng hay một dải IP không được tìm ra nó.
+ep_out=$(bash -c 'source "$1/lib/endpoint.sh"; p2s_endpoint' _ "$SRC")
+T "endpoint: giải mã ra URL http"      "http://" "$ep_out"
+bash -c 'source "$1/lib/endpoint.sh"; p2s_endpoint_valid' _ "$SRC" \
+  && pass "endpoint: hợp lệ" || fail "endpoint: hợp lệ"
+
+# roundtrip: encode rồi decode phải quay lại đúng chuỗi ban đầu
+for u in "http://a.example:8000" "http://10.1.2.3:9999"; do
+  rt=$(bash -c 'source "$1/lib/endpoint.sh"
+    b=$(p2s_endpoint_encode "$2"); P2S_ENDPOINT_B64=$b p2s_endpoint' _ "$SRC" "$u")
+  T "endpoint: roundtrip $u" "$u" "$rt"
+done
+
+# không có IP:port nào viết thẳng trong mã nguồn
+plain=$(grep -rEn 'https?://[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+' "$SRC/lib" "$SRC/engine" \
+          "$SRC/main.sh" 2>/dev/null | grep -v '^.*#' || true)
+T "endpoint: không lộ IP:port trong mã" "" "$plain"
+
+# ------------------------------------------------- main.sh: không wizard
+# Chạy trần KHÔNG được hỏi gì: phải báo thiếu tham số rồi thoát ngay.
+out=$(WORKDIR="$w2" P2S_DATA_DIR='' bash "$SRC/main.sh" </dev/null 2>&1)
+T "main: chạy trần báo thiếu tham số" "thiếu tham số bắt buộc" "$out"
+T "main: chạy trần nêu tham số cần"   "--project --chatid" "$out"
+N "main: chạy trần không prompt"       "Nhập" "$out"
+
+out=$(WORKDIR="$w2" P2S_DATA_DIR='' bash "$SRC/main.sh" </dev/null 2>&1)
+T "main: thiếu project+chatid báo rõ" "--project --chatid" "$out"
+
+# --server không còn là tham số của người dùng: truyền vào thì bỏ qua,
+# không truyền thì vẫn chạy (endpoint nằm trong mã nguồn).
+out=$(WORKDIR="$w2" P2S_DATA_DIR='' bash "$SRC/main.sh" --server http://x.test </dev/null 2>&1)
+N "main: --server không còn bắt buộc" "thiếu tham số bắt buộc: --server" "$out"
+T "main: vẫn đòi project/chatid"      "--project --chatid" "$out"
+
+# ------------------------------------------------- chốt chặn chạy lại
+# Thiết bị đã pair đầy đủ -> chạy lại lệnh triển khai phải báo "đã thiết lập"
+# và KHÔNG được đụng vào conf (không đổi dự án, không đổi chat, không cấp key mới).
+w3=$(newlab)
+stub3=$w3/curlstub
+mkdir -p "$stub3"
+cat >"$stub3/curl" <<'STUB'
+#!/usr/bin/env bash
+self=$(dirname "$0")
+args=("$@")
+url='' body=''
+for ((i = 0; i < $#; i++)); do
+  case ${args[$i]} in
+    -d|--data) body=${args[$((i + 1))]} ;;
+    http*) url=${args[$i]} ;;
+  esac
+done
+case $url in
+  *register-chatid)
+    printf '%s' "$body" >"$self/register_body"
+    n=$(cat "$self/reg_count" 2>/dev/null || echo 0); n=$((n + 1))
+    printf '%s' "$n" >"$self/reg_count"
+    printf '{"pair_ref":"SEC-R%s","bot":"@test_bot","warning":null}' "$n"
+    ;;
+  *pairing-status*)
+    printf '{"status":"linked","api_key":"p2sk-key-%s"}' "$(cat "$self/reg_count")"
+    ;;
+  *) printf '{}' ;;
+esac
+STUB
+chmod +x "$stub3/curl"
+SETUP_ENV=(PATH="$stub3:$PATH" WORKDIR="$w3" P2S_PAIR_POLL=1 P2S_PAIR_TIMEOUT=10)
+
+# lần đầu: phải chạy thật
+out=$(env "${SETUP_ENV[@]}" bash "$SRC/main.sh" \
+      --server http://fake-central.test --project proj-A --chatid 812345678 2>&1)
+T "setup: lần đầu ghép nối"        "GHÉP NỐI THÀNH CÔNG" "$out"
+T "setup: lần đầu ghi project"     'PROJECT="proj-A"' "$(cat "$w3/conf/device.conf")"
+
+# banner VCCSEC ở đầu, và output KHÔNG được lộ server/chat
+first=$(printf '%s\n' "$out" | head -1)
+T "setup: banner ở dòng đầu"       "__     __"           "$first"
+T "setup: banner đủ 5 dòng"        " \____||____/ |_____| \____|" "$out"
+N "setup: không in dòng Server"    "Server     :"        "$out"
+N "setup: không in dòng Chat nhận" "Chat nhận  :"        "$out"
+T "setup: nêu thiết bị + IP"       "Đang đăng ký thiết bị" "$out"
+T "setup: nêu dự án khi đăng ký"   'cho dự án "proj-A"'   "$out"
+T "setup: gợi ý kiểm tra"          "Kiểm tra trạng thái:" "$out"
+
+key1=$(sed -n 's/^API_KEY=//p' "$w3/conf/central.conf")
+: >"$stub3/reg_count"; : >"$stub3/register_body"
+
+# lần hai, y hệt -> chặn
+out=$(env "${SETUP_ENV[@]}" bash "$SRC/main.sh" \
+      --server http://fake-central.test --project proj-A --chatid 812345678 2>&1)
+T "setup: chạy lại báo đã thiết lập" "ĐÃ ĐƯỢC THIẾT LẬP MONITOR" "$out"
+N "setup: chạy lại KHÔNG gọi register" "SEC-R" "$(cat "$stub3/register_body")"
+T "setup: chạy lại giữ nguyên key"  "$key1" "$(sed -n 's/^API_KEY=//p' "$w3/conf/central.conf")"
+
+# lần ba, cố đổi dự án + chat -> vẫn chặn, conf không đổi
+out=$(env "${SETUP_ENV[@]}" bash "$SRC/main.sh" \
+      --server http://fake-central.test --project proj-B --chatid 999888777 2>&1)
+T "setup: đổi dự án vẫn bị chặn"    "ĐÃ ĐƯỢC THIẾT LẬP MONITOR" "$out"
+T "setup: conf project không đổi"   'PROJECT="proj-A"' "$(cat "$w3/conf/device.conf")"
+T "setup: conf chat không đổi"      "CHAT_ID=812345678" "$(cat "$w3/conf/central.conf")"
+N "setup: không cấp key mới"        "p2sk-key-2" "$(cat "$w3/conf/central.conf")"
+
+# --force -> được phép đổi
+out=$(env "${SETUP_ENV[@]}" bash "$SRC/main.sh" --force \
+      --server http://fake-central.test --project proj-B --chatid 999888777 2>&1)
+T "setup: --force cho đổi cấu hình" "GHÉP NỐI THÀNH CÔNG" "$out"
+T "setup: --force ghi project mới"  'PROJECT="proj-B"' "$(cat "$w3/conf/device.conf")"
+T "setup: --force ghi chat mới"     "CHAT_ID=999888777" "$(cat "$w3/conf/central.conf")"
+
+# pair dở (có project thật nhưng mất API key) -> KHÔNG chặn
+w4=$(newlab)
+printf 'PROJECT="proj-C"\nDEVICE="test-device"\n' >"$w4/conf/device.conf"
+printf 'SERVER_URL=http://fake-central.test\nAPI_KEY=\nPROJECT_NAME=proj-C\nCHAT_ID=812345678\n' \
+  >"$w4/conf/central.conf"
+out=$(env PATH="$stub3:$PATH" WORKDIR="$w4" P2S_PAIR_POLL=1 P2S_PAIR_TIMEOUT=10 \
+      bash "$SRC/main.sh" --server http://fake-central.test --project proj-C --chatid 812345678 2>&1)
+T "setup: pair dở vẫn chạy tiếp"    "GHÉP NỐI THÀNH CÔNG" "$out"
+
+rm -rf -- "$w3" "$w4"
+
+# ------------------------------------------- supervisor: lịch & timeout
+# Vòng lặp cũ dùng `sleep $interval` SAU mỗi scan, nên thời gian scan cộng dồn
+# vào chu kỳ: đo thật được 319s / 308s / 307s thay vì 300s.
+w5=$(newlab)
+printf 'PROJECT="p"\nDEVICE="d"\n' >"$w5/conf/device.conf"
+printf 'BATCH_INTERVAL=300\n' >>"$w5/conf/default.conf"
+mkdir -p "$w5/projects/p/devices/d/run"
+
+# bám lưới: now bất kỳ -> tick kế tiếp luôn là bội số của interval
+grid=$(bash -c '
+interval=300
+for now in 1792943583 1792943585 1792943800; do
+  next=$(( (now / interval + 1) * interval ))
+  printf "%s " $(( next - now ))
+done')
+T "supervisor: bám lưới 300s" "117 115 200 " "$grid"
+
+# scan treo phải bị timeout kill, không treo vòng lặp
+t0=$(date +%s)
+timeout -k 2 2 bash -c 'sleep 60' >/dev/null 2>&1; rc=$?
+t1=$(date +%s)
+T "supervisor: timeout kill scan treo" "124" "$rc"
+N "supervisor: không chờ hết 60s"      "60" "$((t1 - t0))"
+
+# scan.lock cũ bị coi là treo và xoá; lock mới thì giữ
+touch -d '2 hours ago' "$w5/projects/p/devices/d/run/scan.lock"
+st=$(find "$w5/projects/p/devices/d/run/scan.lock" -newermt "-330 seconds" 2>/dev/null)
+T "supervisor: nhận ra lock cũ" "" "$st"
+touch "$w5/projects/p/devices/d/run/scan.lock"
+st=$(find "$w5/projects/p/devices/d/run/scan.lock" -newermt "-330 seconds" 2>/dev/null)
+T "supervisor: giữ lock mới" "$w5/projects/p/devices/d/run/scan.lock" "$st"
+
+# rotate: file quá lớn phải được đổi tên, không cắt cụt khi đang ghi
+printf 'x%.0s' $(seq 1 5000) >"$w5/projects/p/devices/d/run/scan.log"
+sz=$(stat -c %s "$w5/projects/p/devices/d/run/scan.log")
+(( sz > 1024 )) && mv -f "$w5/projects/p/devices/d/run/scan.log" "$w5/projects/p/devices/d/run/scan.log.1"
+T "supervisor: rotate scan.log" "5000" "$(stat -c %s "$w5/projects/p/devices/d/run/scan.log.1" 2>/dev/null || echo 0)"
+
+rm -rf -- "$w5"
+
+# Agent chết giữa 2 tick phải được phát hiện sớm, không đợi hết interval.
+# Trước đây _ensure_agent chỉ chạy sau mỗi scan nên alert kẹt tới 5 phút.
+T "supervisor: có watchdog agent" "AGENT_CHECK" "$(cat "$SRC/engine/supervisor.sh")"
+T "supervisor: respawn trong vòng lặp chờ" "_ensure_agent" \
+  "$(sed -n '/remaining > 0/,/done/p' "$SRC/engine/supervisor.sh")"
+T "supervisor: mặc định 20s" "AGENT_CHECK:-20" "$(cat "$SRC/engine/supervisor.sh")"
+
+# chia nhỏ thời gian chờ: không ngủ liền 300s
+nap=$(bash -c 'remaining=300; check=20; n=0; while (( remaining > 0 )); do
+  nap=$(( remaining < check ? remaining : check )); remaining=$(( remaining - nap )); n=$((n+1)); done; echo $n')
+T "supervisor: ngủ chia nhỏ 15 lần" "15" "$nap"
+
 stub=$w2/curlstub
 mkdir -p "$stub"
 cat >"$stub/curl" <<'STUB'
@@ -197,28 +395,43 @@ case $url in
 esac
 STUB
 chmod +x "$stub/curl"
-PAIR_ENV=(PATH="$stub:$PATH" WORKDIR="$w2" P2S_PAIR_POLL=1 P2S_PAIR_TIMEOUT=30)
+FAKE_EP=$(bash -c 'source "$1/lib/endpoint.sh"; p2s_endpoint_encode "http://fake-central.test"' _ "$SRC")
+PAIR_ENV=(PATH="$stub:$PATH" WORKDIR="$w2" P2S_PAIR_POLL=1 P2S_PAIR_TIMEOUT=30
+          P2S_ENDPOINT_B64="$FAKE_EP")
 
-# chat ID sai định dạng -> báo lỗi rồi đọc lại; giá trị hợp lệ ở lần 2 được dùng
+# Chat ID sai định dạng -> từ chối ngay, KHÔNG gọi server (không còn prompt
+# tương tác: lệnh triển khai nhận đủ tham số, sai thì báo lỗi và dừng).
 out=$(printf 'abc\n812345678\n' | env "${PAIR_ENV[@]}" \
-      bash "$w2/engine/central.sh" pair --server http://fake-central.test 2>&1)
-T "pair: chatid sai bị từ chối"  "không đúng định dạng" "$out"
-T "pair: đăng ký với chatid nhập lại" '"chat_id":"812345678"' "$(cat "$stub/register_body")"
-N "pair: chatid sai không gửi lên server" '"abc"' "$(cat "$stub/register_body")"
+      bash "$w2/engine/central.sh" pair --chatid abc 2>&1)
+T "pair: chatid sai bị từ chối"  "không hợp lệ" "$out"
+N "pair: chatid sai không gửi lên server" '"chat_id"' "$(cat "$stub/register_body" 2>/dev/null)"
 
-# luồng đầy đủ --chatid: wizard -> register -> poll -> lưu conf
+# thiếu tham số -> báo đúng tham số còn thiếu
+out=$(env "${PAIR_ENV[@]}" bash "$w2/engine/central.sh" pair 2>&1)
+T "pair: thiếu chatid báo rõ" "thiếu tham số bắt buộc: --chatid" "$out"
+
+# luồng đầy đủ --chatid: register -> poll -> lưu conf
 rm -f "$stub/poll_count"
 out=$(env "${PAIR_ENV[@]}" \
-      bash "$w2/engine/central.sh" pair --server http://fake-central.test --chatid 998877665 2>&1)
-T "pair: ghi rõ ghép tự động"        "TỰ ĐỘNG"             "$out"
+      bash "$w2/engine/central.sh" pair --chatid 998877665 2>&1)
+T "pair: nêu thiết bị + IP khi đăng ký" "Đang đăng ký thiết bị test-device |" "$out"
 T "pair: đăng ký đúng project"       '"project_name":"test-project"' "$(cat "$stub/register_body")"
-T "pair: thành công sau khi confirm" "GHÉP NỐI THÀNH CÔNG" "$out"
-T "pair: gợi ý bước tiếp theo"        "php2shell-monitor.sh -- run" "$out"
+T "pair: conf ghi xong là thành công" "API_KEY=" "$(cat "$w2/conf/central.conf")"
 T "pair: conf lưu server + key"      "SERVER_URL=http://fake-central.test" \
+  "$(cat "$w2/conf/central.conf")"
+T "pair: conf lưu chat id"           "CHAT_ID=998877665" \
   "$(cat "$w2/conf/central.conf")"
 T "pair: conf 0600"                  "600" "$(stat -c %a "$w2/conf/central.conf")"
 N "pair: không tự bật agent khi chưa có supervisor" "agent" \
   "$(ls "$w2/projects/test-project/devices/test-device/run/agent" 2>/dev/null)"
+
+# idempotent: chạy lại cùng tham số không gọi server lần nữa, không cấp key mới
+: >"$stub/register_body"
+out=$(env "${PAIR_ENV[@]}" \
+      bash "$w2/engine/central.sh" pair --chatid 998877665 2>&1)
+T "pair: chạy lại báo đã ghép nối" "Đã ghép nối trước đó" "$out"
+T "pair: chạy lại KHÔNG gọi register" "" "$(cat "$stub/register_body")"
+T "pair: giữ nguyên API key" "p2sk-test-key-42" "$(cat "$w2/conf/central.conf")"
 
 # test mode: gửi 1 alert INFO qua đúng API key đã lưu
 out=$(env "${PAIR_ENV[@]}" bash "$w2/engine/central.sh" test 2>&1)

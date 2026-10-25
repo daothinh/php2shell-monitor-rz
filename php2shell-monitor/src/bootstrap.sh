@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
-# bootstrap.sh - makeself startup script.
-#
-# The archive is built with `makeself --needroot --target /opt/php2shell-monitor`,
-# so the payload is unpacked STRAIGHT into the install directory: no copy in
-# /tmp, no second location. This script only finishes the install in place.
-#
-# Invariants:
-#   - root required (makeself --needroot refuses earlier)
-#   - the install directory is the only thing this tool ever writes to
-#   - code is overwritten on upgrade; conf/ and projects/ are preserved
+# bootstrap.sh - makeself startup script. Finishes the install in place.
+# Invariants: root required; only the install directory is written; code is
+# replaced on upgrade while conf/ and projects/ are preserved.
 set -u
 
 die() { printf 'php2shell-monitor: %s\n' "$*" >&2; exit 1; }

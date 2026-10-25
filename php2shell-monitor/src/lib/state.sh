@@ -3,7 +3,6 @@
 # The line number is what makes an alert traceable back to `file:line`.
 [[ -n ${P2S_STATE_SH:-} ]] && return 0
 P2S_STATE_SH=1
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 P2S_OFFSETS_FILE=${P2S_OFFSETS_FILE:-}
