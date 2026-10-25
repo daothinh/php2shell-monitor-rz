@@ -23,7 +23,7 @@ source "$WORKDIR/lib/paths.sh"
 p2s_device_init || exit 0
 [[ -f $WORKDIR/conf/default.conf ]] && source "$WORKDIR/conf/default.conf"
 
-MAX_INLINE=${MAX_EVIDENCE_INLINE:-500}
+MAX_EVIDENCE_INLINE=${MAX_EVIDENCE_INLINE:-0}
 
 _rank() {
   case ${1^^} in
@@ -88,13 +88,19 @@ _sev_counts_json() {
   printf '%s]' "$out"
 }
 
-# ------------------------------------------------- 3. inline evidence (capped)
-if (( total <= MAX_INLINE )); then
-  inline="[$(paste -sd, -- "$EVIDENCE")]"
-  truncated=false
-else
-  inline="[$(head -n "$MAX_INLINE" -- "$EVIDENCE" | paste -sd, -)]"
-  truncated=true
+# ------------------------------------------------- 3. evidence travels out-of-band
+# The alert line stays small and metadata-only. Embedding the full set inline
+# made one queue line 148 MB for a 300k-hit batch: mapfile held it in bash
+# memory (761 MB RSS), paste built a second copy, and the agent never finished.
+# The evidence file is uploaded separately as gzipped JSONL, complete and
+# already deduplicated, and the server writes it straight to the mirror.
+# MAX_EVIDENCE_INLINE>0 still embeds a preview for manual/debug use only.
+truncated=false
+inline='[]'
+if [[ -n ${MAX_EVIDENCE_INLINE:-} && ${MAX_EVIDENCE_INLINE:-0} =~ ^[0-9]+$ ]] \
+   && (( MAX_EVIDENCE_INLINE > 0 )); then
+  inline="[$(head -n "$MAX_EVIDENCE_INLINE" -- "$EVIDENCE" | paste -sd, -)]"
+  (( total > MAX_EVIDENCE_INLINE )) && truncated=true
 fi
 
 # ------------------------------------------------- 4. the single alert
@@ -113,6 +119,7 @@ alert=$(json_obj \
   "rules" "$(_rule_counts_json)" \
   "severities" "$(_sev_counts_json)" \
   "evidence_file" "$(json_str "$EVIDENCE")" \
+  "evidence_count" "$(json_num "$total")" \
   "evidence_truncated" "$truncated" \
   "evidence" "$inline")
 

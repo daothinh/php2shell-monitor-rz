@@ -175,6 +175,29 @@ post_alerts() { # các dòng JSON làm tham số -> 0 nếu server nhận
   return $rc
 }
 
+# upload_evidence <alert_json_line>
+# Gửi file evidence của batch dạng gzip thô, tách khỏi alert JSON. Alert chỉ
+# mang metadata; đây là kênh chở toàn bộ event. Server ghi thẳng vào mirror.
+upload_evidence() {
+  local line=$1 batch evf
+  batch=$(printf '%s' "$line" | sed -n 's/.*"batch_id":"\([^"]*\)".*/\1/p')
+  evf=$(printf '%s' "$line" | sed -n 's/.*"evidence_file":"\([^"]*\)".*/\1/p')
+  [[ -n $batch && -n $evf && -r $evf ]] || return 0
+  local gz="$P2S_TMP_DIR/ev.$batch.$$.gz"
+  gzip -6 -c -- "$evf" >"$gz" || { rm -f -- "$gz"; return 1; }
+  local rc=0
+  "${CURL[@]}" --max-time 300 -X POST "$SERVER_URL/api/v1/ingest-evidence" \
+    -H "X-API-Key: $API_KEY" \
+    -H "X-Batch-Id: $batch" \
+    -H "X-Hostname: $(hostname 2>/dev/null || echo unknown)" \
+    -H "X-Lan-Ip: $(lan_ip)" \
+    -H "X-User: $(id -un 2>/dev/null || echo unknown)" \
+    -H 'Content-Type: application/gzip' \
+    --data-binary "@$gz" >/dev/null || rc=$?
+  rm -f -- "$gz"
+  return $rc
+}
+
 # Đọc dòng mới hoàn chỉnh từ $ALERT_FILE; rotation-aware theo inode.
 # Chỉ tiêu thụ đúng số byte đã stat; dòng cuối chưa có \n để lại cho chu kỳ sau.
 # Sets: NEW_LINES (array), NEW_POS, NEW_INO.
@@ -261,6 +284,8 @@ cmd_agent() {
       while ((sent < ${#NEW_LINES[@]})); do
         local -a part=("${NEW_LINES[@]:sent:BATCH_MAX}")
         if post_alerts "${part[@]}"; then
+          local _l
+          for _l in "${part[@]}"; do upload_evidence "$_l" || true; done
           sent=$((sent + ${#part[@]}))
         else
           spool_append "${NEW_LINES[@]:sent}"

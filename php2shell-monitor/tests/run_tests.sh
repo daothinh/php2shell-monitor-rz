@@ -24,7 +24,7 @@ newlab() {
   cp -a "$SRC/plugins/." "$w/plugins/"
   cp -a "$SRC/rules/pack/." "$w/rules/pack/"
   printf 'PROJECT="test-project"\nDEVICE="test-device"\n' >"$w/conf/device.conf"
-  printf 'BATCH_INTERVAL=300\nMAX_EVIDENCE_INLINE=500\nEVIDENCE_KEEP=50\nPLUGINS_DISABLED=""\n' \
+  printf 'BATCH_INTERVAL=300\nMAX_EVIDENCE_INLINE=0\nEVIDENCE_KEEP=50\nPLUGINS_DISABLED=""\n' \
     >"$w/conf/default.conf"
   : >"$w/conf/whitelist.conf"
   printf '%s' "$w"
@@ -135,9 +135,12 @@ T "alert: host is device label"     "test-device" "$(jq -r '.host' "$alert")"
 T "alert: hostname is machine name" "" "$(jq -r '.hostname' "$alert")"
 T "alert: hit count preserved"         "3"        "$(jq -r '.hits' "$alert")"
 T "alert: all rules counted"           "P2S-020"  "$(jq -r '[.rules[].rule_id]|join(",")' "$alert")"
-T "alert: evidence keeps file path"    "/var/www/shell.php" "$(jq -r '.evidence[2].file' "$alert")"
-T "alert: evidence keeps line number"  "11"       "$(jq -r '.evidence[0].line' "$alert")"
-T "alert: evidence keeps raw line"     "cmd=id"   "$(jq -r '.evidence[1].raw' "$alert")"
+# Evidence không nằm trong alert nữa: kiểm tra file JSONL trên đĩa, đó mới là
+# bản đầy đủ được upload nguyên văn.
+EVF=$w/projects/test-project/devices/test-device/evidence/20261024T000000Z.jsonl
+T "evidence file: keeps file path"     "/var/www/shell.php" "$(jq -r '.file' "$EVF" | tail -1)"
+T "evidence file: keeps line number"   "11"       "$(jq -r '.line' "$EVF" | head -1)"
+T "evidence file: keeps raw line"      "cmd=id"   "$(jq -r '.raw' "$EVF" | sed -n 2p)"
 T "alert: project carried"             "test-project" "$(jq -r '.project' "$alert")"
 T "alert: device carried"              "test-device"  "$(jq -r '.device' "$alert")"
 T "alert: evidence file written"       "20261024T000000Z.jsonl" "$(jq -r '.evidence_file' "$alert")"
@@ -171,10 +174,24 @@ T "batch log: empty batch recorded" "no-hits" "$(tail -1 "$w/projects/test-proje
 report "$w" "$hits" "20261024T001000Z"
 T "alert: second batch appends" "2" "$(wc -l <"$alert" | tr -d ' ')"
 
-# inline cap
+# Mặc định KHÔNG nhét evidence vào alert: 300k event = dòng JSON 148MB, agent
+# không gửi nổi. Evidence đi kênh riêng, alert chỉ mang metadata.
+report "$w" "$hits" "20261024T001200Z"
+T "alert: mặc định không inline evidence" "0" \
+  "$(jq -r '.evidence | length' "$alert" | tail -1)"
+T "alert: có evidence_count" "3" "$(jq -r '.evidence_count' "$alert" | tail -1)"
+T "alert: không bị coi là truncated" "false" "$(jq -r '.evidence_truncated' "$alert" | tail -1)"
+T "alert: evidence_file trỏ file đầy đủ" "20261024T001200Z.jsonl" \
+  "$(jq -r '.evidence_file | split("/") | last' "$alert" | tail -1)"
+T "alert: full evidence on disk" "3" \
+  "$(wc -l <"$w/projects/test-project/devices/test-device/evidence/20261024T001200Z.jsonl" | tr -d ' ')"
+
+# MAX_EVIDENCE_INLINE>0 = preview thủ công, không phải đường truyền chính
 sed -i 's/^MAX_EVIDENCE_INLINE=.*/MAX_EVIDENCE_INLINE=2/' "$w/conf/default.conf"
 report "$w" "$hits" "20261024T001500Z"
-T "alert: inline evidence capped" "true" "$(jq -r '.evidence_truncated' "$alert" | tail -1)"
+T "alert: preview giới hạn khi bật tay" "2" \
+  "$(jq -r '.evidence | length' "$alert" | tail -1)"
+T "alert: preview báo truncated" "true" "$(jq -r '.evidence_truncated' "$alert" | tail -1)"
 T "alert: full evidence still on disk" "3" \
   "$(wc -l <"$w/projects/test-project/devices/test-device/evidence/20261024T001500Z.jsonl" | tr -d ' ')"
 

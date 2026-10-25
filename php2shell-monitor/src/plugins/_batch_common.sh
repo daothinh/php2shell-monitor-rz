@@ -44,12 +44,14 @@ batch_read() {
     newpos=$size
   fi
 
+  # No per-batch event cap: breaking out of this loop advanced the offset to
+  # `newpos` anyway, so every line past the cap was skipped forever. Reading the
+  # whole chunk is the only way no log line is silently lost.
   local count=0 line
   while IFS= read -r line; do
     [[ -z $line ]] && continue
     count=$((count + 1))
     line_no=$((line_no + 1))
-    (( count > ${MAX_EVENTS_PER_BATCH:-50000} )) && break
     P2S_FILE=$file
     P2S_LINE=$line_no
     export P2S_FILE P2S_LINE
