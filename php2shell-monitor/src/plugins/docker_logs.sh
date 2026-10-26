@@ -93,15 +93,14 @@ docker_handle_line() {
 
 CURSOR_FILE=$P2S_STATE_DIR/docker_cursors.tsv
 
-# _cursor_get <container> -> "<timestamp>\t<seq>"; chưa có thì "\t0".
+# _cursor_get <container> -> "<ts>\t<seq>" hoặc chuỗi RỖNG khi chưa có con trỏ.
+# Không dùng sentinel "\t0": tab đứng đầu là IFS-whitespace nên `read` nuốt
+# mất, biến thành cur_ts="0" — mà --since 0 là EPOCH 0, lần chạy đầu đọc lại
+# TOÀN BỘ lịch sử container thay vì chỉ cửa sổ gần nhất.
 _cursor_get() {
   local c=$1
-  if [[ -r $CURSOR_FILE ]]; then
-    awk -F'\t' -v c="$c" '$1 == c { printf "%s\t%s", $2, $3; f=1; exit }
-                          END { if (!f) printf "\t0" }' "$CURSOR_FILE"
-  else
-    printf '\t0'
-  fi
+  [[ -r $CURSOR_FILE ]] || return 0
+  awk -F'\t' -v c="$c" '$1 == c { printf "%s\t%s", $2, $3; exit }' "$CURSOR_FILE"
 }
 
 # _cursor_set <container> <timestamp> <seq> — ghi đè dòng của container, giữ
@@ -144,8 +143,14 @@ if (( ! found_json )); then
   docker ps --format '{{.Names}}' 2>/dev/null |
   while IFS= read -r c; do
     [[ -z $c ]] && continue
-    IFS=$'\t' read -r cur_ts cur_seq <<<"$(_cursor_get "$c")"
-    [[ -n ${cur_seq:-} ]] || cur_seq=0
+    cur_ts=''; cur_seq=0
+    x=$(_cursor_get "$c")
+    if [[ -n $x ]]; then
+      cur_ts=${x%%$'\t'*}
+      cur_seq=${x#*$'\t'}
+      # dòng cursor của bản lỗi cũ ghi ts="0" (epoch 0): coi như chưa có mốc
+      [[ $cur_ts == 0 ]] && cur_ts=''
+    fi
     # --since nhận RFC3339 tới giây; phần lẻ nano do bộ lọc bên dưới xử lý.
     since=${cur_ts:+${cur_ts%%.*}}
     since=${since:-${DOCKER_LOG_SINCE:-10m}}

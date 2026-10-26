@@ -570,6 +570,40 @@ out3=$(env PATH="$dstub:$PATH" WORKDIR="$w4" DOCKER_LOG_DIR="$w4/no-dkr" \
          bash "$w4/plugins/docker_logs.sh")
 T "docker CLI fallback: quét qua docker logs" '"php2shell-cli"' "$out3"
 
+# HỒI QUY: cursor chưa có KHÔNG được rơi vào --since 0 (epoch 0 = đọc toàn bộ
+# lịch sử). Bug thật: _cursor_get trả "\t0", tab đầu bị `read` IFS nuốt thành
+# cur_ts="0" -> lần chạy đầu nuốt lại mọi log cũ của container.
+dstub2=$w4/dockerstub2
+mkdir -p "$dstub2"
+cat >"$dstub2/docker" <<'DSTUB2'
+#!/usr/bin/env bash
+self=$(dirname "$0")
+if [[ $1 == ps ]]; then printf 'old-box\n'; exit 0; fi
+printf '%s\n' "$*" >"$self/logs_args"
+# mô phỏng --since của docker: chỉ khi bị gọi --since 0 (epoch 0) mới trả
+# dòng log cổ đại; --since 10m thì không có dòng nào trong cửa sổ.
+case " $* " in
+  *" --since 0 "*)
+    printf '%s\n' '2024-01-01T00:00:00.000000001Z 1.2.3.4 - - [x] "GET /ancient HTTP/1.1" 200 1 "-" "php2shell-ancient"' ;;
+esac
+DSTUB2
+chmod +x "$dstub2/docker"
+rm -f "$w4/projects/test-project/devices/test-device/state/docker_cursors.tsv"
+: >"$dstub2/logs_args"
+out4=$(env PATH="$dstub2:$PATH" WORKDIR="$w4" DOCKER_LOG_DIR="$w4/no-dkr" \
+         bash "$w4/plugins/docker_logs.sh")
+T "docker: lần đầu dùng --since mặc định, không phải 0" "since 10m" "$(cat "$dstub2/logs_args")"
+N "docker: không đọc lại dòng log cổ đại (epoch-0)" "php2shell-ancient" "$out4"
+
+# "min" phải nằm TRONG match: đặt lệch ra ngoài (P2S-052/055 cũ) thì jsonl.awk
+# đọc match.min rỗng -> min=1, ngưỡng kìm lặng lẽ biến mất — rule ồn ào vô điều kiện.
+awk -f "$SRC/lib/jsonl.awk" rules="$w4/rules_parsed.tsv" ands="$w4/ands_parsed.tsv" \
+    "$SRC"/rules/pack/*.jsonl 2>/dev/null
+T "rules: P2S-052 min=3 (nằm trong match)" "3" \
+  "$(awk -F'\037' '$1=="P2S-052"{print $10}' "$w4/rules_parsed.tsv")"
+T "rules: P2S-055 min=3 (nằm trong match)" "3" \
+  "$(awk -F'\037' '$1=="P2S-055"{print $10}' "$w4/rules_parsed.tsv")"
+
 # ------------------------------------------- rule pack không cần jq
 # Rule pack đọc bằng lib/jsonl.awk. Đây là điều kiện sống còn: nếu jq là bắt
 # buộc thì host không cài được jq sẽ chạy monitor mà không phát hiện gì.
