@@ -618,6 +618,34 @@ out4=$(env PATH="$dstub2:$PATH" WORKDIR="$w4" DOCKER_LOG_DIR="$w4/no-dkr" \
 T "docker: lần đầu dùng --since mặc định, không phải 0" "since 10m" "$(cat "$dstub2/logs_args")"
 N "docker: không đọc lại dòng log cổ đại (epoch-0)" "php2shell-ancient" "$out4"
 
+# HỒI QUY: --since từ cursor PHẢI giữ hậu tố Z. Cắt nano bằng %%.* làm mất Z,
+# daemon docker đọc ts không-Z theo múi khác và trả 0 dòng — batch sau im
+# lặng mãi mãi dù container có log mới.
+dstub3=$w4/dockerstub3
+mkdir -p "$dstub3"
+cat >"$dstub3/docker" <<'DSTUB3'
+#!/usr/bin/env bash
+self=$(dirname "$0")
+if [[ $1 == ps ]]; then printf 'stub-box\n'; exit 0; fi
+since=''; prev=''
+for a in "$@"; do [[ $prev == --since ]] && since=$a; prev=$a; done
+printf '%s\n' "$*" >"$self/logs_args"
+# mô phỏng docker: ts không có TZ (mất Z) -> daemon đọc lệch múi -> 0 dòng
+[[ $since == 2026-10-26T08:50:09Z ]] || exit 0
+[[ $since < 2026-10-26T08:57:30Z ]] && \
+  printf '%s\n' '2026-10-26T08:57:30.831151265Z 1.2.3.4 - - [x] "GET /fresh HTTP/1.1" 200 1 "-" "php2shell-fresh"'
+DSTUB3
+chmod +x "$dstub3/docker"
+mkdir -p "$w4/projects/test-project/devices/test-device/state"
+printf 'stub-box\t2026-10-26T08:50:09.123456789Z\t1\n' \
+  >"$w4/projects/test-project/devices/test-device/state/docker_cursors.tsv"
+: >"$dstub3/logs_args"
+out5=$(env PATH="$dstub3:$PATH" WORKDIR="$w4" DOCKER_LOG_DIR="$w4/no-dkr" \
+         bash "$w4/plugins/docker_logs.sh")
+T "docker: --since từ cursor giữ hậu tố Z" "since 2026-10-26T08:50:09Z" "$(cat "$dstub3/logs_args")"
+T "docker: dòng mới sau cursor được emit" "php2shell-fresh" \
+  "$(printf '%s\n' "$out5" | awk -F'\t' 'NF==12 && $2=="access_log"{print $9}')"
+
 # "min" phải nằm TRONG match: đặt lệch ra ngoài (P2S-052/055 cũ) thì jsonl.awk
 # đọc match.min rỗng -> min=1, ngưỡng kìm lặng lẽ biến mất — rule ồn ào vô điều kiện.
 awk -f "$SRC/lib/jsonl.awk" rules="$w4/rules_parsed.tsv" ands="$w4/ands_parsed.tsv" \

@@ -107,7 +107,11 @@ if (( ! found_json )); then
       [[ $cur_ts == 0 ]] && cur_ts=''
     fi
     # --since nhận RFC3339 tới giây; phần lẻ nano do bộ lọc dưới đây xử lý.
+    # PHẢI giữ hậu tố Z: cắt nano bằng %%.* làm mất Z, daemon docker đọc ts
+    # không-Z theo múi khác và trả 0 dòng — mọi batch sau đó "im lặng" dù
+    # container có log mới (thực nghiệm: không Z = 0 dòng, có Z = 1 dòng).
     since=${cur_ts:+${cur_ts%%.*}}
+    [[ -n $since && $since != *Z ]] && since+=Z
     since=${since:-${DOCKER_LOG_SINCE:-10m}}
 
     new_ts=$cur_ts
