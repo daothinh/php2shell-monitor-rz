@@ -38,21 +38,92 @@ for f in "$WORKDIR"/conf.default/*.conf; do
 done
 [[ -d "$WORKDIR/conf/rules.d" ]] || (umask 077 && mkdir -p -- "$WORKDIR/conf/rules.d")
 
+# Dừng mọi tiến trình của bản cài CŨ trước khi thay code.
+#
+# makeself giải nén đè lên thư mục cài nhưng không đụng tới process đang chạy.
+# Supervisor/agent cũ sống tiếp với cwd trỏ vào inode đã bị xoá
+# ("/opt/php2shell-monitor (deleted)"): chúng vẫn quay vòng batch, vẫn ghi alert
+# và vẫn forward lên server bằng CODE CŨ, song song với bản mới. Trên lab đã thấy
+# đúng 2 cặp supervisor+agent cùng chạy, và các batch do bản cũ sinh ra không hề
+# xuất hiện trong log của bản mới — nhìn bên ngoài chỉ thấy severity nhảy lộn xộn.
+# Chúng còn giữ flock trên inode đã xoá, nên lock của bản mới không hề chặn được.
+p2s_kill_stale() {
+  local pid cmd _pat
+  # Pattern phải khớp ĐƯỜNG DẪN THẬT: "engine/supervisor.sh", không phải
+  # "engine.sh". pgrep -f chạy ERE trên toàn cmdline.
+  _pat="$WORKDIR/(engine|plugins|discovery)/[a-z_]+\.sh|$WORKDIR/main\.sh"
+  for pid in $(pgrep -f "$_pat" 2>/dev/null); do
+    [[ $pid == "$$" ]] && continue
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+    # chỉ kill process thuộc bản cài này, không đụng process khác trên host
+    [[ $cmd == *"$WORKDIR"* ]] || continue
+    kill -TERM "$pid" 2>/dev/null || continue
+  done
+  # cho chúng thoát êm, rồi cưỡng bức nếu còn cứng đầu
+  local _wait
+  for _wait in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -f "$_pat" >/dev/null 2>&1 || break
+    sleep 0.3
+  done
+  for pid in $(pgrep -f "$_pat" 2>/dev/null); do
+    [[ $pid == "$$" ]] && continue
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+    [[ $cmd == *"$WORKDIR"* ]] || continue
+    kill -KILL "$pid" 2>/dev/null
+  done
+  return 0
+}
+p2s_kill_stale
+
 # Upgrade: the payload is unpacked over the previous install, so files that the
 # new version dropped would linger and keep running. MANIFEST lists everything
 # the build shipped; delete anything else under the CODE trees. conf/ and
 # projects/ are operator data, and export/ holds the exported alerts, so none of
 # them is ever pruned.
+#
+# LC_ALL=C phải áp cho CẢ sort VÀ comm. Trước đây chỉ sort có LC_ALL=C còn comm
+# chạy theo locale của máy: hai bên sắp xếp khác nhau ("lib/json.sh" đứng trước
+# "lib/jsonl.awk" ở C, nhưng sau ở en_US.UTF-8), comm thấy input "not in sorted
+# order" rồi trả về danh sách rác. Hậu quả: bootstrap xoá gần hết code vừa giải
+# nén và main.sh chết với "No such file or directory". Toàn bộ khối này chạy
+# trong một subshell có LC_ALL=C nên không thể lệch lại lần nữa.
 if [[ -s $WORKDIR/MANIFEST ]]; then
-  (cd -- "$WORKDIR" && find lib engine plugins rules discovery third_party conf.default \
-    -type f 2>/dev/null) | LC_ALL=C sort >"$WORKDIR/.present"
-  LC_ALL=C sort "$WORKDIR/MANIFEST" >"$WORKDIR/.manifest"
-  comm -23 "$WORKDIR/.present" "$WORKDIR/.manifest" >"$WORKDIR/.stale"
-  while IFS= read -r rel; do
-    [[ -n $rel ]] || continue
-    rm -f -- "$WORKDIR/$rel"
-  done <"$WORKDIR/.stale"
-  rm -f -- "$WORKDIR/.present" "$WORKDIR/.manifest" "$WORKDIR/.stale"
+  (
+    LC_ALL=C
+    export LC_ALL
+    cd -- "$WORKDIR" || exit 1
+    find lib engine plugins rules discovery third_party conf.default \
+      -type f 2>/dev/null | LC_ALL=C sort >.present
+    LC_ALL=C sort MANIFEST >.manifest
+
+    # Chốt chặn: MANIFEST phải là superset của những gì đang có. Nếu không,
+    # phép trừ là vô nghĩa (comm lỗi thứ tự, MANIFEST hỏng, payload thiếu) và
+    # xoá tiếp sẽ phá bản cài. Bỏ qua việc prune còn hơn để lại file cũ.
+    if ! LC_ALL=C comm -13 .present .manifest >/dev/null 2>&1; then
+      rm -f -- .present .manifest
+      exit 0
+    fi
+    LC_ALL=C comm -23 .present .manifest >.stale 2>/dev/null || : >.stale
+
+    # Lưới an toàn cuối: danh sách "cần xoá" không được vượt quá nửa số file
+    # đang có. Vượt ngưỡng đó gần như chắc chắn là lỗi tính toán, không phải
+    # một bản nâng cấp bình thường.
+    n_present=$(wc -l <.present)
+    n_stale=$(wc -l <.stale)
+    if (( n_present > 0 && n_stale * 2 > n_present )); then
+      rm -f -- .present .manifest .stale
+      exit 0
+    fi
+
+    while IFS= read -r rel; do
+      [[ -n $rel ]] || continue
+      case $rel in
+        /*|*..*) continue ;;   # không bao giờ xoá ngoài WORKDIR
+      esac
+      rm -f -- "$WORKDIR/$rel"
+    done <.stale
+    rm -f -- .present .manifest .stale
+  )
 fi
 
 # Everything below the install dir holds raw log lines (IPs, URIs, request

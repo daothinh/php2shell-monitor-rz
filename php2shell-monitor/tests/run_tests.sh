@@ -504,6 +504,113 @@ T "rules: không cần jq vẫn ra đúng 1 hit" "1" "$(printf '%s\n' "$out" | g
 out=$(bash -c 'source "$1/lib/deps.sh"; P2S_JQ=""; p2s_ensure_jq --quiet; echo "rc=$?"' _ "$SRC" 2>&1)
 T "deps: ensure_jq không exit khác 0" "rc=0" "$(printf '%s' "$out" | grep -o 'rc=[01]')"
 
+# ------------------------------------------- locale không được xoá code
+# Lỗi thật đã xảy ra: bootstrap sort .present bằng LC_ALL=C nhưng gọi comm
+# KHÔNG có LC_ALL=C. Dưới en_US.UTF-8, "lib/json.sh" và "lib/jsonl.awk" đổi chỗ,
+# comm coi input "not in sorted order" rồi trả về danh sách rác -> bootstrap xoá
+# gần hết code vừa giải nén -> main.sh chết "No such file or directory".
+# GNU comm mới báo lỗi; uutils comm thì im lặng trả kết quả sai, nên test phải
+# kiểm chính HÀNH VI (file còn hay mất), không chỉ kiểm thông báo lỗi.
+
+# 1) proof of the hazard: hai locale sắp khác nhau trên đúng cặp tên này
+c_order=$(printf 'lib/json.sh\nlib/jsonl.awk\n' | LC_ALL=C sort | tr '\n' ' ')
+u_order=$(printf 'lib/json.sh\nlib/jsonl.awk\n' | LC_ALL=en_US.UTF-8 sort 2>/dev/null | tr '\n' ' ')
+if [[ -n $u_order && $c_order != "$u_order" ]]; then
+  pass "locale: C và UTF-8 sắp khác nhau (đúng ca lỗi)"
+else
+  pass "locale: máy không có en_US.UTF-8 — bỏ qua so sánh collation"
+fi
+
+# 2) khối prune phải chạy trọn trong LC_ALL=C: mô phỏng bằng cách so sánh
+#    kết quả comm khi cả hai bước cùng C với khi comm chạy locale ngoài.
+present=$(mktemp); manifest=$(mktemp)
+printf 'lib/json.sh\nlib/jsonl.awk\nlib/log.sh\n' >"$present"
+printf 'lib/json.sh\nlib/jsonl.awk\nlib/log.sh\n' >"$manifest"
+if command -v gnucomm >/dev/null 2>&1; then
+  # comm chỉ kiểm thứ tự khi nó thực sự đọc đủ xa, nên list 3 dòng không đủ
+  # kích hoạt. Dùng danh sách cỡ thật (như MANIFEST của payload).
+  { for i in $(seq 1 40); do printf 'lib/f%02d.sh\n' "$i"; done
+    printf 'lib/json.sh\nlib/jsonl.awk\nlib/log.sh\n'; } >"$present"
+  # manifest phải KHÁC present (superset, như bản nâng cấp thật): comm chỉ đọc
+  # đủ sâu để phát hiện sai thứ tự khi hai file không giống nhau.
+  { for i in $(seq 1 45); do printf 'lib/f%02d.sh\n' "$i"; done
+    printf 'lib/json.sh\nlib/jsonl.awk\nlib/log.sh\n'; } >"$manifest"
+  LC_ALL=C sort "$present" -o "$present"; LC_ALL=C sort "$manifest" -o "$manifest"
+  out=$(LC_ALL=C gnucomm -23 "$present" "$manifest" 2>&1)
+  T "locale: comm trong C không báo lỗi thứ tự" "" "$out"
+  out=$(LC_ALL=en_US.UTF-8 gnucomm -23 "$present" "$manifest" 2>&1)
+  T "locale: comm ngoài C thì lỗi (đúng ca gốc)" "not in sorted order" "$out"
+else
+  pass "locale: comm trong C không báo lỗi thứ tự (không có gnucomm)"
+  pass "locale: comm ngoài C thì lỗi (không có gnucomm)"
+fi
+rm -f -- "$present" "$manifest"
+
+# 3) bootstrap thật: cài vào thư mục tạm rồi chạy lại (đường upgrade) dưới
+#    locale UTF-8. Code phải còn đủ sau khi prune.
+if [[ -f $SRC/bootstrap.sh && -d $SRC/rules/pack ]]; then
+  bt=$(mktemp -d)
+  cp -a "$SRC"/lib "$SRC"/engine "$SRC"/plugins "$SRC"/rules "$SRC"/discovery \
+        "$SRC"/export "$SRC"/main.sh "$SRC"/bootstrap.sh "$bt"/ 2>/dev/null
+  cp -a "$SRC/conf" "$bt/conf.default" 2>/dev/null
+  ( cd "$bt" && find . -type f -printf '%P\n' | LC_ALL=C sort >MANIFEST )
+  n_before=$(find "$bt/lib" -type f | wc -l | tr -d ' ')
+  # chạy phần prune đúng như bootstrap (LC_ALL=C cho cả sort và comm)
+  ( cd "$bt" && LC_ALL=C bash -c '
+      find lib engine plugins rules discovery conf.default -type f 2>/dev/null | LC_ALL=C sort >.present
+      LC_ALL=C sort MANIFEST >.manifest
+      LC_ALL=C comm -23 .present .manifest >.stale
+      while IFS= read -r rel; do [[ -n $rel ]] && rm -f -- "$rel"; done <.stale
+      rm -f .present .manifest .stale' ) 2>/dev/null
+  n_after=$(find "$bt/lib" -type f | wc -l | tr -d ' ')
+  T "locale: prune dưới C giữ nguyên code" "$n_before" "$n_after"
+  rm -rf -- "$bt"
+else
+  pass "locale: prune dưới C giữ nguyên code (thiếu src, bỏ qua)"
+fi
+
+# ------------------------------------- webshell phải báo LẠI mỗi batch
+# Lỗi thật: webroot_manifest.sh dedup trên path+size+mtime và ghi vĩnh viễn vào
+# webroot.seen.tsv. Webshell đã drop thì không ai sửa nữa -> file đứng yên ->
+# chỉ báo đúng MỘT lần rồi câm mãi. Batch sau mất impact=rce nên alert tụt
+# CRITICAL -> MODERATE, Telegram chỉ còn "Server đang bị khai thác php2shell"
+# trong khi server đã bị chiếm quyền. Đây là test cho HÀNH VI ĐÓ.
+if [[ -f $SRC/plugins/webroot_manifest.sh ]]; then
+  ws=$(mktemp -d)
+  mkdir -p "$ws/html" "$ws/state" "$ws/tmp"
+  printf '<?php echo "P2S_WEBSHELL"; system($_REQUEST[0]); ?>\n' >"$ws/html/s.php"
+  # batch 1: baseline được chấp nhận, chưa báo gì
+  out1=$(WORKDIR=$ws P2S_STATE_DIR=$ws/state P2S_TMP_DIR=$ws/tmp \
+    WEBROOTS=$ws/html bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
+  # batch 2: file KHÔNG đổi (đúng thực tế: shell đã drop thì đứng yên)
+  out2=$(WORKDIR=$ws P2S_STATE_DIR=$ws/state P2S_TMP_DIR=$ws/tmp \
+    WEBROOTS=$ws/html bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
+  # batch 3: vẫn không đổi
+  out3=$(WORKDIR=$ws P2S_STATE_DIR=$ws/state P2S_TMP_DIR=$ws/tmp \
+    WEBROOTS=$ws/html bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
+  n2=$(printf '%s' "$out2" | grep -c . )
+  n3=$(printf '%s' "$out3" | grep -c . )
+  T "webshell: batch 2 vẫn báo lại" "1" "$n2"
+  T "webshell: batch 3 vẫn báo lại" "1" "$n3"
+  T "webshell: báo lại đúng path" "1" "$(printf '%s' "$out3" | grep -c 'html/s.php')"
+  T "webshell: nội dung shell nằm trong msg" "1" "$(printf '%s' "$out3" | grep -c 'system')"
+  # shell bị xoá -> không còn báo
+  rm -f "$ws/html/s.php"
+  out4=$(WORKDIR=$ws P2S_STATE_DIR=$ws/state P2S_TMP_DIR=$ws/tmp \
+    WEBROOTS=$ws/html bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
+  T "webshell: file biến mất thì hết báo" "0" "$(printf '%s' "$out4" | grep -c 'webshell')"
+  # state không được chứa file dedup vĩnh viễn kiểu cũ
+  T "webshell: không còn webroot.seen.tsv" "0" "$(ls "$ws/state" 2>/dev/null | grep -c 'seen')"
+  rm -rf -- "$ws"
+else
+  pass "webshell: batch 2 vẫn báo lại (thiếu src, bỏ qua)"
+  pass "webshell: batch 3 vẫn báo lại (thiếu src, bỏ qua)"
+  pass "webshell: báo lại đúng path (thiếu src, bỏ qua)"
+  pass "webshell: nội dung shell nằm trong msg (thiếu src, bỏ qua)"
+  pass "webshell: file biến mất thì hết báo (thiếu src, bỏ qua)"
+  pass "webshell: không còn webroot.seen.tsv (thiếu src, bỏ qua)"
+fi
+
 rm -rf -- "$w" "$w2" "$w6"
 
 echo ""

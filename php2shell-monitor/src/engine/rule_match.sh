@@ -82,12 +82,18 @@ _source_hits() { # <csv> <out>
 }
 
 # Intersect two newline-separated line-number files in place.
-# comm compares byte order, so both inputs must be sorted the same way (LC_ALL=C,
-# lexicographic) — numeric sort would break comm for >=10 lines.
+# comm so sánh theo thứ tự byte, nên hai input phải được sort CÙNG một cách.
+# LC_ALL=C phải áp cho cả sort lẫn comm — nếu chỉ sort có mà comm chạy theo
+# locale máy, comm coi input là "not in sorted order" và trả kết quả rỗng, làm
+# mọi rule im lặng. Numeric sort cũng sẽ phá comm khi có >=10 dòng.
 _intersect() { # <base> <other>
-  LC_ALL=C sort -u "$1" -o "$1"
-  LC_ALL=C sort -u "$2" -o "$2"
-  comm -12 "$1" "$2" >"$TMP/i" && mv -f -- "$TMP/i" "$1"
+  (
+    LC_ALL=C
+    export LC_ALL
+    sort -u "$1" -o "$1"
+    sort -u "$2" -o "$2"
+    comm -12 "$1" "$2" >"$TMP/i" && mv -f -- "$TMP/i" "$1"
+  )
 }
 
 _hit_count() { wc -l <"$1" | tr -d ' '; }

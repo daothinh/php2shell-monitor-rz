@@ -11,7 +11,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 plugin_name=webroot
 export plugin_name
 MANIFEST=$P2S_STATE_DIR/webroot.manifest.tsv
-SEEN=$P2S_STATE_DIR/webroot.seen.tsv
+# Danh sách webshell đang thực sự nằm trên đĩa (path + đoạn code khớp).
+# KHÔNG phải dedup: mỗi batch quét lại và báo lại chừng nào file còn đó.
+SHELLS=$P2S_STATE_DIR/webroot.shells.tsv
+SHELLS_NOW=$P2S_STATE_DIR/webroot.shells.now.$$
 
 webroot_dirs() {
   local -a out=()
@@ -78,6 +81,15 @@ done <"$tmp"
 # never "NEW", so a diff-only plugin stays blind to it forever. Scan the code
 # itself every batch and report the CODE, not just the path, so the analyst
 # sees what the shell does without opening the file.
+#
+# Báo lại MỖI batch chừng nào file còn đó. Trước đây khối này dedup trên
+# path+size+mtime và ghi vĩnh viễn vào webroot.seen.tsv: một shell đứng yên
+# (webshell đã drop thì không ai sửa nữa) chỉ báo đúng một lần rồi câm mãi.
+# Hậu quả thực tế: batch sau mất impact=rce nên alert tụt từ CRITICAL xuống
+# MODERATE, và Telegram chỉ còn "Server đang bị khai thác php2shell" trong khi
+# server đã bị chiếm quyền. Trạng thái "đang có shell" là sự thật của batch
+# hiện tại, không phải sự kiện một lần — nó phải tồn tại cùng file.
+: >"$SHELLS_NOW"
 while IFS=$'\t' read -r path _sz _mt _own; do
   [[ -n $path ]] || continue
   [[ $path == *.user.ini || $path == */.htaccess ]] && continue
@@ -87,14 +99,16 @@ while IFS=$'\t' read -r path _sz _mt _own; do
     '(system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec|assert|eval|create_function|call_user_func(_array)?|preg_replace)[[:space:]]*\([^)]*\$_(REQUEST|GET|POST|COOKIE|SERVER|FILES)' \
     | head -1)
   [[ -n $hit ]] || continue
-  # De-dup on path+size+mtime: an unchanged shell must not re-alert every batch.
-  sig="$path\t$_sz\t$_mt"
-  grep -qxF -- "$sig" "$SEEN" 2>/dev/null && continue
-  printf '%s\n' "$sig" >>"$SEEN"
+  printf '%s\t%s\n' "$path" "$hit" >>"$SHELLS_NOW"
   P2S_TS=$(utc_now); export P2S_TS
   emit_record webroot "$path" 0 "" "" "" "" "" "" \
     "webroot webshell pattern: $path contains '$hit'" "-"
 done <"$tmp"
+
+# webroot.shells.tsv = ảnh chụp các shell của batch này. File biến mất thì
+# dòng cũng biến mất, nên không có dedup nào sống lâu hơn sự thật trên đĩa.
+sort -u "$SHELLS_NOW" >"$SHELLS" 2>/dev/null || : >"$SHELLS"
+rm -f -- "$SHELLS_NOW"
 
 
 { printf '# path\tsize\tmtime\towner\n'; sort -u "$tmp"; } >"$MANIFEST.tmp.$$" &&
