@@ -146,6 +146,21 @@ T "alert: device carried"              "test-device"  "$(jq -r '.device' "$alert
 T "alert: evidence file written"       "20261024T000000Z.jsonl" "$(jq -r '.evidence_file' "$alert")"
 T "evidence: one record per hit"       "3" "$(wc -l <"$w/projects/test-project/devices/test-device/evidence/20261024T000000Z.jsonl" | tr -d ' ')"
 
+# containers[]: hit từ docker:/container: nói rõ container nào gây alert —
+# operator phân biệt alert host và alert container ngay trên tin nhắn.
+hits2="$w/hits2.tsv"
+printf '%s\n' \
+  $'2026-10-24T00:00:01Z\taccess_log\tdocker:php-web\t7\t1.2.3.4\tGET\t/up.php?PHP_SESSION_UPLOAD_PROGRESS=x\t200\tphp2shell-109618\t\tGET /up.php\tP2S-008\tHIGH\t' \
+  $'2026-10-24T00:00:02Z\taccess_log\tdocker:php-web\t8\t1.2.3.4\tGET\t/s.php?p=../../../etc/passwd\t200\tcurl\t\tGET /s.php\tP2S-052\tHIGH\t' \
+  $'2026-10-24T00:00:03Z\taccess_log\tcontainer:db-1:/var/log/nginx/access.log\t2\t1.2.3.4\tGET\t/x\t200\tcurl\t\tGET /x\tP2S-030\tHIGH\t' \
+  >"$hits2"
+report "$w" "$hits2" "20261024T010000Z"
+alert2=$(tail -1 "$alert")
+T "containers: gom docker: + container: (dedup)" "php-web,db-1" \
+  "$(jq -r '[.containers[]]|join(",")' <<<"$alert2")"
+# batch trước không có container nào -> mảng rỗng
+T "containers: alert host thi rong" "[]" "$(head -1 "$alert" | jq -c '.containers')"
+
 # ------------------------------------------- severity tiers (impact-driven)
 # CRITICAL chỉ khi có bằng chứng RCE; nếu không thì chia theo số event.
 _tier() { # <số event> <có rce?>

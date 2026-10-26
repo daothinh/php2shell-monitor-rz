@@ -117,27 +117,25 @@ def _headline(alert: dict) -> str:
         return "Dấu hiệu dò quét php2shell"
     return "Server đang bị khai thác php2shell"
 def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
-    """One batch alert -> one detailed Telegram message.
+    """One batch alert -> one compact Telegram message (khung cố định).
 
     🛡 CENTRAL SECURITY ALERT · 📅 thời điểm gửi
     🚨 Mức độ · ⚠️ Sự kiện · 📊 Tổng số Events
-    🧩 Rule ×số hit · ⏱ cửa sổ sự kiện · 🔖 batch id
     📦 Dự án · 🖥 Môi trường/OS · 👤 User · 🏷 Hostname · 🌐 IP LAN
-    🔎 3 dòng evidence mẫu (raw, kèm IP khi có)
+    (+ 🐳 Container — chỉ khi alert sinh từ log/artifact của container,
+    để phân biệt alert của host và của container nào)
 
-    Full evidence (every raw hit with file:line) stays on the server
-    (`GET /api/v1/alerts/<id>`) and in the evidence mirror — tin nhắn chỉ mang
-    đủ để nhận mặt tấn công, không quá giới hạn 4096 ký tự của Telegram.
+    Rule chi tiết, cửa sổ sự kiện, batch id và toàn bộ evidence nằm trên
+    server (`GET /api/v1/alerts/<id>`) và evidence mirror — tin nhắn giữ
+    đúng khung cố định theo yêu cầu operator.
     """
     esc = html.escape
     sev = _sev(alert)
-    emoji = _SEV_EMOJI[sev]
 
     when = (_parse_ts(alert.get("ts_utc") or alert.get("ts") or alert.get("window_end"))
             or datetime.now(tz)).astimezone(tz)
 
-    hits = alert.get("evidence") or []
-    total = int(alert.get("hits") or len(hits))
+    total = int(alert.get("hits") or len(alert.get("evidence") or []))
     what = esc(_headline(alert))
 
     # "User" is the OS account the monitor runs as — the account that would own
@@ -157,64 +155,21 @@ def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
         f"🚨 <b>Mức độ:</b> <code>{esc(sev)}</code>",
         f"⚠️ <b>Sự kiện:</b> {what}",
         f"📊 <b>Tổng số Events:</b> <code>{total}</code>",
-    ]
-
-    # Rule breakdown từ counter — kể cả khi evidence[] đã bị cắt inline
-    rules = [(str(r.get("rule_id") or ""), int(r.get("hits") or 0))
-             for r in (alert.get("rules") or []) if isinstance(r, dict) and r.get("rule_id")]
-    if not rules:  # payload legacy không có counters: gom từ evidence
-        seen: dict[str, int] = {}
-        for h in hits:
-            for rid in _split_ids((h or {}).get("rule_id")):
-                seen[rid] = seen.get(rid, 0) + 1
-        rules = sorted(seen.items(), key=lambda x: (-x[1], x[0]))
-    if rules:
-        rules.sort(key=lambda x: (-x[1], x[0]))
-        parts = [f"<code>{esc(rid)}</code> ×{n}" for rid, n in rules[:6]]
-        if len(rules) > 6:
-            parts.append(f"+{len(rules) - 6} rule khác")
-        lines.append(f"🧩 <b>Rule:</b> " + " · ".join(parts))
-
-    ws = _parse_ts(alert.get("window_start"))
-    we = _parse_ts(alert.get("window_end"))
-    if ws and we:
-        ws, we = ws.astimezone(tz), we.astimezone(tz)
-        span = f"{ws:%H:%M} → {we:%H:%M}" if ws.date() == we.date() \
-            else f"{ws:%d/%m %H:%M} → {we:%d/%m %H:%M}"
-        lines.append(f"⏱ <b>Thời gian sự kiện:</b> {span}")
-
-    batch = str(alert.get("batch_id") or "")[:40]
-    if batch:
-        lines.append(f"🔖 <b>Batch:</b> <code>{esc(batch)}</code>")
-
-    lines += [
         "",
         f"📦 <b>Dự án:</b> <code>{esc(project_name[:64])}</code>",
         f"🖥 <b>Môi trường / OS:</b> <b>[{esc(env)}]</b> <code>{esc(os_name)}</code>",
         f"👤 <b>User:</b> <code>{esc(user)}</code>",
         f"🏷 <b>Hostname:</b> <code>{esc(hostname)}</code>",
-        f"🌐 <b>IP LAN:</b> <code>{esc(lan_ip)}</code>",
     ]
 
-    # 3 dòng evidence đầu: đủ nhận mặt tấn công ngay trên chat
-    samples: list[str] = []
-    for h in hits:
-        if not isinstance(h, dict):
-            continue
-        raw = str(h.get("raw") or h.get("msg") or "").strip()
-        if not raw:
-            continue
-        src = str(h.get("ip") or "").strip()
-        sample = f"{src} {raw}" if src and not raw.startswith(src) else raw
-        if len(sample) > 110:
-            sample = sample[:107] + "..."
-        samples.append(sample)
-        if len(samples) >= 3:
-            break
-    if samples:
-        lines += ["", "🔎 <b>Mẫu evidence:</b>"]
-        lines += [f"<code>{esc(s)}</code>" for s in samples]
+    # Container nguồn của alert (monitor aggregate từ field file của từng hit:
+    # docker:<tên> / container:<tên>) — không có nghĩa alert từ chính host.
+    containers = [str(c).strip()[:64] for c in (alert.get("containers") or [])
+                  if str(c).strip()][:5]
+    if containers:
+        lines.append(f"🐳 <b>Container:</b> <code>{esc(', '.join(containers))}</code>")
 
+    lines.append(f"🌐 <b>IP LAN:</b> <code>{esc(lan_ip)}</code>")
     return "\n".join(lines)
 
 

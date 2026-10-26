@@ -749,6 +749,8 @@ def test_merged_rule_id_still_detects_rce():
 
 
 def test_format_alert_matches_template():
+    """Khung cố định 12 dòng theo yêu cầu operator — KHÔNG rule breakdown,
+    window, batch, mẫu evidence (chi tiết nằm trên server)."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
     from app.telegram import format_alert
@@ -770,45 +772,50 @@ def test_format_alert_matches_template():
     }
     msg = format_alert("prod-shop", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
     lines = msg.split("\n")
-    assert lines[0] == "🛡 <b>CENTRAL SECURITY ALERT</b>"
-    assert lines[1] == "📅 <i>25/10/2026 - 23:50</i>"
-    assert "🚨 <b>Mức độ:</b> <code>MODERATE</code>" in msg
-    assert "⚠️ <b>Sự kiện:</b> Server đang bị khai thác php2shell" in msg
-    assert "📊 <b>Tổng số Events:</b> <code>6740</code>" in msg
-    # rule breakdown sắp theo số hit giảm dần
-    assert "🧩 <b>Rule:</b> <code>P2S-050</code> ×4211 · <code>P2S-017</code> ×2529" in msg
-    # cửa sổ sự kiện theo giờ địa phương
-    assert "⏱ <b>Thời gian sự kiện:</b> 23:45 → 23:50" in msg
-    assert "🔖 <b>Batch:</b> <code>20261025T165000Z</code>" in msg
-    assert "📦 <b>Dự án:</b> <code>prod-shop</code>" in msg
-    assert ("🖥 <b>Môi trường / OS:</b> <b>[Docker Container]</b> "
-            "<code>Ubuntu 24.04.1 LTS (Docker)</code>") in msg
-    assert "👤 <b>User:</b> <code>www-data</code>" in msg
-    assert "🏷 <b>Hostname:</b> <code>ip-10-0-1-5</code>" in msg
-    assert "🌐 <b>IP LAN:</b> <code>10.0.1.5</code>" in msg
-    # evidence mẫu kèm IP của kẻ tấn công
-    assert ("🔎 <b>Mẫu evidence:</b>" in msg
-            and "203.0.113.42 GET /page.php?file=/var/lib/php/sessions/" in msg)
-    # không vượt giới hạn Telegram
+    assert lines == [
+        "🛡 <b>CENTRAL SECURITY ALERT</b>",
+        "📅 <i>25/10/2026 - 23:50</i>",
+        "",
+        "🚨 <b>Mức độ:</b> <code>MODERATE</code>",
+        "⚠️ <b>Sự kiện:</b> Server đang bị khai thác php2shell",
+        "📊 <b>Tổng số Events:</b> <code>6740</code>",
+        "",
+        "📦 <b>Dự án:</b> <code>prod-shop</code>",
+        "🖥 <b>Môi trường / OS:</b> <b>[Docker Container]</b> <code>Ubuntu 24.04.1 LTS (Docker)</code>",
+        "👤 <b>User:</b> <code>www-data</code>",
+        "🏷 <b>Hostname:</b> <code>ip-10-0-1-5</code>",
+        "🌐 <b>IP LAN:</b> <code>10.0.1.5</code>",
+    ]
+    # các thành phần đã bỏ theo yêu cầu: không xuất hiện trở lại
+    for gone in ("🧩", "⏱", "🔖", "🔎", "P2S-050", "23:45", "20261025T165000Z"):
+        assert gone not in msg, gone
     assert len(msg) <= 4096
 
 
-def test_format_alert_truncates_long_evidence_and_caps_rules():
+def test_format_alert_container_line():
+    """Alert sinh từ log container phải có dòng 🐳 Container (tên container),
+    nằm giữa Hostname và IP LAN; alert của host thì KHÔNG có dòng này."""
     from zoneinfo import ZoneInfo
     from app.telegram import format_alert
 
-    alert = {
-        "severity": "HIGH", "hits": 999,
-        "rules": [{"rule_id": f"P2S-{i:03d}", "hits": 10 - i} for i in range(9)],
-        "evidence": [{"rule_id": "P2S-001", "ip": "1.2.3.4",
-                      "raw": "x" * 500}] * 5,
-        "ts_utc": "2026-10-25T16:50:00Z",
-    }
-    msg = format_alert("p", alert, ZoneInfo("UTC"))
-    assert "+3 rule khác" in msg               # chỉ liệt kê 6 rule đầu
-    sample_lines = [ln for ln in msg.split("\n") if ln.startswith("<code>")]
-    assert len(sample_lines) <= 3              # tối đa 3 mẫu evidence
-    assert all(len(ln) <= 130 for ln in sample_lines)  # mỗi mẫu bị cắt ngắn
+    base = {"severity": "HIGH", "hits": 4, "host": "egghead", "user": "root",
+            "hostname": "egghead", "lan_ip": "192.168.22.191",
+            "os": "Ubuntu 26.04.1 LTS", "env": "Host",
+            "ts_utc": "2026-10-26T08:16:00Z"}
+    msg = format_alert("lab-group", dict(base, containers=["php-web", "db-1"]),
+                       ZoneInfo("Asia/Ho_Chi_Minh"))
+    lines = msg.split("\n")
+    assert "🐳 <b>Container:</b> <code>php-web, db-1</code>" in lines
+    assert lines.index("🐳 <b>Container:</b> <code>php-web, db-1</code>") == \
+        lines.index("🏷 <b>Hostname:</b> <code>egghead</code>") + 1
+    assert lines[-1] == "🌐 <b>IP LAN:</b> <code>192.168.22.191</code>"
+
+    host_only = format_alert("lab-group", base, ZoneInfo("Asia/Ho_Chi_Minh"))
+    assert "🐳" not in host_only
+    # quá 5 container thì server vẫn kìm ở 5 (monitor đã cap từ trước)
+    many = format_alert("p", dict(base, containers=[f"c{i}" for i in range(9)]),
+                        ZoneInfo("UTC"))
+    assert many.count(", ") <= 4
 
 
 def test_format_alert_critical_uses_rce_headline():

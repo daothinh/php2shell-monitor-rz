@@ -90,6 +90,37 @@ _sev_counts_json() {
   printf '%s]' "$out"
 }
 
+# ------------------------------------------------- 2b. container gây alert
+# Alert sinh từ log/artifact của container phải nói rõ container nào:
+# docker:<tên>   — json log stdout (plugin docker_logs)
+# container:<tên>[:/path] — access log/webroot BÊN TRONG container
+# Operator đọc tin nhắn phân biệt ngay alert của host và của container nào.
+# Evidence là JSONL: quét bằng awk một lượt (batch lớn vẫn nhanh), tối đa 5 tên.
+_containers_json() {
+  [[ -s $EVIDENCE ]] || { printf '[]'; return; }
+  awk '
+    {
+      s = $0
+      p = index(s, "\"file\":\"docker:")
+      if (p > 0) f = substr(s, p + 15)
+      else {
+        p = index(s, "\"file\":\"container:")
+        if (p > 0) f = substr(s, p + 18)
+        else next
+      }
+      q = index(f, "\""); if (q > 0) f = substr(f, 1, q - 1)
+      c = index(f, ":");  if (c > 0) f = substr(f, 1, c - 1)
+      if (f != "" && !(f in seen)) { seen[f] = 1; order[++n] = f }
+    }
+    END {
+      printf "["
+      m = (n < 5 ? n : 5)
+      for (j = 1; j <= m; j++) printf "%s\"%s\"", (j > 1 ? "," : ""), order[j]
+      printf "]"
+    }
+  ' "$EVIDENCE"
+}
+
 # ------------------------------------------------- 3. evidence travels out-of-band
 # The alert line stays small and metadata-only. Embedding the full set inline
 # made one queue line 148 MB for a 300k-hit batch: mapfile held it in bash
@@ -113,6 +144,7 @@ alert=$(json_obj \
   "device" "$(json_str "$DEVICE")" \
   "host" "$(json_str "$DEVICE")" \
   "hostname" "$(json_str "$_host")" \
+  "containers" "$(_containers_json)" \
   "window_start" "$(json_str "$(epoch_to_utc "${WINDOW_START:-0}" 2>/dev/null || utc_now)")" \
   "window_end" "$(json_str "$(epoch_to_utc "$WINDOW_END")")" \
   "severity" "$(json_str "$top_sev")" \
