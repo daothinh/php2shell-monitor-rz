@@ -24,7 +24,9 @@ trong `MANIFEST` bị xoá. Không tạo cron/systemd/file ngoài thư mục nà
 
 1. plugin đọc phần log mới từ offset đã lưu (`state/offsets.tsv`, theo inode + byte + số dòng);
 2. rule pack khớp trên từng field;
-3. **tối đa một alert** — severity cao nhất, kèm mọi dòng log gốc;
+3. **tối đa một alert** — severity: có `impact=rce` thì CRITICAL (một event cũng
+   đủ), còn lại theo số lượng (`>= CRIT_THRESHOLD` là MODERATE), kèm mọi dòng
+   log gốc;
 4. lưu offset, ghi `run/batches.log`.
 
 Không có batch nào bị bỏ: nếu một batch đang chạy, batch sau thấy lock và thoát

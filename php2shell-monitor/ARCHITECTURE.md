@@ -9,7 +9,9 @@
 
 1. **Read-only trên host**: chỉ đọc log; mọi ghi nằm dưới `/opt/php2shell-monitor`
    (`$WORKDIR`), là thư mục duy nhất tool tạo ra trên hệ thống.
-2. **Một alert mỗi batch**, severity = mức cao nhất trong batch. Không dedup,
+2. **Một alert mỗi batch**, severity = phát biểu về server: batch có `impact=rce`
+   thì CRITICAL (một event cũng đủ), còn lại chia theo số lượng
+   (`>= CRIT_THRESHOLD` là MODERATE, dưới ngưỡng là INFO). Không dedup,
    không correlation, không scoring — người đọc nhận đúng một thông báo và
    toàn bộ bằng chứng trong đó.
 3. **Bằng chứng không bị mất**: mỗi hit giữ `file` + `line` + `raw`; bản đầy đủ
@@ -72,6 +74,27 @@
 5. còn lại: emit mỗi (record, rule) một dòng, field 12 = rule id, field 13 = severity.
 
 `min` thay cho cơ chế aggregate cũ: ngưỡng đơn giản, dễ giải thích, không state.
+
+### Severity của alert (`lib/evidence.awk`)
+
+Severity là phát biểu về **server**, không phải về rule ồn nhất. Thứ tự xét:
+
+| Điều kiện | Kết quả | Ý nghĩa |
+|---|---|---|
+| batch có `impact=rce` | `CRITICAL` | server đã bị chiếm — một event cũng đủ |
+| `total >= CRIT_THRESHOLD` | `MODERATE` | leo thang ồ ạt, chưa có bằng chứng RCE |
+| còn lại | `INFO` | dò quét / nhiễu nền |
+
+**Mức độ trước, số lượng sau.** Rule nào là bằng chứng server đã bị chiếm thì tự
+khai `"impact":"rce"` trong pack — hiện có `P2S-020/021/022/024/025/056/057`. Một
+hit duy nhất của các rule đó đã đủ CRITICAL, vì đó là sự thật về mức độ chứ không
+phải tần suất. Ngược lại, không rule nào được phép "thành" CRITICAL chỉ vì số
+lượng: `P2S-050/051/054` bắn trên mọi lần **thử** LFI nên không khai `impact`.
+
+Ranh giới quan trọng nhất là `P2S-057`: cùng một URI, `404` là *đang thử*
+(`P2S-050/051`, không `impact`), `2xx` là *đã đọc được file* (`P2S-057`,
+`impact=rce`). Nhờ vậy một cuộc LFI tinh gọn 18 request vẫn nổi CRITICAL, trong
+khi 6000 request dò quét thì dừng ở MODERATE.
 
 ## 5. Lưu trữ
 

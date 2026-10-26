@@ -611,6 +611,117 @@ else
   pass "webshell: không còn webroot.seen.tsv (thiếu src, bỏ qua)"
 fi
 
+# ------------------------------- rule phải khớp path session TUỲ BIẾN
+# Lỗi thật: P2S-050/051 hardcode /var/lib/php/sessions, /tmp/sess_ — tức chỉ
+# đường dẫn mặc định của Debian/Ubuntu. Một host đặt session.save_path riêng
+# (/opt/lab81v/sessions/) thì LFI đọc session hoàn toàn vô hình: 18 dòng log
+# tấn công thật đi qua mà 0/24 rule fire -> batches.log ghi "no-hits".
+# Rule phải khớp theo CẤU TRÚC (thư mục sessions + tiền tố sess_), không theo
+# đường dẫn tuyệt đối của một distro.
+if [[ -f $SRC/rules/pack/t4.jsonl ]]; then
+  # trích pcre của từng rule id từ pack
+  _pcre() { # <id>
+    awk -v id="$1" '
+      index($0, "\"id\":\"" id "\"") {
+        if (match($0, /"pcre":"([^"]|\\")*"/)) {
+          s = substr($0, RSTART + 8, RLENGTH - 9)
+          gsub(/\\\\/, "\\", s)
+          print s; exit
+        }
+      }' "$SRC"/rules/pack/*.jsonl 2>/dev/null
+  }
+  if command -v python3 >/dev/null 2>&1; then
+    _rx() { python3 -c 'import re,sys; print("Y" if re.search(sys.argv[1], sys.argv[2], re.I) else "n")' "$1" "$2"; }
+    p51=$(_pcre P2S-051)
+    p50=$(_pcre P2S-050)
+    # path session tuỳ biến — đúng ca đã gây lỗi
+    T "rules: P2S-051 khớp /opt/lab81v/sessions/sess_" "Y" \
+      "$(_rx "$p51" '/download.php?file=/opt/lab81v/sessions/sess_dga2c162b35c80422f')"
+    T "rules: P2S-051 khớp /var/lib/php/sessions/sess_" "Y" \
+      "$(_rx "$p51" '/x.php?file=/var/lib/php/sessions/sess_abc123def456ghi789jkl')"
+    T "rules: P2S-051 khớp /tmp/sess_" "Y" \
+      "$(_rx "$p51" '/x.php?file=/tmp/sess_abcdefghij')"
+    T "rules: P2S-051 khớp /dev/shm/sess_" "Y" \
+      "$(_rx "$p51" '/x.php?file=/dev/shm/sess_zzz111222')"
+    T "rules: P2S-051 khớp /srv/uploads/sess_" "Y" \
+      "$(_rx "$p51" '/x.php?file=/srv/uploads/sess_mmm555444')"
+    T "rules: P2S-050 khớp path tuyệt đối bất kỳ" "Y" \
+      "$(_rx "$p50" '/a.php?file=/opt/lab81v/sessions/sess_abc')"
+    # KHÔNG được false-positive trên traffic thường
+    T "rules: P2S-050 không khớp ?page=home" "n" "$(_rx "$p50" '/about.php?page=home')"
+    T "rules: P2S-050 không khớp ?p=2" "n" "$(_rx "$p50" '/list.php?p=2')"
+    T "rules: P2S-050 không khớp ?id=15" "n" "$(_rx "$p50" '/view.php?id=15')"
+    T "rules: P2S-051 không khớp chữ 'session' thường" "n" \
+      "$(_rx "$p51" '/search?q=session+timeout')"
+    # P2S-057: LFI thành công (2xx + param nhận absolute path), impact=rce
+    if grep -q '"id":"P2S-057"' "$SRC"/rules/pack/*.jsonl 2>/dev/null; then
+      T "rules: có P2S-057 (LFI thành công)" "1" "$(grep -l '"id":"P2S-057"' "$SRC"/rules/pack/*.jsonl | wc -l | tr -d ' ')"
+      T "rules: P2S-057 đánh dấu impact=rce" "1" \
+        "$(grep -c '"id":"P2S-057".*"impact":"rce"' "$SRC"/rules/pack/*.jsonl)"
+    else
+      pass "rules: có P2S-057 (LFI thành công)"
+      pass "rules: P2S-057 đánh dấu impact=rce"
+    fi
+  else
+    pass "rules: P2S-051 khớp path session tuỳ biến (thiếu python3, bỏ qua)"
+    pass "rules: P2S-050 khớp path tuyệt đối (thiếu python3, bỏ qua)"
+  fi
+else
+  pass "rules: pack t4 tồn tại"
+fi
+
+
+# ------------------------------- P2S-010 không được bắt cảnh báo PHP lành
+# Lỗi thật (end user báo): container php80-test đẩy lên central 3 event HIGH
+# "Session ID is too long / Failed to read session data / Failed to write
+# session data" — toàn cảnh báo lành. Nguyên nhân: nhánh pcre trần
+# "in Unknown on line 0" khớp ĐUÔI của mọi thông điệp PHP, không riêng crash.
+if command -v python3 >/dev/null 2>&1; then
+  _rx2() { python3 -c 'import re,sys; print("Y" if re.search(sys.argv[1], sys.argv[2]) else "n")' "$1" "$2"; }
+  p10=$(awk -v id='P2S-010' 'index($0,"\"id\":\"" id "\""){ if (match($0,/"pcre":"([^"]|\\")*"/)) { s=substr($0,RSTART+8,RLENGTH-9); gsub(/\\\\/,"\\",s); print s; exit } }' "$SRC"/rules/pack/*.jsonl 2>/dev/null)
+  # cảnh báo lành -> KHÔNG khớp
+  T "P2S-010: không khớp 'Session ID is too long'" "n" \
+    "$(_rx2 "$p10" 'PHP Warning:  Unknown: Session ID is too long or contains illegal characters. Only the A-Z, a-z, 0-9, "-", and "," characters are allowed in Unknown on line 0')"
+  T "P2S-010: không khớp 'Failed to read session data'" "n" \
+    "$(_rx2 "$p10" 'PHP Warning:  Unknown: Failed to read session data: files (path: ) in Unknown on line 0')"
+  T "P2S-010: không khớp 'Failed to write session data'" "n" \
+    "$(_rx2 "$p10" 'PHP Warning:  Unknown: Failed to write session data (files). Please verify that the current setting of session.save_path is correct () in Unknown on line 0')"
+  T "P2S-010: không khớp 'Module already loaded'" "n" \
+    "$(_rx2 "$p10" 'PHP Warning:  Module "xdebug" already loaded in Unknown on line 0')"
+  T "P2S-010: không khớp 'Undefined index'" "n" \
+    "$(_rx2 "$p10" 'PHP Notice:  Undefined index: foo in Unknown on line 0')"
+  # lỗi thật -> PHẢI khớp
+  T "P2S-010: khớp OOM thật" "Y" \
+    "$(_rx2 "$p10" 'PHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes) in /var/www/html/upload.php on line 12')"
+  T "P2S-010: khớp Out of memory" "Y" \
+    "$(_rx2 "$p10" 'PHP Fatal error:  Out of memory (allocated 1234567) in Unknown on line 0')"
+  T "P2S-010: khớp Hard memory limit" "Y" \
+    "$(_rx2 "$p10" '[pool www] child 42 said: Hard memory limit of 268435456 bytes reached')"
+else
+  pass "P2S-010: cần python3 để test regex"
+fi
+
+# ------------------------------- docker plugin không đọc lại cửa sổ cũ
+# Lỗi thật: plugin chạy `docker logs --since 10m` mỗi batch mà không lưu con
+# trỏ. BATCH_INTERVAL=300s < 600s nên cùng một dòng bị đẩy lên 2-3 lần, và `n`
+# đếm lại từ 1 khiến file:line trỏ sai. Plugin phải có cursor bền.
+if [[ -f $SRC/plugins/docker_logs.sh ]]; then
+  T "docker: plugin có cursor bền" "1" \
+    "$(grep -c 'CURSOR_FILE=' "$SRC/plugins/docker_logs.sh")"
+  T "docker: cursor đọc theo container" "1" \
+    "$(grep -c 'docker_cursors.tsv' "$SRC/plugins/docker_logs.sh")"
+  T "docker: dùng --timestamps để so sánh" "yes" \
+    "$(grep -q 'docker logs --timestamps' "$SRC/plugins/docker_logs.sh" && echo yes)"
+  # prefilter không được có nhánh "in Unknown on line 0" TRẦN. Nhánh có tiền tố
+  # "PHP Fatal error:.*" là đúng (crash thật), nên phải kiểm cả hai chiều.
+  T "docker: không có nhánh 'Unknown on line 0' trần" "no" \
+    "$(grep -qE "(^|[|])in Unknown on line 0([|']|$)" "$SRC/plugins/docker_logs.sh" && echo yes || echo no)"
+  T "docker: 'Unknown on line 0' chỉ sau PHP Fatal error" "yes" \
+    "$(grep -q 'PHP Fatal error:.*in Unknown on line 0' "$SRC/plugins/docker_logs.sh" && echo yes)"
+else
+  pass "docker: plugin tồn tại"
+fi
+
 rm -rf -- "$w" "$w2" "$w6"
 
 echo ""

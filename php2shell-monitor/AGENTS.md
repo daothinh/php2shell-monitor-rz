@@ -34,7 +34,7 @@ src/
 │   ├── supervisor.sh       vòng lặp batch + PID/lock
 │   └── status.sh           báo cáo trạng thái
 ├── plugins/                13 nguồn log; _batch_common.sh giữ offset + dòng
-├── rules/pack/{t1,t2,t3}.jsonl
+├── rules/pack/{t1,t2,t3,t4}.jsonl
 ├── discovery/              discovery.sh (read-only), retro_hunt.sh, patch_status.sh
 └── export/export_json.sh
 ```
@@ -54,7 +54,7 @@ src/
 ## Kiểm thử
 
 ```bash
-SRC=$PWD/src bash tests/run_tests.sh   # 50 assertion, không cần bats
+SRC=$PWD/src bash tests/run_tests.sh   # 136 assertion, không cần bats
 bats tests/unit                        # parser tests
 shellcheck -x src/lib/*.sh src/engine/*.sh src/plugins/*.sh
 ./build.sh                             # shellcheck + tests + makeself

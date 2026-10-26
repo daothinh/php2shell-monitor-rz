@@ -42,11 +42,16 @@ RCE_RULES = frozenset({
     "P2S-024",  # php-fpm spawned shell child          -> command ran
     "P2S-025",  # reverse shell / post-exploitation    -> channel open
     "P2S-056",  # webshell pattern inside webroot      -> shell on disk
+    "P2S-057",  # LFI tra 2xx + tham so nhan absolute path -> file da doc duoc
 })
 # Deliberately NOT here: P2S-050 / P2S-051 / P2S-054. Those fire on every LFI
 # *attempt* (a request URI naming a session file or a php:// wrapper). They are
 # the attack in progress, not proof it worked — including them would paint every
 # noisy batch CRITICAL and bury the one batch where a shell really landed.
+#
+# P2S-057 là ranh giới: cùng một URI, 404 là "đang thử", 2xx là "đã đọc được".
+# Rule này chỉ fire khi server thật sự trả nội dung file, nên nó là bằng chứng
+# đọc file thành công — cùng hạng với shell đã lên đĩa, không phải dò quét.
 
 
 def _split_ids(raw: Any) -> set[str]:

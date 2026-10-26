@@ -50,7 +50,9 @@ ALERT=$P2S_ALERT_DIR/queue.jsonl
 # and never finished inside the batch window.
 COUNTS=$P2S_TMP_DIR/report.$BATCH.counts.tsv
 : >"$COUNTS"
-awk -f "$WORKDIR/lib/evidence.awk" -v outcounts="$COUNTS" "$HITS" >"$EVIDENCE"
+awk -f "$WORKDIR/lib/evidence.awk" -v outcounts="$COUNTS" \
+  -v crit_threshold="${CRIT_THRESHOLD:-5000}" \
+  "$HITS" >"$EVIDENCE"
 
 total=0
 top_sev=INFO

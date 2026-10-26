@@ -63,15 +63,20 @@ function rec(ts, rule, sev, source, file, line, ip, method, uri, status, ua, pid
 }
 
 END {
-  # Alert severity is a statement about the SERVER, not about the loudest rule.
-  #   rce_hits > 0                 -> CRITICAL (a shell exists / a command ran)
-  #   else total >= CRIT_THRESHOLD -> MODERATE (heavy php2shell exploitation)
-  #   else                         -> INFO     (probe / background noise)
-  # A noisy probe batch must never be able to claim CRITICAL: only `impact=rce`
-  # from the rule pack can, and the rule pack only sets it on proof.
-  if (rce_hits > 0)      final_sev = "CRITICAL"
-  else if (total >= crit_threshold) final_sev = "MODERATE"
-  else                   final_sev = "INFO"
+  # Alert severity là phát biểu về SERVER. Ưu tiên MỨC ĐỘ trước, SỐ LƯỢNG sau:
+  #
+  #   1. impact=rce   -> CRITICAL, bất kể số event (kể cả 1). Đây là bằng chứng
+  #                      server đã bị chiếm: shell trên đĩa, lệnh đã chạy, LFI đã
+  #                      đọc được file thật. Mức độ không được thua số lượng.
+  #   2. còn lại      -> theo SỐ LƯỢNG: >= crit_threshold là MODERATE (leo thang
+  #                      ồ ạt), dưới ngưỡng là INFO (dò quét / nhiễu nền).
+  #
+  # Rule nào đáng là "bằng chứng" thì phải tự khai `impact":"rce"` trong pack.
+  # P2S-057 làm đúng việc đó: 2xx + tham số nhận đường dẫn tuyệt đối = LFI đã
+  # thực sự đọc được file, khác hẳn 404 = chỉ đang thử.
+  if (rce_hits > 0)                  final_sev = "CRITICAL"
+  else if (total >= crit_threshold)  final_sev = "MODERATE"
+  else                               final_sev = "INFO"
 
   printf "%d\t%s\t%d\n", total, final_sev, rce_hits > (outcounts)
   for (k in rule_count) printf "R\t%s\t%d\n", k, rule_count[k] > (outcounts)

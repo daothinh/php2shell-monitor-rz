@@ -658,8 +658,9 @@ def test_headline_only_critical_on_rce_evidence():
     def h(rule_id, sev="CRITICAL"):
         return _headline({"severity": sev, "evidence": [{"rule_id": rule_id}]})
 
-    # có shell trên đĩa / lệnh đã chạy
-    for rid in ("P2S-020", "P2S-021", "P2S-022", "P2S-024", "P2S-025", "P2S-056"):
+    # có shell trên đĩa / lệnh đã chạy / LFI đã đọc được file
+    for rid in ("P2S-020", "P2S-021", "P2S-022", "P2S-024", "P2S-025",
+                "P2S-056", "P2S-057"):
         assert h(rid) == "Server bị chiếm quyền (RCE)", rid
 
     # chỉ là dò quét / đang khai thác, chưa chứng minh được gì
@@ -667,6 +668,29 @@ def test_headline_only_critical_on_rce_evidence():
     assert h("P2S-051", "MODERATE") == "Server đang bị khai thác php2shell"
     assert h("P2S-054", "MODERATE") == "Server đang bị khai thác php2shell"
     assert h("P2S-050", "INFO") == "Dấu hiệu dò quét php2shell"
+
+
+def test_lfi_attempt_vs_lfi_success():
+    """Cùng một URI: 404 = đang thử, 2xx = đã đọc được file.
+
+    Đây là ranh giới P2S-050/051 (attempt) với P2S-057 (success). Gộp chúng lại
+    thì mọi batch dò quét ồn ào đều thành CRITICAL; tách ra thì batch LFI tinh gọn
+    18 request vẫn nổi đúng mức.
+    """
+    from app.telegram import _headline, is_rce
+
+    uri = "/vuln.php?file=/opt/lab81v/sessions/sess_dga2c162b35c80422f"
+    # đang thử: 404, chỉ khớp P2S-050/051
+    attempt = {"severity": "INFO", "evidence": [
+        {"rule_id": "P2S-050,P2S-051", "uri": uri, "status": "404"}]}
+    assert is_rce(attempt) is False
+    assert _headline(attempt) == "Dấu hiệu dò quét php2shell"
+
+    # đã đọc được: 2xx, P2S-057 fire
+    success = {"severity": "CRITICAL", "evidence": [
+        {"rule_id": "P2S-050,P2S-051,P2S-057", "uri": uri, "status": "200"}]}
+    assert is_rce(success) is True
+    assert _headline(success) == "Server bị chiếm quyền (RCE)"
 
 
 def test_merged_rule_id_still_detects_rce():

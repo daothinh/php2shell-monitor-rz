@@ -1,4 +1,4 @@
-{"id":"P2S-010","severity":"HIGH","source":["fpm_error","apache_error","appcms","docker","journal"],"match":{"type":"regex","field":"msg","pcre":"Allowed memory size of|PHP Fatal error: +Out of memory|Hard memory limit of|in Unknown on line 0","min":5}}
+{"id":"P2S-010","severity":"HIGH","source":["fpm_error","apache_error","appcms","docker","journal"],"match":{"type":"regex","field":"msg","pcre":"(?i)(Allowed memory size of [0-9]+ bytes exhausted|PHP Fatal error: +Out of memory|Hard memory limit of [0-9]+ bytes|PHP Fatal error:.*\\bin Unknown on line 0)","min":5}}
 {"id":"P2S-011","severity":"HIGH","source":["fpm_error","apache_error","kernel","appcms","docker","journal"],"match":{"type":"regex","field":"msg","pcre":"exited on signal (6|7|11)|exit signal Segmentation fault|SIGSEGV|SIGBUS|SIGABRT|segfault at"}}
 {"id":"P2S-013","severity":"MEDIUM","source":["sessions"],"match":{"type":"regex","field":"msg","pcre":"upload_progress"}}
 {"id":"P2S-014","severity":"MEDIUM","source":["nginx_error","docker"],"match":{"type":"regex","field":"msg","pcre":"upstream prematurely closed connection|recv\\(\\) failed \\(104|upstream sent unexpected FastCGI record: 3"}}
