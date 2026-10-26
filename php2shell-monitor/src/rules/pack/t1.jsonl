@@ -4,3 +4,4 @@
 {"id":"P2S-017","severity":"MEDIUM","source":["access_log"],"match":{"type":"regex","field":"uri","pcre":"(?i)PHP_SESSION_UPLOAD_PROGRESS"}}
 {"id":"P2S-030","severity":"HIGH","source":["access_log"],"match":{"type":"regex","field":"uri","pcre":"(?i)[?&](cmd|exec|command|c)=.*(whoami|curl|wget|python3?|ssh|uname|cat%20|id;|;id|base64)"}}
 {"id":"P2S-040","severity":"MEDIUM","source":["modsec"],"match":{"type":"regex","field":"msg","pcre":"ModSecurity: .*(9109618|9109619|9109620|20260001|20260004|20260006|20260007|20260008|1009618|1009619|1009620)|PHP upload-progress|signature_id.: *(910961801|910961802|910961803)"}}
+{"id":"P2S-041","severity":"HIGH","source":["docker"],"match":{"type":"regex","field":"msg","pcre":"(?i)php2shell|php_session_upload_progress"}}

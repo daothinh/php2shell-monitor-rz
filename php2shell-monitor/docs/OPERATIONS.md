@@ -77,6 +77,26 @@ while IFS=: read -r f l; do [ "$l" -gt 0 ] && sed -n "${l}p" "$f"; done
 | Giới hạn inline | `MAX_EVIDENCE_INLINE=100` (file evidence vẫn đủ) |
 | Giữ evidence bao lâu | `EVIDENCE_KEEP=2016` (số batch ≈ 7 ngày ở 300s) |
 
+### Log Docker (plugin `docker_logs`)
+
+Script chạy sudo nên plugin đọc **thẳng** file json log của mọi container dưới
+`/var/lib/docker/containers/*/` (đổi qua biến `DOCKER_LOG_DIR`) — offset-tracked
+như access log, không quét lại dòng cũ giữa các batch. Thư mục đó không đọc
+được thì tự chuyển sang `docker logs --timestamps` với **con trỏ bền** theo
+container (`state/docker_cursors.tsv` lưu timestamp + số thứ tự cuối): dòng đã
+đưa lên ở batch trước không được đẩy lại, và `file:line` không đếm lại từ 1.
+`DOCKER_LOG_SINCE` chỉ còn là cửa sổ của lượt QUÉT ĐẦU TIÊN (chưa có con trỏ).
+
+Hai loại dòng ra khỏi container:
+
+- dòng **access-log combined** (image apache/nginx chính thức ghi access ra
+  stdout) → phát dưới nguồn `access_log` với đủ field ip/method/uri/status/ua
+  nên toàn bộ rule tấn công (P2S-008/015/016/017/030/050–056) phủ cả app chạy
+  trong container;
+- dòng còn lại chỉ phát khi có marker crash/OOM (P2S-010/011/014/018) hoặc
+  marker tấn công php2shell/upload-progress (P2S-041) → nguồn `docker`, file
+  hiển thị `docker:<tên-container>`.
+
 Rule bị loại vì `min` xuất hiện trong `run/batches.log`:
 `suppressed  P2S-016  4 hit(s) < min 5`.
 

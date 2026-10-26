@@ -377,39 +377,65 @@ stub=$w2/curlstub
 mkdir -p "$stub"
 cat >"$stub/curl" <<'STUB'
 #!/usr/bin/env bash
-# fake Central Alert Server — emulates the endpoints central.sh calls
+# fake Central Alert Server — mô phỏng các endpoint central.sh gọi, đủ cả
+# ngữ nghĩa HTTP thật: -o ghi body ra file, -w in http_code. File $self/unlinked
+# tồn tại = dự án đã bị /unlink trên bot -> whoami/ingest-log trả 401
+# project_disabled như server thật.
 self=$(dirname "$0")
 args=("$@")
-url='' body=''
+url='' body='' out='' wfmt=''
 for ((i = 0; i < $#; i++)); do
   case ${args[$i]} in
     -d|--data) body=${args[$((i + 1))]} ;;
+    --data-binary)
+      body=${args[$((i + 1))]}
+      [[ $body == @* ]] && body=$(cat "${body#@}")   # payload gửi qua file
+      ;;
+    -o) out=${args[$((i + 1))]} ;;
+    -w) wfmt=${args[$((i + 1))]} ;;
     http*) url=${args[$i]} ;;
   esac
 done
+code=200
 case $url in
+  *whoami)
+    if [[ -e $self/unlinked ]]; then
+      code=401
+      resp='{"detail":{"code":"project_disabled","message":"Dự án đã bị ngắt (/unlink trên bot) — chạy lại lệnh deploy trên máy để ghép nối lại"}}'
+    else
+      resp='{"status":"linked","project_name":"test-project","chat_id":"998877665"}'
+    fi
+    ;;
   *register-chatid)
     printf '%s' "$body" >"$self/register_body"
-    printf '{"pair_ref":"SEC-TEST-REF","chat_id":"812345678","bot":"@test_bot","expires_in":900,"warning":null}'
+    resp='{"pair_ref":"SEC-TEST-REF","chat_id":"812345678","bot":"@test_bot","expires_in":900,"warning":null}'
     ;;
   *pairing-status*)
     n=$(cat "$self/poll_count" 2>/dev/null || echo 0)
     n=$((n + 1)); printf '%s' "$n" >"$self/poll_count"
     if ((n < 3)); then
-      printf '{"status":"pending"}'
+      resp='{"status":"pending"}'
     else
-      printf '{"status":"linked","api_key":"p2sk-test-key-42"}'
+      resp='{"status":"linked","api_key":"p2sk-test-key-42"}'
     fi
     ;;
   *ingest-log)
-    for ((i = 0; i < $#; i++)); do
-      [[ ${args[$i]} == X-API-Key:* ]] && printf '%s' "${args[$i]}" >"$self/ingest_key"
-    done
-    printf '%s' "$body" >"$self/ingest_body"
-    printf '{"received":1,"delivered":1}'
+    if [[ -e $self/unlinked ]]; then
+      code=401
+      resp='{"detail":{"code":"project_disabled","message":"Dự án đã bị ngắt (/unlink trên bot) — chạy lại lệnh deploy trên máy để ghép nối lại"}}'
+    else
+      for ((i = 0; i < $#; i++)); do
+        [[ ${args[$i]} == X-API-Key:* ]] && printf '%s' "${args[$i]}" >"$self/ingest_key"
+      done
+      printf '%s' "$body" >"$self/ingest_body"
+      resp='{"received":1,"delivered":1}'
+    fi
     ;;
-  *) printf '{"error":"unknown endpoint %s"}' "$url"; exit 1 ;;
+  *) printf '{"error":"unknown endpoint %s"}' "$url" >&2; exit 1 ;;
 esac
+if [[ -n $out ]]; then printf '%s' "$resp" >"$out"; else printf '%s' "$resp"; fi
+[[ -n $wfmt && $wfmt == *http_code* ]] && printf '%s' "$code"
+exit 0
 STUB
 chmod +x "$stub/curl"
 FAKE_EP=$(bash -c 'source "$1/lib/endpoint.sh"; p2s_endpoint_encode "http://fake-central.test"' _ "$SRC")
@@ -450,12 +476,99 @@ T "pair: chạy lại báo đã ghép nối" "Đã ghép nối trước đó" "$
 T "pair: chạy lại KHÔNG gọi register" "" "$(cat "$stub/register_body")"
 T "pair: giữ nguyên API key" "p2sk-test-key-42" "$(cat "$w2/conf/central.conf")"
 
+# /unlink trên bot rồi chạy lại pair: whoami trả 401 -> PHẢI đăng ký lại
+# (guard cũ chỉ tin conf local nên chặn re-pair — đây chính là bug đã sửa)
+touch "$stub/unlinked"
+: >"$stub/register_body"
+out=$(env "${PAIR_ENV[@]}" \
+      bash "$w2/engine/central.sh" pair --chatid 998877665 2>&1)
+T "re-pair: key bị từ chối -> gọi register lại" '"project_name":"test-project"' \
+  "$(cat "$stub/register_body")"
+T "re-pair: conf được ghi lại với key mới" "API_KEY=" "$(cat "$w2/conf/central.conf")"
+rm -f "$stub/unlinked"
+
 # test mode: gửi 1 alert INFO qua đúng API key đã lưu
 out=$(env "${PAIR_ENV[@]}" bash "$w2/engine/central.sh" test 2>&1)
 T "test: delivered >= 1 trong phản hồi" "delivered" "$out"
 T "test: dùng API key từ conf"          "X-API-Key: p2sk-test-key-42" "$(cat "$stub/ingest_key")"
 T "test: message alert thử nêu device"  "test-device" "$(cat "$stub/ingest_body")"
 T "test: payload là alert thử INFO"     '"severity":"INFO"' "$(cat "$stub/ingest_body")"
+
+# agent đẩy alert khi dự án vừa bị /unlink: 401 KHÔNG được coi là gửi xong —
+# alert phải vào spool kèm cảnh báo đúng nguyên nhân (trước đây curl coi 401
+# là thành công, offset tiến và alert mất im lặng).
+spoolf=$w2/projects/test-project/devices/test-device/run/agent/spool/pending.jsonl
+alertq=$w2/projects/test-project/devices/test-device/alerts/queue.jsonl
+mkdir -p "$(dirname "$alertq")"
+printf '%s\n' '{"ts_utc":"2026-10-24T00:00:05Z","batch_id":"T-401","rule_id":"P2S-056","severity":"CRITICAL","message":"probe"}' >"$alertq"
+touch "$stub/unlinked"
+: >"$stub/ingest_body"
+env "${PAIR_ENV[@]}" P2S_AGENT_POLL=1 timeout -s TERM 4 \
+  bash "$w2/engine/central.sh" agent >/dev/null 2>"$w2/agent401.log"
+T "agent 401: cảnh báo đúng nguyên nhân (/unlink)" "đã bị ngắt" "$(cat "$w2/agent401.log")"
+T "agent 401: alert kẹt trong spool, không mất" '"batch_id":"T-401"' "$(cat "$spoolf" 2>/dev/null)"
+N "agent 401: server KHÔNG nhận được alert"   '"batch_id":"T-401"' "$(cat "$stub/ingest_body")"
+
+# ghép nối lại xong: agent drain spool — đúng batch, spool rỗng
+rm -f "$stub/unlinked"
+env "${PAIR_ENV[@]}" P2S_AGENT_POLL=1 timeout -s TERM 4 \
+  bash "$w2/engine/central.sh" agent >/dev/null 2>&1
+N "agent drain: spool rỗng sau khi gửi được" "T-401" "$(cat "$spoolf" 2>/dev/null)"
+T "agent drain: server nhận đúng batch" '"batch_id":"T-401"' "$(cat "$stub/ingest_body")"
+
+# --------------------------------------- docker_logs: container log qua file json
+# Script chạy sudo nên đọc thẳng /var/lib/docker/containers (offset-tracked);
+# dòng access trong stdout container -> nguồn access_log để trọn rule pack
+# tấn công áp dụng; crash/marker -> nguồn docker.
+w4=$(newlab)
+mkdir -p "$w4/dkr/containers/abc123def456"
+cid=abc123def456
+printf '{"ID":"x","Name":"/web-php","Image":"php:8.2-apache"}' \
+  >"$w4/dkr/containers/$cid/config.v2.json"
+{
+  printf '{"log":"10.0.0.9 - - [26/Oct/2026:03:00:02 +0000] \\"POST /up.php?PHP_SESSION_UPLOAD_PROGRESS=x HTTP/1.1\\" 200 5 \\"-\\" \\"php2shell-109619\\"","stream":"stdout","time":"2026-10-26T03:00:02Z"}\n'
+  printf '{"log":"child exited on signal 11 (SIGSEGV)","stream":"stderr","time":"2026-10-26T03:00:03Z"}\n'
+  printf '{"log":"[app] internal php2shell probe","stream":"stderr","time":"2026-10-26T03:00:04Z"}\n'
+  printf '{"log":"normal app line","stream":"stdout","time":"2026-10-26T03:00:05Z"}\n'
+} >"$w4/dkr/containers/$cid/$cid-json.log"
+docker_env=(WORKDIR="$w4" DOCKER_LOG_DIR="$w4/dkr/containers")
+out=$(env "${docker_env[@]}" bash "$w4/plugins/docker_logs.sh")
+T "docker: access stdout -> access_log + UA php2shell" '"php2shell-109619"' "$out"
+T "docker: access line bung field uri" "PHP_SESSION_UPLOAD_PROGRESS" \
+  "$(printf '%s' "$out" | awk -F'\t' '$2=="access_log"{print $7}')"
+T "docker: access line bung field method/status" $'POST\t' \
+  "$(printf '%s' "$out" | awk -F'\t' '$2=="access_log"{print $6"\t"$8}')"
+T "docker: tên container lấy từ config.v2.json" "docker:web-php" "$out"
+T "docker: crash SIGSEGV giữ nguồn docker" "SIGSEGV" \
+  "$(printf '%s' "$out" | awk -F'\t' '$2=="docker"{print $11}')"
+N "docker: dòng app lành tính bị lọc bỏ" "normal app line" "$out"
+
+# offset-tracked: chạy lại không quét lại dòng cũ (khác `docker logs --since`)
+out2=$(env "${docker_env[@]}" bash "$w4/plugins/docker_logs.sh")
+N "docker: chạy lại không trùng lặp (offset)" "php2shell" "$out2"
+
+# rule pack phủ stream từ docker: tấn công + crash + marker stderr
+printf '%s\n' "$out" >"$w4/dstream.tsv"
+rout=$(WORKDIR="$w4" P2S_SRC_DIR="$w4" bash "$w4/engine/rule_match.sh" "$w4/dstream.tsv" 2>/dev/null)
+T "docker rule: UA php2shell khớp P2S-008" "P2S-008" "$rout"
+T "docker rule: upload_progress khớp P2S-017" "P2S-017" "$rout"
+T "docker rule: crash khớp P2S-011" "P2S-011" "$rout"
+T "docker rule: marker stderr khớp P2S-041" "P2S-041" "$rout"
+
+# CLI fallback: DOCKER_LOG_DIR không đọc được -> quét qua `docker logs`
+dstub=$w4/dockerstub
+mkdir -p "$dstub"
+cat >"$dstub/docker" <<'DSTUB'
+#!/usr/bin/env bash
+case "$1" in
+  ps) printf 'web-cli\n' ;;
+  logs) printf '1.2.3.4 - - [x] "GET /t HTTP/1.1" 200 1 "-" "php2shell-cli"\n' ;;
+esac
+DSTUB
+chmod +x "$dstub/docker"
+out3=$(env PATH="$dstub:$PATH" WORKDIR="$w4" DOCKER_LOG_DIR="$w4/no-dkr" \
+         bash "$w4/plugins/docker_logs.sh")
+T "docker CLI fallback: quét qua docker logs" '"php2shell-cli"' "$out3"
 
 # ------------------------------------------- rule pack không cần jq
 # Rule pack đọc bằng lib/jsonl.awk. Đây là điều kiện sống còn: nếu jq là bắt
