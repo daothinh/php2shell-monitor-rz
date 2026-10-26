@@ -25,9 +25,10 @@ TRIỂN KHAI (một lệnh duy nhất):
   rồi bật supervisor rà log mỗi 5 phút + forwarder đẩy alert về Telegram.
 
   Thiết bị đã thiết lập rồi thì chạy lại sẽ báo "THIẾT BỊ ĐÃ ĐƯỢC THIẾT LẬP"
-  và thoát — không ghi đè conf, không cấp key mới.
+  và thoát — không ghi đè conf, không cấp key mới. Ngoại lệ: nếu dự án đã
+  bị /unlink trên bot (key bị thu hồi), đúng lệnh này TỰ ghép nối lại.
 
-  Muốn ĐỔI cấu hình: thêm --force.
+  Muốn ĐỔI cấu hình: thêm --force (xoá ghép nối cũ, cấp API key mới).
     sudo php2shell-monitor.sh --force --project <tên> --chatid <id>
 
 Chế độ khác:
@@ -157,7 +158,10 @@ report_already_setup() {
 
  Muốn ĐỔI cấu hình (dự án / server / chat khác), thêm --force:
    sudo php2shell-monitor.sh --force --project <tên> --chatid <id>
-   (lệnh này cấp API key mới và đổi chat nhận alert của thiết bị này)
+   (lệnh này xoá ghép nối cũ, cấp API key mới và đổi chat nhận alert)
+
+ Bị ngắt trên bot (/unlink)? Chạy lại đúng lệnh deploy ban đầu — script tự
+ phát hiện key đã bị thu hồi và ghép nối lại, không cần --force.
 EOF
 }
 
@@ -175,9 +179,24 @@ apply_project() { # <tên dự án>
 }
 
 if [[ $mode == setup ]]; then
-  if already_setup && (( ! opt_force )); then
-    report_already_setup
-    exit 0
+  if already_setup; then
+    if (( opt_force )); then
+      # --force = ĐỔI cấu hình: xoá pair cũ hẳn để pair lại thật (cấp key mới),
+      # không giữ lại conf cũ khiến guard thứ hai trong central.sh bỏ qua.
+      rm -f -- "$WORKDIR/conf/central.conf"
+    else
+      # Guard phải hỏi server, không chỉ tin conf local: /unlink trên bot không
+      # có kênh báo về máy. Key còn sống (hoặc không kiểm tra được) -> giữ hành
+      # vi cũ; server từ chối (401) -> ghép nối lại ngay thay vì chặn người dùng.
+      bash "$WORKDIR/engine/central.sh" is-alive
+      alive=$?
+      if (( alive != 1 )); then
+        report_already_setup
+        exit 0
+      fi
+      printf '\n⚠️  API key hiện tại đã bị server từ chối (dự án đã /unlink trên bot?)\n'
+      printf ' — tiến hành ghép nối lại cho dự án %s...\n' "$opt_project"
+    fi
   fi
   apply_project "$opt_project"
 fi
@@ -195,9 +214,13 @@ esac
 
 case $mode in
   setup)
-    # 1) pair (idempotent: central.sh skips when conf already matches)
+    # 1) pair (idempotent; TỰ ghép nối lại khi key cũ đã bị server thu hồi)
     bash "$WORKDIR/engine/central.sh" pair \
       --server "$opt_server" --chatid "$opt_chatid" || exit $?
+
+    # 1b) agent cũ (nếu có) còn giữ API key cũ trong bộ nhớ — kick để
+    # supervisor respawn nó với conf mới trong ≤AGENT_CHECK giây
+    bash "$WORKDIR/engine/supervisor.sh" kick-agent >/dev/null 2>&1 || true
 
     # 2) start the supervisor; it spawns the forwarder itself. Output is shown
     #    only on failure — the pid line is not operator-facing.

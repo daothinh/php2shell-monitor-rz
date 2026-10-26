@@ -58,6 +58,26 @@ load_conf() {
 # trong response của register-chatid và sẽ ghi đè giá trị này.
 P2S_BOT=${P2S_BOT:-@p2shell_bot}
 
+# Key trong conf còn được server công nhận không? /unlink trên bot không có
+# kênh báo ngược về máy nên conf local vẫn "nguyên vẹn" dù key đã bị thu hồi.
+#   exit 0 = còn sống · 1 = server từ chối (401: đã /unlink, key bị thu hồi)
+#   2 = không kết luận được (chưa có conf, mạng lỗi, server cũ chưa có /whoami)
+check_pairing() {
+  [[ -r $CONF_PATH ]] || return 2
+  local key url code
+  key=$(sed -n 's/^API_KEY=//p' "$CONF_PATH" | head -1)
+  url=$(sed -n 's/^SERVER_URL=//p' "$CONF_PATH" | head -1)
+  [[ -n $url ]] || url=$(p2s_endpoint)
+  [[ -n $key && $url =~ ^https?:// ]] || return 2
+  code=$("${CURL[@]}" -o /dev/null --max-time 10 -w '%{http_code}' \
+    "$url/api/v1/whoami" -H "X-API-Key: $key") || return 2
+  case $code in
+    200) return 0 ;;
+    401) return 1 ;;
+    *)   return 2 ;;   # 404 = server cũ chưa có /whoami: giữ hành vi cũ
+  esac
+}
+
 # Đã ghép nối đúng bộ ba server/project/chatid chưa? -> in trạng thái, trả 0.
 already_paired() { # <server> <chatid>
   local server=$1 chatid=$2
@@ -68,7 +88,13 @@ already_paired() { # <server> <chatid>
   c_proj=$(sed -n 's/^PROJECT_NAME=//p' "$CONF_PATH" | head -1)
   c_chat=$(sed -n 's/^CHAT_ID=//p' "$CONF_PATH" | head -1)
   # conf without CHAT_ID is not a match: pair again once
-  [[ -n $c_key && $c_server == "$server" && $c_proj == "$PROJECT" && $c_chat == "$chatid" ]]
+  [[ -n $c_key && $c_server == "$server" && $c_proj == "$PROJECT" && $c_chat == "$chatid" ]] || return 1
+  # Conf khớp tham số CHƯA đủ: dự án có thể đã bị /unlink trên bot. Hỏi server;
+  # chỉ khi server khẳng định từ chối (401) mới pair lại — mạng lỗi thì giữ
+  # conf như cũ để chạy lệnh deploy nhiều lần không spam đăng ký.
+  check_pairing
+  (( $? == 1 )) && return 1
+  return 0
 }
 
 cmd_pair() {
@@ -155,24 +181,52 @@ EOF
 # Ghi payload ra file rồi dùng --data-binary @file: argv có giới hạn
 # (MAX_ARG_STRLEN ~128 KiB) nên một batch nhiều hit sẽ chết với
 # "curl: Argument list too long" và alert kẹt lại trong spool.
-post_alerts() { # các dòng JSON làm tham số -> 0 nếu server nhận
-  local payload_file
+post_alerts() { # các dòng JSON làm tham số -> 0 chỉ khi server NHẬN (HTTP 2xx)
+  local payload_file os_name env_kind
+  os_name=$(os_pretty); env_kind=$(env_label)
   payload_file=$P2S_TMP_DIR/payload.$$.json
   {
-    printf '{"host":"%s","device":"%s","lan_ip":"%s","user":"%s","alerts":[' \
+    printf '{"host":"%s","device":"%s","lan_ip":"%s","user":"%s","os":"%s","env":"%s","alerts":[' \
       "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" \
       "$(json_escape "$DEVICE")" \
       "$(json_escape "$(lan_ip)")" \
-      "$(json_escape "$(id -un 2>/dev/null || echo unknown)")"
+      "$(json_escape "$(id -un 2>/dev/null || echo unknown)")" \
+      "$(json_escape "$os_name")" \
+      "$(json_escape "$env_kind")"
     printf '%s\n' "$@" | paste -sd, -
     printf ']}'
   } >"$payload_file" || { rm -f -- "$payload_file"; return 1; }
-  local rc=0
-  "${CURL[@]}" -X POST "$SERVER_URL/api/v1/ingest-log" \
+  local rc=0 code body_file=$P2S_TMP_DIR/resp.$$.json
+  code=$("${CURL[@]}" -o "$body_file" -w '%{http_code}' -X POST \
+    "$SERVER_URL/api/v1/ingest-log" \
     -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
-    --data-binary "@$payload_file" >/dev/null || rc=$?
+    --data-binary "@$payload_file") || rc=$?
   rm -f -- "$payload_file"
-  return $rc
+  # Không nhìn HTTP status thì 4xx cũng "thành công" với curl: server từ chối
+  # (vd 401 sau /unlink trên bot) mà agent tưởng đã gửi -> offset tiến, alert
+  # mất im lặng. Chỉ 2xx mới tính là đã gửi.
+  if (( rc )) || [[ ! $code =~ ^2 ]]; then
+    [[ $code == 401 || $code == 403 ]] && _reject_hint "$body_file" "$code"
+    rm -f -- "$body_file"
+    return 1
+  fi
+  rm -f -- "$body_file"
+  return 0
+}
+
+# Nói đúng nguyên nhân bị từ chối: server trả detail.code=project_disabled
+# khi dự án đã /unlink (key bị thu hồi) — khi đó phải chạy deploy lại, không
+# phải chờ mạng.
+_reject_hint() { # <file body phản hồi> <http_code>
+  local why
+  why=$(grep -o '"code"[[:space:]]*:[[:space:]]*"project_disabled"' "$1" 2>/dev/null | head -1)
+  if [[ -n $why ]]; then
+    printf '%s: server từ chối — dự án đã bị ngắt (/unlink trên bot). Alert được giữ trong spool; chạy lại lệnh deploy để ghép nối lại.\n' \
+      "$P2S_PROG" >&2
+  else
+    printf '%s: server từ chối (HTTP %s) — API key không hợp lệ. Alert được giữ trong spool; chạy lại lệnh deploy để ghép nối lại.\n' \
+      "$P2S_PROG" "${2:-không rõ}" >&2
+  fi
 }
 
 # upload_evidence <alert_json_line>
@@ -289,7 +343,7 @@ cmd_agent() {
           sent=$((sent + ${#part[@]}))
         else
           spool_append "${NEW_LINES[@]:sent}"
-          printf '%s: mạng lỗi — spool %d alert, thử lại sau\n' \
+          printf '%s: không gửi được — spool %d alert, thử lại sau\n' \
             "$P2S_PROG" $((${#NEW_LINES[@]} - sent)) >&2
           break
         fi
@@ -304,10 +358,12 @@ cmd_test() {
   load_conf
   local ts payload resp
   ts=$(utc_now)
-  payload=$(printf '{"host":"%s","lan_ip":"%s","user":"%s","alerts":[{"ts_utc":"%s","rule_id":"TEST-001","severity":"INFO","tier":"TEST","message":"Alert thử từ php2shell-monitor (%s) — đường truyền ghép nối hoạt động!"}]}' \
+  payload=$(printf '{"host":"%s","lan_ip":"%s","user":"%s","os":"%s","env":"%s","alerts":[{"ts_utc":"%s","rule_id":"TEST-001","severity":"INFO","tier":"TEST","message":"Alert thử từ php2shell-monitor (%s) — đường truyền ghép nối hoạt động!"}]}' \
     "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" \
     "$(json_escape "$(lan_ip)")" \
     "$(json_escape "$(id -un 2>/dev/null || echo unknown)")" \
+    "$(json_escape "$(os_pretty)")" \
+    "$(json_escape "$(env_label)")" \
     "$ts" "$DEVICE")
   resp=$("${CURL[@]}" -X POST "$SERVER_URL/api/v1/ingest-log" \
     -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
@@ -320,5 +376,7 @@ case ${1:-help} in
   pair)  shift; cmd_pair "$@" ;;
   agent) cmd_agent ;;
   test)  cmd_test ;;
-  *) die "central.sh {pair --chatid <id>} | agent | test" ;;
+  # Health-check ghép nối cho guard của main.sh: 0=sống 1=bị từ chối 2=không rõ
+  is-alive) check_pairing; exit $? ;;
+  *) die "central.sh {pair --chatid <id>} | agent | test | is-alive" ;;
 esac

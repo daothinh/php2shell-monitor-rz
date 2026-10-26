@@ -88,7 +88,7 @@ csv_has() {
 # LAN IP: source address of the default route, then first global IPv4, then
 # `hostname -I`. Never loopback; never `hostname -i` (reverse DNS can block).
 lan_ip() {
-  local ip
+  local ip=''   # gán rỗng: local trần + set -u báo "unbound variable" (bash 5)
   if have ip; then
     ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
     [[ -n $ip ]] || ip=$(ip -4 -o addr show scope global 2>/dev/null |
@@ -97,4 +97,25 @@ lan_ip() {
   [[ -n $ip ]] || ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\./ && !/^127\./ { print; exit }')
   [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ip=""
   printf '%s' "$ip"
+}
+
+# OS + loại môi trường cho envelope alert: operator đọc tin Telegram thấy ngay
+# máy bị nằm ở đâu (container hay bare-metal, distro gì), không phải tra thiết bị.
+os_pretty() {
+  local n=''
+  [[ -r /etc/os-release ]] && \
+    n=$(sed -n 's/^PRETTY_NAME="\(.*\)"$/\1/p' /etc/os-release | head -1)
+  [[ -n $n ]] || n=$(uname -s 2>/dev/null || echo unknown)
+  printf '%s' "$n"
+}
+
+env_label() {
+  if [[ -f /.dockerenv ]] || grep -qa docker /proc/1/cgroup 2>/dev/null; then
+    printf 'Docker Container'
+  elif grep -qaE 'containerd|kubepods|lxc' /proc/1/cgroup 2>/dev/null \
+     || [[ -f /proc/1/root/.dockerenv ]]; then
+    printf 'Container'
+  else
+    printf 'Host'
+  fi
 }

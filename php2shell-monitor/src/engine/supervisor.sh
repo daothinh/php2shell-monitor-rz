@@ -191,8 +191,17 @@ case ${1:-} in
       exit 1
     fi
     ;;
+  kick-agent)
+    # Sau khi pair lại (vd dự án bị /unlink rồi ghép mới): agent đang chạy vẫn
+    # giữ API key cũ trong bộ nhớ. Giết agent (PID đã xác minh) — vòng loop
+    # respawn nó trong ≤AGENT_CHECK giây và agent mới đọc conf mới, drain spool.
+    apid=$(_agent_pid) || { echo "no agent running"; exit 0; }
+    kill -TERM "$apid" 2>/dev/null || true
+    rm -f -- "$P2S_DEVICE_RUN_DIR/agent/agent.pid"
+    echo "agent (pid $apid) stopped — supervisor sẽ respawn với conf mới"
+    ;;
   *)
-    echo "usage: supervisor.sh {start|stop|status}" >&2
+    echo "usage: supervisor.sh {start|stop|status|kick-agent}" >&2
     exit 2
     ;;
 esac
