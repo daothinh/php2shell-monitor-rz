@@ -54,11 +54,17 @@ src/
 ## Kiểm thử
 
 ```bash
-SRC=$PWD/src bash tests/run_tests.sh   # 136 assertion, không cần bats
+SRC=$PWD/src bash tests/run_tests.sh   # 149 assertion, không cần bats
 bats tests/unit                        # parser tests
 shellcheck -x src/lib/*.sh src/engine/*.sh src/plugins/*.sh
 ./build.sh                             # shellcheck + tests + makeself
 ```
+
+Build ra `dist/php2shell-monitor-<VERSION>.sh` (+ `.sha256`) — tên file mang
+version để phân biệt từng bản. `dist/php2shell-monitor.sh` là symlink trỏ về
+bản mới nhất, nên đường dẫn cũ trong tài liệu vẫn dùng được. Mỗi lần sửa code
+phải bump `VERSION` trước khi `./build.sh`, nếu không bản mới ghi đè bản cũ và
+mất dấu vết để rollback.
 
 Khi sửa rule pack: chạy `-- once` trên lab có log mẫu rồi kiểm
 `alerts/queue.jsonl` (đúng 1 dòng) và `evidence/<batch>.jsonl` (đủ hit).

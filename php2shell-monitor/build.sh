@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# build.sh - shellcheck + tests + makeself -> dist/php2shell-monitor.sh (+sha256)
+# build.sh - shellcheck + tests + makeself -> dist/php2shell-monitor-<version>.sh
 # Runs on the BUILD machine only (needs makeself; target machine needs none).
 #
 # The archive unpacks directly into INSTALL_DIR on the target host; nothing is
 # staged in /tmp and no second copy is made by bootstrap.sh.
+#
+# Ten artifact mang version: moi lan build ra mot file rieng de phan biet, doi
+# chieu va rollback. dist/php2shell-monitor.sh la symlink tro ve ban moi nhat,
+# de cac lenh cu trong README van chay.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
@@ -11,6 +15,9 @@ VERSION=$(cat VERSION 2>/dev/null || echo "1.0.0")
 DIST=dist
 PAYLOAD=dist/payload
 INSTALL_DIR=/opt/php2shell-monitor
+# Ten file theo version: php2shell-monitor-1.3.2.sh (+ .sha256)
+ARTIFACT="$DIST/php2shell-monitor-$VERSION.sh"
+LATEST="$DIST/php2shell-monitor.sh"
 
 mkdir -p -- "$DIST"
 rm -rf -- "$PAYLOAD"
@@ -56,22 +63,33 @@ if command -v makeself >/dev/null 2>&1; then
   # --needroot: refuse to run without root before unpacking anything.
   # --target:   unpack straight into the install directory (no /tmp staging).
   makeself --sha256 --nox11 --noprogress --gzip --needroot --target "$INSTALL_DIR" \
-    "$PAYLOAD" "$DIST/php2shell-monitor.sh" \
+    "$PAYLOAD" "$ARTIFACT" \
     "PHP2Shell Monitor $VERSION" ./bootstrap.sh
 
   # Lenh chinh cua tool la "php2shell-monitor.sh --server ... --project ...
   # --chatid ...": makeself mac dinh tu choi flag la va doi dau "--" phan cach.
   # Vá stub de flag duoc chuyen thang xuong script.
-  python3 tools/patch_makeself.py "$DIST/php2shell-monitor.sh"
+  python3 tools/patch_makeself.py "$ARTIFACT"
 
-  sha256sum "$DIST/php2shell-monitor.sh" >"$DIST/php2shell-monitor.sh.sha256"
-  echo "built: $DIST/php2shell-monitor.sh (installs into $INSTALL_DIR)"
+  sha256sum "$ARTIFACT" >"$ARTIFACT.sha256"
+
+  # symlink "ban moi nhat": giu nguyen duong dan cu trong README/tai lieu va
+  # trong script cai dat cua khach, nhung van phan biet duoc tung ban build.
+  ln -sfn -- "$(basename -- "$ARTIFACT")" "$LATEST"
+  ln -sfn -- "$(basename -- "$ARTIFACT").sha256" "$LATEST.sha256"
+
+  echo "built: $ARTIFACT (installs into $INSTALL_DIR)"
+  echo "sha256: $(cut -d' ' -f1 <"$ARTIFACT.sha256")"
+  echo "latest: $LATEST -> $(readlink -- "$LATEST")"
 else
   echo "makeself not installed; payload staged at $PAYLOAD (install: apt install makeself)"
-  echo "fallback: dist/php2shell-monitor-raw.tar.gz"
+  RAW="$DIST/php2shell-monitor-raw-$VERSION.tar.gz"
+  echo "fallback: $RAW"
   echo "          (sudo mkdir -p $INSTALL_DIR && sudo tar -xzf ... -C $INSTALL_DIR && sudo $INSTALL_DIR/bootstrap.sh)"
-  tar -czf "$DIST/php2shell-monitor-raw.tar.gz" -C "$PAYLOAD" .
-  sha256sum "$DIST/php2shell-monitor-raw.tar.gz" >"$DIST/php2shell-monitor-raw.tar.gz.sha256"
+  tar -czf "$RAW" -C "$PAYLOAD" .
+  sha256sum "$RAW" >"$RAW.sha256"
+  ln -sfn -- "$(basename -- "$RAW")" "$DIST/php2shell-monitor-raw.tar.gz"
+  ln -sfn -- "$(basename -- "$RAW").sha256" "$DIST/php2shell-monitor-raw.tar.gz.sha256"
 fi
 
 rm -rf -- "$PAYLOAD"
