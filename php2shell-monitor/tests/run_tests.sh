@@ -583,7 +583,15 @@ DSTUB
 chmod +x "$dstub/docker"
 out3=$(env PATH="$dstub:$PATH" WORKDIR="$w4" DOCKER_LOG_DIR="$w4/no-dkr" \
          bash "$w4/plugins/docker_logs.sh")
-T "docker CLI fallback: quét qua docker logs" '"php2shell-cli"' "$out3"
+# Phải là record TSV 12 field với nguồn access_log — không phải dòng log thô
+# rò ra stdout (bug từng có: printf thiếu >>"$raw" làm dòng in thẳng ra
+# stream, awk không bao giờ chạy, cursor vẫn coi như đã xử lý).
+cli_recs=$(printf '%s\n' "$out3" | awk -F'\t' 'NF==12 && $2=="access_log" && $9=="php2shell-cli"')
+T "docker CLI fallback: record TSV access_log đầy đủ field" \
+  "web-cli" "$cli_recs"
+non_tsv=$(printf '%s\n' "$out3" | awk -F'\t' 'NF!=12 && NF!=0')
+N "docker CLI fallback: không rò dòng thô ra stream (mọi dòng TSV 12 field)" \
+  "HTTP/1.1" "$non_tsv"
 
 # HỒI QUY: cursor chưa có KHÔNG được rơi vào --since 0 (epoch 0 = đọc toàn bộ
 # lịch sử). Bug thật: _cursor_get trả "\t0", tab đầu bị `read` IFS nuốt thành

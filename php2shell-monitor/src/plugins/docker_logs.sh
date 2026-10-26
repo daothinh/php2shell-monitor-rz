@@ -128,8 +128,11 @@ if (( ! found_json )); then
       # Đã thấy ở batch trước: bỏ. So sánh chuỗi hợp lệ vì docker in timestamp
       # cố định độ rộng phần lẻ (9 chữ số).
       [[ -n $cur_ts && -n $ts && ! $ts > $cur_ts ]] && continue
-      # ghi lại kèm ts để awk dùng đúng thời điểm sự việc, không phải giờ batch
-      if [[ -n $ts ]]; then printf '%s %s\n' "$ts" "$body"; else printf '%s\n' "$body"; fi
+      # Ghi vào $raw kèm ts để awk dùng đúng thời điểm sự việc. PHẢI >>"$raw":
+      # thiếu redirect thì dòng in thẳng ra stream record (phá TSV), $raw rỗng
+      # mãi -> awk không chạy -> CLI fallback mất im lặng mọi dòng trong khi
+      # cursor vẫn ghi như đã xử lý.
+      if [[ -n $ts ]]; then printf '%s %s\n' "$ts" "$body" >>"$raw"; else printf '%s\n' "$body" >>"$raw"; fi
       new_seq=$((new_seq + 1))
       [[ -n $ts ]] && new_ts=$ts
     done < <(docker logs --timestamps --since "$since" "$c" 2>&1)
