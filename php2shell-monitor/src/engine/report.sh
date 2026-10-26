@@ -92,10 +92,10 @@ _sev_counts_json() {
 
 # ------------------------------------------------- 2b. container gây alert
 # Alert sinh từ log/artifact của container phải nói rõ container nào:
-# docker:<tên>   — json log stdout (plugin docker_logs)
-# container:<tên>[:/path] — access log/webroot BÊN TRONG container
-# Operator đọc tin nhắn phân biệt ngay alert của host và của container nào.
-# Evidence là JSONL: quét bằng awk một lượt (batch lớn vẫn nhanh), tối đa 5 tên.
+# docker:<tên>[:<cid12>]      — json log stdout (plugin docker_logs)
+# container:<tên>[:<cid12>][:...path] — access log/webroot BÊN TRONG container
+# Operator đọc tin nhắn phân biệt ngay alert của host và của container nào
+# (tên + id 12 ký tự). Evidence là JSONL: quét awk một lượt, tối đa 5 tên.
 _containers_json() {
   [[ -s $EVIDENCE ]] || { printf '[]'; return; }
   awk '
@@ -109,13 +109,25 @@ _containers_json() {
         else next
       }
       q = index(f, "\""); if (q > 0) f = substr(f, 1, q - 1)
-      c = index(f, ":");  if (c > 0) f = substr(f, 1, c - 1)
-      if (f != "" && !(f in seen)) { seen[f] = 1; order[++n] = f }
+      # bóc name rồi đoạn kế tiếp: 12 hex là cid12, còn lại (path...) bỏ qua
+      id = ""
+      c = index(f, ":")
+      if (c > 0) {
+        seg = substr(f, c + 1); f = substr(f, 1, c - 1)
+        c2 = index(seg, ":"); if (c2 > 0) seg = substr(seg, 1, c2 - 1)
+        if (length(seg) == 12 && seg ~ /^[0-9a-f]+$/) id = seg
+      }
+      disp = f
+      if (f != "" && !(f in seen)) { seen[f] = id; order[++n] = f }
+      else if (f in seen && seen[f] == "" && id != "") seen[f] = id
     }
     END {
       printf "["
       m = (n < 5 ? n : 5)
-      for (j = 1; j <= m; j++) printf "%s\"%s\"", (j > 1 ? "," : ""), order[j]
+      for (j = 1; j <= m; j++) {
+        f = order[j]; id = seen[f]
+        printf "%s\"%s\"", (j > 1 ? "," : ""), (id != "" ? f " (" id ")" : f)
+      }
       printf "]"
     }
   ' "$EVIDENCE"

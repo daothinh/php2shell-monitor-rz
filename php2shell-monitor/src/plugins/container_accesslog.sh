@@ -91,7 +91,7 @@ parse_container_access() {
     # realfile: alert phải chỉ được container nào, không phải đường dẫn
     # /proc/<pid>/root/var/log/nginx/access.log.
     awk -f "$P2S_SRC_DIR/lib/accesslog.awk" -v src=access_log \
-        -v realfile="container:$name" -v startline="$line_no" "$chunk" | tee "$chunk.out"
+        -v realfile="container:$name:${cid:0:12}" -v startline="$line_no" "$chunk" | tee "$chunk.out"
     emitted=$(wc -l <"$chunk.out")
     read_lines=$(LC_ALL=C awk 'END { print NR }' "$chunk" 2>/dev/null)
     [[ -n $read_lines ]] || read_lines=$emitted

@@ -51,6 +51,10 @@ if [[ -d $DOCKER_LOG_DIR && -r $DOCKER_LOG_DIR ]]; then
     name=$(grep -o '"Name":"[^"]*"' "$d/config.v2.json" 2>/dev/null | head -1 | cut -d'"' -f4)
     name=${name#/}
     name=${name:-${cid:0:12}}
+    cid12=${cid:0:12}
+    # id kèm tên để tin nhắn phân biệt container cùng tên trên 2 máy khác nhau;
+    # name đã lùi về cid12 thì không lặp lại
+    [[ $name == "$cid12" ]] && dlabel="docker:$name" || dlabel="docker:$name:$cid12"
 
     # batch_parse_awk: đọc phần byte mới, chạy awk MỘT lần, cập nhật offset.
     # realfile override đường dẫn thật bằng "docker:<tên container>": alert phải
@@ -58,7 +62,7 @@ if [[ -d $DOCKER_LOG_DIR && -r $DOCKER_LOG_DIR ]]; then
     # theo đường dẫn thật (bash giữ $jf), nên đổi tên container không làm mất
     # tiến độ đọc.
     batch_parse_awk "$jf" access_log dockerlog.awk \
-      -v realfile="docker:$name" -v name="$name" \
+      -v realfile="$dlabel" -v name="$name" \
       -v accessre="$ACCESS_RE" -v markerre="$MARKER_RE"
   done
 fi
@@ -95,9 +99,10 @@ if (( ! found_json )); then
     rm -f -- "$tmp"
   }
 
-  docker ps --format '{{.Names}}' 2>/dev/null |
-  while IFS= read -r c; do
+  docker ps --format '{{.ID}}\t{{.Names}}' 2>/dev/null |
+  while IFS=$'\t' read -r cid12 c; do
     [[ -z $c ]] && continue
+    [[ $c == "$cid12" ]] && dlabel="docker:$c" || dlabel="docker:$c:$cid12"
     cur_ts=''; cur_seq=0
     x=$(_cursor_get "$c")
     if [[ -n $x ]]; then
@@ -143,7 +148,7 @@ if (( ! found_json )); then
 
     if [[ -s $raw ]]; then
       awk -f "$DOCKERLOG_AWK" \
-          -v realfile="docker:$c" -v startline=0 -v name="$c" \
+          -v realfile="$dlabel" -v startline=0 -v name="$c" \
           -v accessre="$ACCESS_RE" -v markerre="$MARKER_RE" \
           -v cli_ts=1 "$raw"
     fi

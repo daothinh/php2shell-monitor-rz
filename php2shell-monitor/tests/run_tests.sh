@@ -150,13 +150,14 @@ T "evidence: one record per hit"       "3" "$(wc -l <"$w/projects/test-project/d
 # operator phân biệt alert host và alert container ngay trên tin nhắn.
 hits2="$w/hits2.tsv"
 printf '%s\n' \
-  $'2026-10-24T00:00:01Z\taccess_log\tdocker:php-web\t7\t1.2.3.4\tGET\t/up.php?PHP_SESSION_UPLOAD_PROGRESS=x\t200\tphp2shell-109618\t\tGET /up.php\tP2S-008\tHIGH\t' \
+  $'2026-10-24T00:00:01Z\taccess_log\tdocker:php-web:aaaabbbbcccc\t7\t1.2.3.4\tGET\t/up.php?PHP_SESSION_UPLOAD_PROGRESS=x\t200\tphp2shell-109618\t\tGET /up.php\tP2S-008\tHIGH\t' \
   $'2026-10-24T00:00:02Z\taccess_log\tdocker:php-web\t8\t1.2.3.4\tGET\t/s.php?p=../../../etc/passwd\t200\tcurl\t\tGET /s.php\tP2S-052\tHIGH\t' \
-  $'2026-10-24T00:00:03Z\taccess_log\tcontainer:db-1:/var/log/nginx/access.log\t2\t1.2.3.4\tGET\t/x\t200\tcurl\t\tGET /x\tP2S-030\tHIGH\t' \
+  $'2026-10-24T00:00:03Z\taccess_log\tcontainer:db-1:111122223333:/var/log/nginx/access.log\t2\t1.2.3.4\tGET\t/x\t200\tcurl\t\tGET /x\tP2S-030\tHIGH\t' \
   >"$hits2"
 report "$w" "$hits2" "20261024T010000Z"
 alert2=$(tail -1 "$alert")
-T "containers: gom docker: + container: (dedup)" "php-web,db-1" \
+T "containers: gom tên + cid12 từ docker:/container: (dedup)" \
+  "php-web (aaaabbbbcccc),db-1 (111122223333)" \
   "$(jq -r '[.containers[]]|join(",")' <<<"$alert2")"
 # batch trước không có container nào -> mảng rỗng
 T "containers: alert host thi rong" "[]" "$(head -1 "$alert" | jq -c '.containers')"
@@ -554,6 +555,7 @@ T "docker: access line bung field uri" "PHP_SESSION_UPLOAD_PROGRESS" \
 T "docker: access line bung field method/status" $'POST\t' \
   "$(printf '%s' "$out" | awk -F'\t' '$2=="access_log"{print $6"\t"$8}')"
 T "docker: tên container lấy từ config.v2.json" "docker:web-php" "$out"
+T "docker: file record kèm cid12" "docker:web-php:abc123def456" "$out"
 T "docker: crash SIGSEGV giữ nguồn docker" "SIGSEGV" \
   "$(printf '%s' "$out" | awk -F'\t' '$2=="docker"{print $11}')"
 N "docker: dòng app lành tính bị lọc bỏ" "normal app line" "$out"
@@ -576,7 +578,7 @@ mkdir -p "$dstub"
 cat >"$dstub/docker" <<'DSTUB'
 #!/usr/bin/env bash
 case "$1" in
-  ps) printf 'web-cli\n' ;;
+  ps) printf 'abc123def456\tweb-cli\n' ;;
   logs) printf '1.2.3.4 - - [x] "GET /t HTTP/1.1" 200 1 "-" "php2shell-cli"\n' ;;
 esac
 DSTUB
@@ -601,7 +603,7 @@ mkdir -p "$dstub2"
 cat >"$dstub2/docker" <<'DSTUB2'
 #!/usr/bin/env bash
 self=$(dirname "$0")
-if [[ $1 == ps ]]; then printf 'old-box\n'; exit 0; fi
+if [[ $1 == ps ]]; then printf 'aaaabbbbcccc\told-box\n'; exit 0; fi
 printf '%s\n' "$*" >"$self/logs_args"
 # mô phỏng --since của docker: chỉ khi bị gọi --since 0 (epoch 0) mới trả
 # dòng log cổ đại; --since 10m thì không có dòng nào trong cửa sổ.
@@ -626,7 +628,7 @@ mkdir -p "$dstub3"
 cat >"$dstub3/docker" <<'DSTUB3'
 #!/usr/bin/env bash
 self=$(dirname "$0")
-if [[ $1 == ps ]]; then printf 'stub-box\n'; exit 0; fi
+if [[ $1 == ps ]]; then printf 'aaaabbbbcccc\tstub-box\n'; exit 0; fi
 since=''; prev=''
 for a in "$@"; do [[ $prev == --since ]] && since=$a; prev=$a; done
 printf '%s\n' "$*" >"$self/logs_args"
@@ -1029,8 +1031,8 @@ T "container: access log phát ra nguồn access_log" "yes" \
   "$(printf '%s' "$acc9" | grep -q 'access_log' && echo yes || echo no)"
 T "container: GIỮ query string page=" "yes" \
   "$(printf '%s' "$acc9" | grep -q 'page=/var/lib/php/sessions' && echo yes || echo no)"
-T "container: file hiển thị container:<tên>" "yes" \
-  "$(printf '%s' "$acc9" | grep -q 'container:web-one' && echo yes || echo no)"
+T "container: file hiển thị container:<tên>:<cid12>" "yes" \
+  "$(printf '%s' "$acc9" | grep -q 'container:web-one:aaaabbbbcccc' && echo yes || echo no)"
 T "container: bóc được request_length 15MB" "yes" \
   "$(printf '%s' "$acc9" | grep -q '15000556' && echo yes || echo no)"
 
