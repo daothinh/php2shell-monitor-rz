@@ -248,18 +248,23 @@ def test_telegram_message_matches_compact_template(env):
     client, cfg, tg = env
     _, key = _project_with_key(cfg)
     client.post("/api/v1/ingest-log", headers={"X-API-Key": key},
-                json={"host": "web01", "lan_ip": "10.0.0.15", "alerts": [_alert()]})
+                json={"host": "web01", "lan_ip": "10.0.0.15",
+                      "os": "Ubuntu 24.04.1 LTS", "env": "Docker Container",
+                      "alerts": [_alert()]})
     assert len(tg.sent) == 1
     text = tg.sent[0][1]
     lines = text.split("\n")
-    assert len(lines) == 5, text
-    assert lines[0].startswith("🛡 <b>Central Security Alert</b> - 24/10/2026 - ")
+    assert lines[0] == "🛡 <b>CENTRAL SECURITY ALERT</b>"
+    assert lines[1].startswith("📅 <i>24/10/2026 - ")
     # P2S-020 carries impact=rce -> CRITICAL, headline must say the box is owned
-    assert lines[1].startswith("🚨 <b>CRITICAL</b> · Server bị chiếm quyền (RCE)")
-    assert "3 events" in lines[1]
-    assert lines[2] == "📦 Dự án: <b>khach-hang-a</b>"
-    assert lines[3] == "🚨 User: <b>root</b> - Hostname: <b>web01</b>"
-    assert lines[4] == "🖥 IP LAN: <b>10.0.0.15</b>"
+    assert "🚨 <b>Mức độ:</b> <code>CRITICAL</code>" in text
+    assert "⚠️ <b>Sự kiện:</b> Server bị chiếm quyền (RCE)" in text
+    assert "📊 <b>Tổng số Events:</b> <code>3</code>" in text
+    assert "📦 <b>Dự án:</b> <code>khach-hang-a</code>" in text
+    assert "🖥 <b>Môi trường / OS:</b> <b>[Docker Container]</b> <code>Ubuntu 24.04.1 LTS</code>" in text
+    assert "👤 <b>User:</b> <code>root</code>" in text
+    assert "🏷 <b>Hostname:</b> <code>web01</code>" in text
+    assert "🌐 <b>IP LAN:</b> <code>10.0.0.15</code>" in text
 
 
 def test_telegram_message_subminute_window_is_escaped(env):
@@ -274,7 +279,7 @@ def test_telegram_message_subminute_window_is_escaped(env):
                 json={"host": "web01", "alerts": [a]})
     text = tg.sent[0][1]
     # Số event thay cho "hit / phút"; không còn ký tự < nào lọt vào HTML.
-    assert "3 events" in text
+    assert "📊 <b>Tổng số Events:</b> <code>3</code>" in text
     assert "<1 phút" not in text
 
 
@@ -283,8 +288,8 @@ def test_telegram_message_without_lan_ip(env):
     _, key = _project_with_key(cfg)
     client.post("/api/v1/ingest-log", headers={"X-API-Key": key},
                 json={"host": "web01", "alerts": [_alert()]})
-    # Không rõ IP LAN thì ghi rõ "không rõ", không bỏ dòng (giữ shape 5 dòng).
-    assert tg.sent[0][1].split("\n")[4] == "🖥 IP LAN: <b>không rõ</b>"
+    # Không rõ IP LAN thì ghi rõ "không rõ", không bỏ dòng.
+    assert "🌐 <b>IP LAN:</b> <code>không rõ</code>" in tg.sent[0][1]
 
 
 def test_ingest_requires_valid_key(env):
@@ -576,6 +581,46 @@ def test_unlink_stops_alerts_for_project(env):
     assert "Không tìm thấy" in tg.sent[-1][1]
 
 
+def test_unlink_revokes_keys_and_classifies_401(env):
+    """/unlink thu hồi TOÀN BỘ key của dự án; 401 sau đó nêu đúng lý do
+    (detail.code=project_disabled) và /whoami là health-check cho agent:
+    200 khi pairing sống, 401 code khi bị ngắt — agent phía máy phân biệt
+    được "phải chạy deploy lại" với key sai thường."""
+    client, cfg, tg = env
+    chat = 8013
+    r = _register_chatid(client, "revoked", chat)
+    key = client.get(f"/api/v1/pairing-status?code={r['pair_ref']}").json()["api_key"]
+
+    ok = client.get("/api/v1/whoami", headers={"X-API-Key": key})
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["status"] == "linked" and body["project_name"] == "revoked"
+
+    bot = _bot(cfg, tg)
+    asyncio.run(bot.handle_update(_msg(chat, "/unlink revoked")))
+
+    gone = client.get("/api/v1/whoami", headers={"X-API-Key": key})
+    assert gone.status_code == 401
+    assert gone.json()["detail"]["code"] == "project_disabled"
+
+    resp = client.post("/api/v1/ingest-log", headers={"X-API-Key": key},
+                       json={"host": "w", "alerts": [_alert()]})
+    assert resp.status_code == 401
+    assert resp.json()["detail"]["code"] == "project_disabled"
+
+    # key chưa từng tồn tại: 401 thông thường (detail string), không có code
+    bad = client.get("/api/v1/whoami", headers={"X-API-Key": "p2s_never"})
+    assert bad.status_code == 401
+    assert not isinstance(bad.json()["detail"], dict)
+
+    # pair lại cùng (tên, chat): tái dụng row, key MỚI sống, key cũ vẫn chết
+    r2 = _register_chatid(client, "revoked", chat)
+    key2 = client.get(f"/api/v1/pairing-status?code={r2['pair_ref']}").json()["api_key"]
+    assert key2 != key
+    assert client.get("/api/v1/whoami", headers={"X-API-Key": key2}).status_code == 200
+    assert client.get("/api/v1/whoami", headers={"X-API-Key": key}).status_code == 401
+
+
 def test_register_chatid_validates_input(env):
     client, cfg, tg = env
     for bad in ("abc", "12", "0", "--100", "+100"):
@@ -712,19 +757,58 @@ def test_format_alert_matches_template():
         "batch_id": "20261025T165000Z",
         "severity": "MODERATE", "hits": 6740,
         "host": "web-01", "user": "www-data", "hostname": "ip-10-0-1-5",
-        "lan_ip": "10.0.1.5",
+        "lan_ip": "10.0.1.5", "os": "Ubuntu 24.04.1 LTS (Docker)",
+        "env": "Docker Container",
         "ts_utc": "2026-10-25T16:50:00Z",
-        "evidence": [{"rule_id": "P2S-050", "impact": ""}],
+        "window_start": "2026-10-25T16:45:00Z",
+        "window_end": "2026-10-25T16:50:00Z",
+        "rules": [{"rule_id": "P2S-050", "hits": 4211},
+                  {"rule_id": "P2S-017", "hits": 2529}],
+        "evidence": [{"rule_id": "P2S-050", "impact": "",
+                      "ip": "203.0.113.42",
+                      "raw": 'GET /page.php?file=/var/lib/php/sessions/sess_ab12 HTTP/1.1'}],
     }
-    lines = format_alert("prod-shop", alert,
-                         ZoneInfo("Asia/Ho_Chi_Minh")).split("\n")
-    assert len(lines) == 5
-    assert lines[0] == "🛡 <b>Central Security Alert</b> - 25/10/2026 - 23:50"
-    assert lines[1] == ("🟡 <b>MODERATE</b> · Server đang bị khai thác php2shell"
-                        " · 6740 events")
-    assert lines[2] == "📦 Dự án: <b>prod-shop</b>"
-    assert lines[3] == "🟡 User: <b>www-data</b> - Hostname: <b>ip-10-0-1-5</b>"
-    assert lines[4] == "🖥 IP LAN: <b>10.0.1.5</b>"
+    msg = format_alert("prod-shop", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
+    lines = msg.split("\n")
+    assert lines[0] == "🛡 <b>CENTRAL SECURITY ALERT</b>"
+    assert lines[1] == "📅 <i>25/10/2026 - 23:50</i>"
+    assert "🚨 <b>Mức độ:</b> <code>MODERATE</code>" in msg
+    assert "⚠️ <b>Sự kiện:</b> Server đang bị khai thác php2shell" in msg
+    assert "📊 <b>Tổng số Events:</b> <code>6740</code>" in msg
+    # rule breakdown sắp theo số hit giảm dần
+    assert "🧩 <b>Rule:</b> <code>P2S-050</code> ×4211 · <code>P2S-017</code> ×2529" in msg
+    # cửa sổ sự kiện theo giờ địa phương
+    assert "⏱ <b>Thời gian sự kiện:</b> 23:45 → 23:50" in msg
+    assert "🔖 <b>Batch:</b> <code>20261025T165000Z</code>" in msg
+    assert "📦 <b>Dự án:</b> <code>prod-shop</code>" in msg
+    assert ("🖥 <b>Môi trường / OS:</b> <b>[Docker Container]</b> "
+            "<code>Ubuntu 24.04.1 LTS (Docker)</code>") in msg
+    assert "👤 <b>User:</b> <code>www-data</code>" in msg
+    assert "🏷 <b>Hostname:</b> <code>ip-10-0-1-5</code>" in msg
+    assert "🌐 <b>IP LAN:</b> <code>10.0.1.5</code>" in msg
+    # evidence mẫu kèm IP của kẻ tấn công
+    assert ("🔎 <b>Mẫu evidence:</b>" in msg
+            and "203.0.113.42 GET /page.php?file=/var/lib/php/sessions/" in msg)
+    # không vượt giới hạn Telegram
+    assert len(msg) <= 4096
+
+
+def test_format_alert_truncates_long_evidence_and_caps_rules():
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert
+
+    alert = {
+        "severity": "HIGH", "hits": 999,
+        "rules": [{"rule_id": f"P2S-{i:03d}", "hits": 10 - i} for i in range(9)],
+        "evidence": [{"rule_id": "P2S-001", "ip": "1.2.3.4",
+                      "raw": "x" * 500}] * 5,
+        "ts_utc": "2026-10-25T16:50:00Z",
+    }
+    msg = format_alert("p", alert, ZoneInfo("UTC"))
+    assert "+3 rule khác" in msg               # chỉ liệt kê 6 rule đầu
+    sample_lines = [ln for ln in msg.split("\n") if ln.startswith("<code>")]
+    assert len(sample_lines) <= 3              # tối đa 3 mẫu evidence
+    assert all(len(ln) <= 130 for ln in sample_lines)  # mỗi mẫu bị cắt ngắn
 
 
 def test_format_alert_critical_uses_rce_headline():
@@ -736,7 +820,9 @@ def test_format_alert_critical_uses_rce_headline():
              "ts_utc": "2026-10-25T16:50:00Z",
              "evidence": [{"rule_id": "P2S-056", "impact": "rce"}]}
     msg = format_alert("prod", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
-    assert "🚨 <b>CRITICAL</b> · Server bị chiếm quyền (RCE) · 3 events" in msg
+    assert "🚨 <b>Mức độ:</b> <code>CRITICAL</code>" in msg
+    assert "⚠️ <b>Sự kiện:</b> Server bị chiếm quyền (RCE)" in msg
+    assert "📊 <b>Tổng số Events:</b> <code>3</code>" in msg
 
 
 # ------------------------------------------------------------ evidence layout

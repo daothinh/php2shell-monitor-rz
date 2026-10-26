@@ -117,16 +117,17 @@ def _headline(alert: dict) -> str:
         return "Dấu hiệu dò quét php2shell"
     return "Server đang bị khai thác php2shell"
 def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
-    """One batch alert -> one 5-line Telegram message.
+    """One batch alert -> one detailed Telegram message.
 
-    🛡 Central Security Alert - dd/mm/yyyy - hh:mm
-    <emoji> <SEVERITY> · <what happened> · <n> events
-    📦 Dự án: <project>
-    <emoji> User: <user> - Hostname: <hostname>
-    🖥 IP LAN: <lan ip>
+    🛡 CENTRAL SECURITY ALERT · 📅 thời điểm gửi
+    🚨 Mức độ · ⚠️ Sự kiện · 📊 Tổng số Events
+    🧩 Rule ×số hit · ⏱ cửa sổ sự kiện · 🔖 batch id
+    📦 Dự án · 🖥 Môi trường/OS · 👤 User · 🏷 Hostname · 🌐 IP LAN
+    🔎 3 dòng evidence mẫu (raw, kèm IP khi có)
 
     Full evidence (every raw hit with file:line) stays on the server
-    (`GET /api/v1/alerts/<id>`) and in the evidence mirror.
+    (`GET /api/v1/alerts/<id>`) and in the evidence mirror — tin nhắn chỉ mang
+    đủ để nhận mặt tấn công, không quá giới hạn 4096 ký tự của Telegram.
     """
     esc = html.escape
     sev = _sev(alert)
@@ -138,7 +139,6 @@ def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
     hits = alert.get("evidence") or []
     total = int(alert.get("hits") or len(hits))
     what = esc(_headline(alert))
-    freq = f"{total} events"
 
     # "User" is the OS account the monitor runs as — the account that would own
     # any dropped shell. "Hostname" is what the machine calls itself. Both come
@@ -147,14 +147,75 @@ def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
     user = str(alert.get("user") or "").strip()[:64] or "không rõ"
     hostname = str(alert.get("hostname") or alert.get("host") or alert.get("device") or "?")[:64]
     lan_ip = str(alert.get("lan_ip") or "").strip()[:64] or "không rõ"
+    env = str(alert.get("env") or "").strip()[:32] or "Không rõ"
+    os_name = str(alert.get("os") or "").strip()[:80] or "không rõ"
 
-    return "\n".join([
-        f"🛡 <b>Central Security Alert</b> - {when:%d/%m/%Y} - {when:%H:%M}",
-        f"{emoji} <b>{esc(sev)}</b> · {what} · {freq}",
-        f"📦 Dự án: <b>{esc(project_name[:64])}</b>",
-        f"{emoji} User: <b>{esc(user)}</b> - Hostname: <b>{esc(hostname)}</b>",
-        f"🖥 IP LAN: <b>{esc(lan_ip)}</b>",
-    ])
+    lines = [
+        "🛡 <b>CENTRAL SECURITY ALERT</b>",
+        f"📅 <i>{when:%d/%m/%Y} - {when:%H:%M}</i>",
+        "",
+        f"🚨 <b>Mức độ:</b> <code>{esc(sev)}</code>",
+        f"⚠️ <b>Sự kiện:</b> {what}",
+        f"📊 <b>Tổng số Events:</b> <code>{total}</code>",
+    ]
+
+    # Rule breakdown từ counter — kể cả khi evidence[] đã bị cắt inline
+    rules = [(str(r.get("rule_id") or ""), int(r.get("hits") or 0))
+             for r in (alert.get("rules") or []) if isinstance(r, dict) and r.get("rule_id")]
+    if not rules:  # payload legacy không có counters: gom từ evidence
+        seen: dict[str, int] = {}
+        for h in hits:
+            for rid in _split_ids((h or {}).get("rule_id")):
+                seen[rid] = seen.get(rid, 0) + 1
+        rules = sorted(seen.items(), key=lambda x: (-x[1], x[0]))
+    if rules:
+        rules.sort(key=lambda x: (-x[1], x[0]))
+        parts = [f"<code>{esc(rid)}</code> ×{n}" for rid, n in rules[:6]]
+        if len(rules) > 6:
+            parts.append(f"+{len(rules) - 6} rule khác")
+        lines.append(f"🧩 <b>Rule:</b> " + " · ".join(parts))
+
+    ws = _parse_ts(alert.get("window_start"))
+    we = _parse_ts(alert.get("window_end"))
+    if ws and we:
+        ws, we = ws.astimezone(tz), we.astimezone(tz)
+        span = f"{ws:%H:%M} → {we:%H:%M}" if ws.date() == we.date() \
+            else f"{ws:%d/%m %H:%M} → {we:%d/%m %H:%M}"
+        lines.append(f"⏱ <b>Thời gian sự kiện:</b> {span}")
+
+    batch = str(alert.get("batch_id") or "")[:40]
+    if batch:
+        lines.append(f"🔖 <b>Batch:</b> <code>{esc(batch)}</code>")
+
+    lines += [
+        "",
+        f"📦 <b>Dự án:</b> <code>{esc(project_name[:64])}</code>",
+        f"🖥 <b>Môi trường / OS:</b> <b>[{esc(env)}]</b> <code>{esc(os_name)}</code>",
+        f"👤 <b>User:</b> <code>{esc(user)}</code>",
+        f"🏷 <b>Hostname:</b> <code>{esc(hostname)}</code>",
+        f"🌐 <b>IP LAN:</b> <code>{esc(lan_ip)}</code>",
+    ]
+
+    # 3 dòng evidence đầu: đủ nhận mặt tấn công ngay trên chat
+    samples: list[str] = []
+    for h in hits:
+        if not isinstance(h, dict):
+            continue
+        raw = str(h.get("raw") or h.get("msg") or "").strip()
+        if not raw:
+            continue
+        src = str(h.get("ip") or "").strip()
+        sample = f"{src} {raw}" if src and not raw.startswith(src) else raw
+        if len(sample) > 110:
+            sample = sample[:107] + "..."
+        samples.append(sample)
+        if len(samples) >= 3:
+            break
+    if samples:
+        lines += ["", "🔎 <b>Mẫu evidence:</b>"]
+        lines += [f"<code>{esc(s)}</code>" for s in samples]
+
+    return "\n".join(lines)
 
 
 class TelegramClient:
@@ -387,9 +448,14 @@ class PairingBot:
         await self.tg.send_message(
             chat_id,
             f"🚫 <b>Đã ngắt dự án {html.escape(name)}</b>\n"
-            "Alert từ dự án này sẽ KHÔNG còn gửi vào chat (lịch sử alert vẫn"
-            " được lưu trên server trung tâm).\n"
-            "Muốn ghép lại: chạy <code>pair</code> trên server của dự án.",
+            "Alert từ dự án này sẽ KHÔNG còn gửi vào chat, mọi API key của dự"
+            " án đã bị thu hồi (lịch sử alert vẫn được lưu trên server trung"
+            " tâm).\n"
+            "Muốn ghép lại: trên máy dự án chạy lại đúng lệnh deploy\n"
+            f"<code>php2shell-monitor.sh --project {html.escape(name)}"
+            " --chatid &lt;chat-id&gt;</code>\n"
+            "— script tự phát hiện key đã chết và ghép nối lại, không cần"
+            " gõ thêm gì.",
         )
 
     # ------------------------------------------------------------- lệnh

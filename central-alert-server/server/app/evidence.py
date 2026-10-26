@@ -55,7 +55,8 @@ def write_evidence(cfg: Config, project: str, alert: dict) -> str:
 
 
 def normalize(alert: dict, default_host: str = "", default_lan_ip: str = "",
-              default_user: str = "") -> dict:
+              default_user: str = "", default_os: str = "",
+              default_env: str = "") -> dict:
     """Coerce an incoming alert into the batch-alert shape the store expects.
 
     The monitor already sends this shape; the fallbacks keep hand-written or
@@ -98,6 +99,8 @@ def normalize(alert: dict, default_host: str = "", default_lan_ip: str = "",
     a["device"] = a.get("device") or a.get("host") or default_host or "unknown"
     a["lan_ip"] = a.get("lan_ip") or default_lan_ip
     a["user"] = str(a.get("user") or default_user or "")
+    a["os"] = str(a.get("os") or default_os or "")
+    a["env"] = str(a.get("env") or default_env or "")
     return a
 
 

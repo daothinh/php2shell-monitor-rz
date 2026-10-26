@@ -275,6 +275,25 @@ def project_by_api_key_hash(db_path: str, key_hash: str) -> Optional[sqlite3.Row
         ).fetchone()
 
 
+def api_key_owner(db_path: str, key_hash: str) -> Optional[sqlite3.Row]:
+    """Tra dự án sở hữu key hash BẤT KỂ trạng thái (active, project.status).
+
+    KHÔNG dùng để xác thực — chỉ để phân loại lỗi 401 (key chưa từng tồn tại
+    khác với dự án đã bị /unlink) và trả /whoami, để agent phía máy phân biệt
+    "phải pair lại" với "thử lại sau".
+    """
+    with connect(db_path) as conn:
+        return conn.execute(
+            """
+            SELECT p.* FROM api_keys k
+            JOIN projects p ON p.id = k.project_id
+            WHERE k.key_hash = ?
+            ORDER BY k.active DESC, k.id DESC LIMIT 1
+            """,
+            (key_hash,),
+        ).fetchone()
+
+
 def count_projects(db_path: str) -> int:
     with connect(db_path) as conn:
         return conn.execute("SELECT COUNT(*) AS n FROM projects").fetchone()["n"]
@@ -412,17 +431,24 @@ def auto_link_code(db_path: str, code: str, gen_api_key, key_hash,
 
 
 def unlink_project(db_path: str, project_name: str, chat_id: str) -> Optional[str]:
-    """/unlink: ngắt một dự án khỏi chat (status=disabled — alert dừng gửi,
-    lịch sử giữ nguyên). Trả về tên dự án đã ngắt, None nếu không tìm thấy."""
+    """/unlink: ngắt một dự án khỏi chat (status=disabled) và THU HỒI toàn bộ
+    API key của dự án (active=0). Alert dừng gửi, key trong conf trên các máy
+    chết hẳn — agent gọi /whoami hoặc bị 401 sẽ biết phải chạy deploy lại để
+    ghép nối lại (lúc đó auto_link cấp key mới). Lịch sử alert giữ nguyên.
+    Trả về tên dự án đã ngắt, None nếu không tìm thấy."""
     with _WRITE_LOCK, connect(db_path) as conn:
-        cur = conn.execute(
-            "UPDATE projects SET status = 'disabled'"
+        row = conn.execute(
+            "SELECT id FROM projects"
             " WHERE project_name = ? AND telegram_chat_id = ? AND status = 'linked'",
             (project_name, str(chat_id)),
-        )
-        if cur.rowcount:
-            return project_name
-        return None
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("UPDATE projects SET status = 'disabled' WHERE id = ?",
+                     (int(row["id"]),))
+        conn.execute("UPDATE api_keys SET active = 0 WHERE project_id = ?",
+                     (int(row["id"]),))
+        return project_name
 
 
 def pairing_status(db_path: str, code: str) -> Optional[dict]:

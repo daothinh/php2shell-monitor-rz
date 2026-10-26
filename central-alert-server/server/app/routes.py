@@ -51,6 +51,23 @@ def _tz(request: Request) -> ZoneInfo:
     return request.app.state.tz
 
 
+def _key_rejection(cfg: Config, api_key: str) -> HTTPException:
+    """401 có phân loại lý do: dự án bị ngắt (/unlink) khác key không hợp lệ.
+
+    Agent phía máy đọc detail.code (project_disabled) để biết phải chạy lại
+    lệnh deploy thay vì retry mù — /unlink trên bot không có kênh báo ngược
+    về thiết bị nên đây là cách máy tự phát hiện.
+    """
+    owner = db.api_key_owner(cfg.database_path, sha256_hex(api_key))
+    if owner is not None:
+        return HTTPException(401, detail={
+            "code": "project_disabled",
+            "message": "Dự án đã bị ngắt (/unlink trên bot) — chạy lại lệnh"
+                       " deploy trên máy để ghép nối lại",
+        })
+    return HTTPException(401, "API key không hợp lệ hoặc dự án chưa ghép nối")
+
+
 def _read_scope(request: Request, x_api_key: str = Header(default=""),
                 authorization: str = Header(default=""),
                 x_admin_token: str = Header(default=""),
@@ -71,7 +88,7 @@ def _read_scope(request: Request, x_api_key: str = Header(default=""),
                                  "X-Read-Token hoặc X-Admin-Token")
     project = db.project_by_api_key_hash(cfg.database_path, sha256_hex(api_key))
     if project is None:
-        raise HTTPException(401, "API key không hợp lệ hoặc dự án chưa ghép nối")
+        raise _key_rejection(cfg, api_key)
     return int(project["id"])
 
 
@@ -153,6 +170,32 @@ def pairing_status(code: str, request: Request):
     return st
 
 
+@router.get("/whoami")
+def whoami(request: Request, x_api_key: str = Header(default=""),
+           authorization: str = Header(default="")):
+    """Health-check ghép nối cho agent: key này còn sống không, thuộc dự án nào.
+
+    200 = pairing còn hiệu lực (agent giữ nguyên conf). 401 kèm
+    detail.code=project_disabled = bị /unlink trên bot → agent/phía deploy
+    phải ghép nối lại. Nhẹ và không tác dụng phụ — dùng cho guard idempotent
+    của script, thay vì chỉ tin file conf local.
+    """
+    cfg = _cfg(request)
+    api_key = x_api_key or (authorization[7:] if authorization.lower().startswith("bearer ") else "")
+    if not api_key:
+        raise HTTPException(401, "Thiếu API key (header X-API-Key hoặc Authorization: Bearer)")
+    key_hash = sha256_hex(api_key)
+    project = db.project_by_api_key_hash(cfg.database_path, key_hash)
+    if project is not None:
+        return {
+            "status": "linked",
+            "project_id": int(project["id"]),
+            "project_name": project["project_name"],
+            "chat_id": project["telegram_chat_id"],
+        }
+    raise _key_rejection(cfg, api_key)
+
+
 # ------------------------------------------------------- ingest evidence
 
 @router.post("/ingest-evidence")
@@ -211,6 +254,8 @@ class IngestBody(BaseModel):
     device: Optional[str] = Field(default=None, max_length=64)
     lan_ip: Optional[str] = Field(default=None, max_length=64)
     user: Optional[str] = Field(default=None, max_length=64)
+    os: Optional[str] = Field(default=None, max_length=80)     # PRETTY_NAME, vd Ubuntu 24.04.1 LTS
+    env: Optional[str] = Field(default=None, max_length=32)    # Docker Container / Container / Host
     alerts: list[dict[str, Any]] = Field(min_length=1)
 
 
@@ -224,7 +269,7 @@ def _auth_project(request: Request, api_key: str) -> Any:
         raise HTTPException(429, f"Quá nhanh; thử lại sau {retry}s")
     project = db.project_by_api_key_hash(cfg.database_path, sha256_hex(api_key))
     if project is None:
-        raise HTTPException(401, "API key không hợp lệ hoặc dự án chưa ghép nối")
+        raise _key_rejection(cfg, api_key)
     return project
 
 
@@ -257,7 +302,7 @@ async def ingest_log(
 
     for raw_alert in body.alerts[: cfg.max_alerts_per_request]:
         alert = evidence.normalize(raw_alert, body.host or "", body.lan_ip or "",
-                                   body.user or "")
+                                   body.user or "", body.os or "", body.env or "")
         device_name = body.device or evidence.device_of(alert, body.host or "")
         device_id = db.upsert_device(cfg.database_path, project["id"], device_name)
 
