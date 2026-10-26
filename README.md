@@ -6,7 +6,7 @@ Hệ thống giám sát thời gian thực bằng Bash script, tự động phá
 
 ---
 
-## 🚀 Hướng dẫn sử dụng (Quick Start)
+## 🚀 Quick Start
 
 ### 1. Tải công cụ
 - **Download:** [github.com/daothinh/php2shell-monitor-rz/releases](https://github.com/daothinh/php2shell-monitor-rz/releases)
