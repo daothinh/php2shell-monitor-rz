@@ -9,18 +9,18 @@ Hệ thống giám sát thời gian thực bằng Bash script, tự động phá
 ## 🚀 Quick Start
 
 ### 1. Tải công cụ
-- **Tải trực tiếp:** [php2shell-monitor.sh](https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh)
-- **Checksum:** [php2shell-monitor.sh.sha256](https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh.sha256)
+- **Bản mới nhất:** [php2shell-monitor-1.2.2.sh](https://github.com/daothinh/php2shell-monitor-rz/releases/download/v1.2.2/php2shell-monitor-1.2.2.sh)
+- **Checksum:** [php2shell-monitor-1.2.2.sh.sha256](https://github.com/daothinh/php2shell-monitor-rz/releases/download/v1.2.2/php2shell-monitor-1.2.2.sh.sha256)
 - **Trang Release:** [github.com/daothinh/php2shell-monitor-rz/releases](https://github.com/daothinh/php2shell-monitor-rz/releases)
 
 ```bash
-curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh
-curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh.sha256
-echo "$(cut -d' ' -f1 php2shell-monitor.sh.sha256)  php2shell-monitor.sh" | sha256sum -c -
-chmod +x php2shell-monitor.sh
+curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/download/v1.2.2/php2shell-monitor-1.2.2.sh
+curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/download/v1.2.2/php2shell-monitor-1.2.2.sh.sha256
+sha256sum -c php2shell-monitor-1.2.2.sh.sha256
+chmod +x php2shell-monitor-1.2.2.sh
 ```
 
-> File `.sha256` sinh từ pipeline build nên bên trong ghi đường dẫn `dist/php2shell-monitor.sh`; lệnh trên ghép lại checksum với tên file sau khi tải để xác minh đúng.
+> Tên file có hậu tố version để phân biệt giữa các bản. File `.sha256` đã trỏ đúng tên file nên `sha256sum -c` chạy trực tiếp được.
 
 ### 2. Thiết lập nhận thông báo qua Telegram
 
@@ -49,5 +49,5 @@ Bạn có thể chọn nhận cảnh báo bảo mật về tin nhắn Cá nhân 
 Mở Terminal trên máy chủ, cấp quyền thực thi (nếu cần) và chạy lệnh sau với quyền root:
 
 ```bash
-chmod +x php2shell-monitor.sh
-sudo ./php2shell-monitor.sh --project "<tên_dự_án>" --chatid "<Chat_ID>"
+chmod +x php2shell-monitor-1.2.2.sh
+sudo ./php2shell-monitor-1.2.2.sh --project "<tên_dự_án>" --chatid "<Chat_ID>"
