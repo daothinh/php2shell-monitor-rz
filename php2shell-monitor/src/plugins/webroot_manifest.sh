@@ -7,6 +7,7 @@
 # checked only for those same files.
 set -u
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/container.sh"
 
 plugin_name=webroot
 export plugin_name
@@ -27,27 +28,61 @@ webroot_dirs() {
   return 0
 }
 
+# container_webroot_dirs — webroot BÊN TRONG từng container đang chạy, qua
+# /proc/<pid>/root (xem lib/container.sh). Host không có /var/www/html khi ứng
+# dụng chạy trong container, nên webroot_dirs() ở trên quét rỗng và webshell
+# đã drop vào container không bao giờ bị thấy — đó là lỗ hổng thật đã bỏ sót
+# s.php trên php2shell-lab-1.
+container_webroot_dirs() {
+  local _short _name _pid rootfs _cid d
+  while IFS=$'\t' read -r _short _name _pid rootfs _cid; do
+    [[ -n $rootfs ]] || continue
+    # Chỉ lấy thư mục NÔNG NHẤT còn tồn tại: /var/www/html đã bao /var/www,
+    # nên quét cả hai làm mỗi file xuất hiện hai lần trong manifest và mỗi
+    # webshell bị báo hai lần trong cùng một alert.
+    for d in /var/www/html /usr/share/nginx/html /var/www; do
+      if [[ -d "$rootfs$d" && -r "$rootfs$d" ]]; then
+        printf '%s\n' "$rootfs$d"
+        break
+      fi
+    done
+  done < <(p2s_containers)
+}
+
 tmp="$P2S_TMP_DIR/webroot.scan.$$"
 : >"$tmp"
 while IFS= read -r d; do
   [[ -n $d ]] || continue
-  find "$d" -xdev -type f \
+  # -L để theo symlink trong container (một số image symlink webroot), nhưng
+  # -xdev vẫn giữ phạm vi trong một filesystem.
+  find -L "$d" -xdev -type f \
     \( -name '*.php' -o -name '*.phtml' -o -name '*.phar' -o -name '*.php5' \
        -o -name '*.inc' -o -name '.user.ini' -o -name '.htaccess' -o -name '*.sh' \) \
     -printf '%p\t%s\t%T@\t%U\n' 2>/dev/null >>"$tmp"
-done < <(webroot_dirs)
+done < <(webroot_dirs; container_webroot_dirs)
 
 # First run: adopt the current tree as baseline, emit nothing (no noise).
+# Manifest lưu khoá ỔN ĐỊNH (xem p2s_container_manifest_key): với file trong
+# container là "container:<cid>:<relpath>", không phải /proc/<pid>/root/...
+# nên restart container không làm toàn bộ webroot trông như "file NEW".
 if [[ ! -s $MANIFEST ]]; then
-  { printf '# path\tsize\tmtime\towner\n'; sort -u "$tmp"; } >"$MANIFEST.tmp.$$" &&
-    mv -f -- "$MANIFEST.tmp.$$" "$MANIFEST"
+  {
+    printf '# path\tsize\tmtime\towner\n'
+    while IFS=$'\t' read -r path sz mt own; do
+      [[ -n $path ]] || continue
+      printf '%s\t%s\t%s\t%s\n' "$(p2s_container_manifest_key "$path")" "$sz" "$mt" "$own"
+    done <"$tmp" | sort -u
+  } >"$MANIFEST.tmp.$$" && mv -f -- "$MANIFEST.tmp.$$" "$MANIFEST"
   rm -f -- "$tmp"
   exit 0
 fi
 
 while IFS=$'\t' read -r path sz mt own; do
   [[ -z $path ]] && continue
-  prev=$(grep -F -- "$path	" "$MANIFEST" | head -1)
+  key=$(p2s_container_manifest_key "$path")
+  # Tên hiển thị trong alert: container:<tên>:/var/www/html/s.php
+  disp=$(p2s_container_display "$path")
+  prev=$(grep -F -- "$key	" "$MANIFEST" | head -1)
   changed=0
   if [[ -n $prev ]]; then
     psz=$(printf '%s' "$prev" | cut -f2)
@@ -56,14 +91,14 @@ while IFS=$'\t' read -r path sz mt own; do
     if [[ $psz != "$sz" || ${pmt%%.*} != "${mt%%.*}" ]]; then
       changed=1
       P2S_TS=$(utc_now); export P2S_TS
-      emit_record webroot "$path" 0 "" "" "" "" "" "" \
-        "webroot file CHANGED: $path (size $psz->$sz, owner $pown->$own)" "-"
+      emit_record webroot "$disp" 0 "" "" "" "" "" "" \
+        "webroot file CHANGED: $disp (size $psz->$sz, owner $pown->$own)" "-"
     fi
   else
     changed=1
     P2S_TS=$(utc_now); export P2S_TS
-    emit_record webroot "$path" 0 "" "" "" "" "" "" \
-      "webroot file NEW: $path (size=$sz owner=$own)" "-"
+    emit_record webroot "$disp" 0 "" "" "" "" "" "" \
+      "webroot file NEW: $disp (size=$sz owner=$own)" "-"
   fi
 
   # Only inspect directives on files that just appeared or changed.
@@ -71,8 +106,8 @@ while IFS=$'\t' read -r path sz mt own; do
                          $path == *.htaccess || $path == */.htaccess ]]; then
     if grep -qiE 'auto_prepend_file' "$path" 2>/dev/null; then
       P2S_TS=$(utc_now); export P2S_TS
-      emit_record webroot "$path" 0 "" "" "" "" "" "" \
-        "auto_prepend_file directive found in $path" "-"
+      emit_record webroot "$disp" 0 "" "" "" "" "" "" \
+        "auto_prepend_file directive found in $disp" "-"
     fi
   fi
 done <"$tmp"
@@ -99,10 +134,12 @@ while IFS=$'\t' read -r path _sz _mt _own; do
     '(system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec|assert|eval|create_function|call_user_func(_array)?|preg_replace)[[:space:]]*\([^)]*\$_(REQUEST|GET|POST|COOKIE|SERVER|FILES)' \
     | head -1)
   [[ -n $hit ]] || continue
-  printf '%s\t%s\n' "$path" "$hit" >>"$SHELLS_NOW"
+  # Khoá ổn định cho webroot.shells.tsv, tên đọc được cho alert.
+  printf '%s\t%s\n' "$(p2s_container_manifest_key "$path")" "$hit" >>"$SHELLS_NOW"
+  disp=$(p2s_container_display "$path")
   P2S_TS=$(utc_now); export P2S_TS
-  emit_record webroot "$path" 0 "" "" "" "" "" "" \
-    "webroot webshell pattern: $path contains '$hit'" "-"
+  emit_record webroot "$disp" 0 "" "" "" "" "" "" \
+    "webroot webshell pattern: $disp contains '$hit'" "-"
 done <"$tmp"
 
 # webroot.shells.tsv = ảnh chụp các shell của batch này. File biến mất thì
@@ -111,6 +148,11 @@ sort -u "$SHELLS_NOW" >"$SHELLS" 2>/dev/null || : >"$SHELLS"
 rm -f -- "$SHELLS_NOW"
 
 
-{ printf '# path\tsize\tmtime\towner\n'; sort -u "$tmp"; } >"$MANIFEST.tmp.$$" &&
-  mv -f -- "$MANIFEST.tmp.$$" "$MANIFEST"
+{
+  printf '# path\tsize\tmtime\towner\n'
+  while IFS=$'\t' read -r path sz mt own; do
+    [[ -n $path ]] || continue
+    printf '%s\t%s\t%s\t%s\n' "$(p2s_container_manifest_key "$path")" "$sz" "$mt" "$own"
+  done <"$tmp" | sort -u
+} >"$MANIFEST.tmp.$$" && mv -f -- "$MANIFEST.tmp.$$" "$MANIFEST"
 rm -f -- "$tmp"

@@ -25,7 +25,11 @@ src/
 │   ├── state.sh            offsets (inode/byte/line) + last_batch
 │   ├── json.sh             json_escape/json_str/json_obj (không fork jq)
 │   ├── log.sh, time_utc.sh
-│   └── accesslog.awk       parser access log, giữ FILENAME + FNR
+│   ├── accesslog.awk       parser access log, giữ FILENAME + FNR
+│   ├── dockerlog.awk       parser log container (JSON + access-log + marker),
+│   │                       một process, ghi mốc tiến độ để cứu khi bị kill
+│   └── container.sh        dò container đang chạy qua config.v2.json +
+│                           /proc/<pid>/root (không cần docker CLI/socket)
 ├── engine/
 │   ├── scan.sh             1 batch: plugins -> rule_match -> report
 │   ├── plugins.sh          chạy mọi plugin, cô lập lỗi, timeout
@@ -33,7 +37,9 @@ src/
 │   ├── report.sh           gom hit -> MỘT alert + evidence/<batch>.jsonl
 │   ├── supervisor.sh       vòng lặp batch + PID/lock
 │   └── status.sh           báo cáo trạng thái
-├── plugins/                13 nguồn log; _batch_common.sh giữ offset + dòng
+├── plugins/                14 nguồn log; _batch_common.sh giữ offset + dòng
+│                           (docker_logs = stdout/stderr container,
+│                            container_accesslog = access log BÊN TRONG container)
 ├── rules/pack/{t1,t2,t3,t4}.jsonl
 ├── discovery/              discovery.sh (read-only), retro_hunt.sh, patch_status.sh
 └── export/export_json.sh
@@ -54,7 +60,7 @@ src/
 ## Kiểm thử
 
 ```bash
-SRC=$PWD/src bash tests/run_tests.sh   # 149 assertion, không cần bats
+SRC=$PWD/src bash tests/run_tests.sh   # 194 assertion, không cần bats
 bats tests/unit                        # parser tests
 shellcheck -x src/lib/*.sh src/engine/*.sh src/plugins/*.sh
 ./build.sh                             # shellcheck + tests + makeself

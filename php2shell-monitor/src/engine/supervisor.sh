@@ -23,7 +23,9 @@ _supervisor_pid() { # in PID nếu pidfile trỏ đúng loop của device này
   pid=$(cat "$PIDFILE" 2>/dev/null)
   [[ $pid =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 1
+  # 2>/dev/null TRƯỚC "<": shell mở input redirection trước khi áp stderr, nên
+  # PID vừa chết vẫn làm rò "/proc/NNN/cmdline: No such file or directory".
+  cmd=$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline") || return 1
   # phải là supervisor.sh loop VÀ đúng device này
   [[ $cmd == *"supervisor.sh"*"loop"* ]] || return 1
   [[ $cmd == *"$WORKDIR"* ]] || return 1
@@ -42,7 +44,7 @@ _agent_pid() {
   pid=$(cat "$P2S_DEVICE_RUN_DIR/agent/agent.pid" 2>/dev/null) || return 1
   [[ $pid =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 1
+  cmd=$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline") || return 1
   [[ $cmd == *"central.sh"*"agent"* ]] || return 1
   [[ $cmd == *"$WORKDIR"* ]] || return 1
   printf '%s' "$pid"

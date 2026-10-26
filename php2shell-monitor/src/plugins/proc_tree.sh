@@ -11,7 +11,12 @@ PARENT_RE='(^|/)(php-fpm|php-cgi|lsphp|frankenphp|httpd|apache2)[0-9.]*$'
 CHILD_RE='(^|/)(sh|bash|dash|zsh|busybox|python3?|perl|nc|ncat|socat|curl|wget)$'
 
 proc_cmdline() {
-  tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null | sed 's/ $//'
+  # 2>/dev/null phải đứng TRƯỚC "<". Plugin này quét MỌI pid trên host nên tỉ
+  # lệ race cao nhất: process sinh/chết liên tục trong lúc quét, và mỗi PID
+  # biến mất giữa chừng lại rò một dòng "No such file or directory" vào
+  # scan.log. Shell mở input redirection trước khi áp stderr, nên thứ tự cũ
+  # ("<file" rồi mới "2>/dev/null") không chặn được gì.
+  tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline" | sed 's/ $//'
 }
 
 [[ ${PROC_SCAN:-1} == 1 ]] || exit 0

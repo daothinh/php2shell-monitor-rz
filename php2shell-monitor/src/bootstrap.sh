@@ -54,7 +54,12 @@ p2s_kill_stale() {
   _pat="$WORKDIR/(engine|plugins|discovery)/[a-z_]+\.sh|$WORKDIR/main\.sh"
   for pid in $(pgrep -f "$_pat" 2>/dev/null); do
     [[ $pid == "$$" ]] && continue
-    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+    # 2>/dev/null phải đứng TRƯỚC "<": shell mở redirection input trước khi áp
+    # redirection stderr cho lệnh, nên "<file" hỏng vẫn in lỗi ra terminal dù
+    # phía sau có 2>/dev/null. pgrep và /proc không nguyên tử: process chết
+    # giữa hai bước là chuyện thường (respawn, batch timeout), và mỗi lần như
+    # vậy lại rò một dòng "/proc/NNN/cmdline: No such file or directory".
+    cmd=$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline") || continue
     # chỉ kill process thuộc bản cài này, không đụng process khác trên host
     [[ $cmd == *"$WORKDIR"* ]] || continue
     kill -TERM "$pid" 2>/dev/null || continue
@@ -67,7 +72,7 @@ p2s_kill_stale() {
   done
   for pid in $(pgrep -f "$_pat" 2>/dev/null); do
     [[ $pid == "$$" ]] && continue
-    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+    cmd=$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline") || continue
     [[ $cmd == *"$WORKDIR"* ]] || continue
     kill -KILL "$pid" 2>/dev/null
   done

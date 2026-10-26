@@ -87,18 +87,124 @@ container (`state/docker_cursors.tsv` lưu timestamp + số thứ tự cuối): 
 đưa lên ở batch trước không được đẩy lại, và `file:line` không đếm lại từ 1.
 `DOCKER_LOG_SINCE` chỉ còn là cửa sổ của lượt QUÉT ĐẦU TIÊN (chưa có con trỏ).
 
+#### Vì sao dùng `lib/dockerlog.awk`
+
+Bản trước bung từng dòng bằng `sed` rồi lọc bằng `grep -qP`: **2 fork mỗi
+dòng ≈ 2.4 ms**. Hai container 76 MB (1.216.130 dòng) mất **49 phút**, vượt
+`PLUGIN_TIMEOUT=120` nên plugin bị kill mỗi batch. Tệ hơn, offset chỉ được ghi
+sau khi đọc hết chunk, nên bị kill là mất sạch tiến độ và batch sau đọc lại
+từ byte 0 — log lớn không bao giờ quét xong dù phần host vẫn bình thường.
+
+Nay toàn bộ việc bóc JSON + nhận dạng access-log + lọc marker chạy trong
+**một process awk**. Đo lại trên cùng dữ liệu: 615k dòng hết **10 s**, hai
+container hết **21 s**.
+
+Thêm nữa, awk ghi mốc tiến độ mỗi `BATCH_CHECKPOINT_LINES` dòng (mặc định
+2000) ra file tạm; nếu plugin bị `PLUGIN_TIMEOUT` cắt giữa chừng, trap EXIT
+đọc mốc đó vào state nên phần đã quét không mất trắng. Batch sau tiếp tục
+đúng dòng, không trùng không sót.
+
 Hai loại dòng ra khỏi container:
 
-- dòng **access-log combined** (image apache/nginx chính thức ghi access ra
-  stdout) → phát dưới nguồn `access_log` với đủ field ip/method/uri/status/ua
-  nên toàn bộ rule tấn công (P2S-008/015/016/017/030/050–056) phủ cả app chạy
-  trong container;
+- dòng **access-log** → phát dưới nguồn `access_log` với đủ field
+  ip/method/uri/status/ua nên toàn bộ rule tấn công (P2S-008/015/016/017/030/
+  050–058) phủ cả app chạy trong container. Nhận **cả hai** định dạng: combined
+  đầy đủ (`IP - - [ts] "GET /x HTTP/1.1" 200 12 "-" "ua"`) và dạng nginx ngắn
+  không có referer/ua (`IP -  dd/Mon/yyyy:hh:mm:ss +zzzz "GET /x" 200`) — dạng
+  sau là thứ container lab thực tế ghi ra, và regex combined cũ bỏ sót 100%;
 - dòng còn lại chỉ phát khi có marker crash/OOM (P2S-010/011/014/018) hoặc
   marker tấn công php2shell/upload-progress (P2S-041) → nguồn `docker`, file
   hiển thị `docker:<tên-container>`.
 
+Nếu log container tăng rất nhanh (ứng dụng ghi hàng trăm MB mỗi ngày), cân
+nhắc bật log rotation của Docker (`max-size`/`max-file`) — plugin đọc được cả
+file đã rotate, nhưng file quá lớn làm lượt quét đầu chậm.
+
 Rule bị loại vì `min` xuất hiện trong `run/batches.log`:
 `suppressed  P2S-016  4 hit(s) < min 5`.
+
+### Monitor ứng dụng chạy TRONG container (plugin `container_accesslog`)
+
+Một install trên host phải monitor cả host lẫn container chạy trên host đó.
+Đây là plugin làm việc đó, và nó **bắt buộc phải có**: `docker_logs` một mình
+là mù với CVE-2026-109618/109619.
+
+#### Vì sao `docker_logs` không đủ
+
+Mỗi container ghi access log **hai nơi**, nội dung khác nhau:
+
+| Nguồn | Ví dụ | Query string |
+|---|---|---|
+| `docker_logs` đọc: stderr → `*-json.log` | `127.0.0.1 -  26/Oct/2026:07:47:47 +0000 "GET /vuln.php" 200` | **mất** |
+| `container_accesslog` đọc: `/var/log/nginx/access.log` trong container | `192.168.0.1 - - [26/Oct/2026:07:47:15 +0000] "GET /vuln.php?page=/var/lib/php/sessions/sess_p2s7d73... HTTP/1.1" 200 410 ... request_length=138` | **có** |
+
+PHP-FPM ghi access log theo `access.format` không có `%Q%q` (`%r` chỉ có
+path), nên query string biến mất trước khi tới json log. Thực đo trên lab:
+
+```
+json log   :       0 dòng chứa 'page='
+access.log : 635.840 dòng chứa 'page='
+```
+
+Toàn bộ CVE nằm trong query string (`?page=/var/lib/php/sessions/sess_...`,
+upload progress 15 MB), nên chỉ đọc json log thì **container bị RCE liên tục
+mà không có alert nào** — đúng sự cố đã gặp.
+
+#### Cách đi vào container mà không cần docker CLI/socket
+
+Mỗi container có PID process chính trong `config.v2.json` (`State.Pid`).
+`/proc/<pid>/root` trỏ vào root filesystem của container và đọc được từ host
+khi có root — **độc lập storage driver** (overlay2, overlayfs, btrfs, zfs,
+vfs). Inode qua đường này trùng khớp với qua overlayfs mount, nên offset
+tracking vẫn đúng.
+
+Plugin cũng tự dò thêm `$DOCKER_LOG_DIR/rootfs/overlayfs/<cid>/` và
+`overlay2/<cid>/merged/` làm dự phòng.
+
+#### Khoá offset ổn định qua restart
+
+Offset và manifest khoá theo **`container:<cid>/<relpath>`**, KHÔNG theo
+`/proc/<pid>/root/...`. Container restart thì PID đổi, đường dẫn `/proc` cũ
+biến mất — khoá theo đường dẫn sẽ khiến lần chạy sau đọc lại từ byte 0 và
+manifest coi toàn bộ webroot là "file NEW". CID thì ổn định suốt vòng đời
+container.
+
+Alert hiển thị `container:<tên>:/var/www/html/s.php` để người đọc biết ngay
+container nào và đường dẫn nào bên trong nó.
+
+#### Nhiều container trên một host
+
+Mỗi container một dòng offset riêng, một mục manifest riêng; plugin không giữ
+state chung nên số container không ảnh hưởng lẫn nhau. Đã kiểm với 2 container
+chạy song song: mỗi cái có offset riêng, alert ghi đúng `container:php2shell-
+lab-1` / `container:php2shell-lab-2`.
+
+`CONTAINER_READ_CAP_BYTES` (mặc định 16 MiB) chặn trần đọc mỗi file mỗi lượt:
+container chạy lâu có thể có access log 100+ MB, đọc hết một lượt thì vượt
+`PLUGIN_TIMEOUT`. Cắt theo trần rồi các batch sau đọc tiếp — không mất dòng
+nào, chỉ trải ra nhiều batch.
+
+#### Webroot trong container
+
+`webroot_manifest` quét thêm webroot **bên trong** từng container, nên webshell
+đã drop vào container cũng bị thấy. Trước đây plugin chỉ quét `/var/www/html`
+trên host — host không có thư mục đó khi ứng dụng chạy trong container, nên
+`s.php` (`system($_REQUEST[0])`) nằm im trong `php2shell-lab-1` mà không ai báo.
+
+Chỉ quét thư mục **nông nhất** còn tồn tại (`/var/www/html` bao `/var/www`),
+nếu không mỗi file sẽ vào manifest hai lần và mỗi webshell bị báo hai lần.
+
+#### Khi /proc bị chặn hoặc muốn quét snapshot offline
+
+Đặt `P2S_CONTAINER_ROOTFS_MAP` trỏ tới file TSV:
+
+```
+<cid>	<tên>	<đường dẫn rootfs>
+```
+
+Plugin dùng danh sách này thay cho việc dò `config.v2.json` + `/proc`. Hữu ích
+khi host hardening (`hidepid=2`), container PID namespace, hoặc khi cần quét
+bản backup rootfs đã copy ra ngoài.
 
 ## 5. Trạng thái
 

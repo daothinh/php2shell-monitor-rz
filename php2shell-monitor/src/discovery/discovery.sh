@@ -67,6 +67,32 @@ ls -l /var/log/nginx/access.log* /var/log/apache2/access.log* /var/log/httpd/acc
   head -50 | tee -a "$REPORT" || true
 _r ""
 
+# ---- container trên host (monitor cả ứng dụng chạy trong container) ----
+# Một install trên host phải thấy cả container. Báo cáo ở đây để người vận
+# hành biết plugin container_* có việc làm hay không, và để capabilities.txt
+# phản ánh đúng nguồn log THẬT SỰ có.
+source "$WORKDIR/lib/container.sh"
+_r "## container đang chạy"
+echo "== container =="
+container_count=0
+while IFS=$'\t' read -r _short name _pid rootfs cid; do
+  container_count=$((container_count + 1))
+  _r "- $name (cid $cid, rootfs ${rootfs:-KHÔNG ĐỌC ĐƯỢC})"
+  [[ -n $rootfs ]] || continue
+  # Access log bên trong container — nguồn DUY NHẤT có query string.
+  for rel in var/log/nginx/access.log var/log/apache2/access.log var/log/httpd/access_log; do
+    [[ -f "$rootfs/$rel" ]] && _r "    access: $rel ($(stat -c '%s' "$rootfs/$rel" 2>/dev/null) bytes)"
+  done
+  # Webroot bên trong container.
+  for d in var/www/html usr/share/nginx/html var/www; do
+    [[ -d "$rootfs/$d" ]] && _r "    webroot: /$d" && break
+  done
+done < <(p2s_containers)
+(( container_count )) || _r "không có container nào đang chạy"
+_r ""
+echo "containers: $container_count"
+echo ""
+
 # ---- capabilities (gates rule `needs`)
 : >"$P2S_STATE_DIR/capabilities.txt"
 [[ -n $(ls /var/log/nginx/access.log* /var/log/apache2/access.log* /var/log/httpd/access_log* 2>/dev/null) ]] && echo "access_log" >>"$P2S_STATE_DIR/capabilities.txt"
@@ -75,6 +101,20 @@ _r ""
 [[ -d /var/log/journal ]] && echo "journal" >>"$P2S_STATE_DIR/capabilities.txt"
 [[ -d /var/lib/php/sessions || -d /var/lib/php/session ]] && echo "sessions" >>"$P2S_STATE_DIR/capabilities.txt"
 [[ $(id -u) -eq 0 ]] && echo "proc" >>"$P2S_STATE_DIR/capabilities.txt"
+# Ứng dụng chạy trong container: access log nằm BÊN TRONG container, host
+# không có /var/log/nginx/access.log. Thiếu dòng này thì capabilities báo
+# không có access_log và rule bị gate bỏ — dù thực tế container đầy log.
+if (( container_count > 0 )); then
+  echo "container" >>"$P2S_STATE_DIR/capabilities.txt"
+  while IFS=$'\t' read -r _short _name _pid rootfs _cid; do
+    [[ -n $rootfs ]] || continue
+    if [[ -f "$rootfs/var/log/nginx/access.log" || -f "$rootfs/var/log/apache2/access.log" \
+          || -f "$rootfs/var/log/httpd/access_log" ]]; then
+      echo "access_log" >>"$P2S_STATE_DIR/capabilities.txt"
+      break
+    fi
+  done < <(p2s_containers)
+fi
 
 echo ""
 echo "discovery complete: $REPORT"

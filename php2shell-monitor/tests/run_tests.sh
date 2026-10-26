@@ -869,7 +869,190 @@ else
   pass "docker: plugin tồn tại"
 fi
 
-rm -rf -- "$w" "$w2" "$w6"
+# --------------------------- đọc /proc/<pid>/cmdline không rò lỗi ra stderr
+# Lỗi thật (end user báo khi cài 1.3.4):
+#   ./bootstrap.sh: line 57: /proc/354810/cmdline: No such file or directory
+# pgrep liệt kê PID xong process chết trước khi đọc /proc/<pid>. Cách viết cũ
+# "<file" rồi mới "2>/dev/null" KHÔNG chặn được: shell mở input redirection
+# trước khi áp stderr cho lệnh. Đo thực tế: cách cũ rò 200/200 lần, cách mới 0.
+_dead_pid=999999999
+T "cmdline: cách cũ rò lỗi ra stderr" "yes" \
+  "$(err=$( { tr '\0' ' ' <"/proc/$_dead_pid/cmdline" 2>/dev/null; } 2>&1 ); [[ -n $err ]] && echo yes)"
+T "cmdline: 2>/dev/null trước < thì im lặng" "no" \
+  "$(err=$( { tr '\0' ' ' 2>/dev/null <"/proc/$_dead_pid/cmdline"; } 2>&1 ); [[ -n $err ]] && echo yes || echo no)"
+
+# và không file nguồn nào được quay lại thứ tự cũ
+for _f in bootstrap.sh engine/supervisor.sh plugins/proc_tree.sh; do
+  T "cmdline: $_f không còn '<file 2>/dev/null'" "no" \
+    "$(grep -qE 'cmdline" 2>/dev/null' "$SRC/$_f" && echo yes || echo no)"
+done
+
+# --------------------- docker_logs: tốc độ + checkpoint khi bị kill
+# Lỗi thật: hai container 76 MB = 1.216.130 dòng. Đường bash cũ (sed + grep
+# mỗi dòng = 2 fork ≈ 2.4 ms) mất 49 phút, vượt PLUGIN_TIMEOUT 120 s nên plugin
+# bị kill mỗi batch. Offset lại chỉ được ghi SAU vòng lặp => không có tiến độ
+# nào được lưu => batch sau đọc lại từ byte 0 => vòng lặp chết vĩnh viễn.
+w7=$(newlab)
+mkdir -p "$w7/dkr/containers/c7"
+printf '{"ID":"x","Name":"/big"}' >"$w7/dkr/containers/c7/config.v2.json"
+# 3000 dòng: đủ để vượt mốc checkpoint (mặc định 2000) ít nhất một lần
+{
+  i=0
+  while (( i < 3000 )); do
+    i=$((i + 1))
+    printf '{"log":"10.0.0.%d -  26/Oct/2026:03:00:00 +0000 \\"GET /p%d.php\\" 200\\n","stream":"stdout","time":"2026-10-26T03:00:00Z"}\n' \
+      "$(( (i % 250) + 1 ))" "$i"
+  done
+} >"$w7/dkr/containers/c7/c7-json.log"
+
+t0=$(date +%s%N)
+out7=$(env WORKDIR="$w7" DOCKER_LOG_DIR="$w7/dkr/containers" bash "$w7/plugins/docker_logs.sh" 2>/dev/null)
+t1=$(date +%s%N)
+ms7=$(( (t1 - t0) / 1000000 ))
+
+T "docker: đọc 3000 dòng < 5s (awk, không fork mỗi dòng)" "fast" \
+  "$( (( ms7 < 5000 )) && echo fast || echo slow:${ms7}ms )"
+T "docker: phát đủ 3000 record" "3000" "$(printf '%s' "$out7" | grep -c . )"
+T "docker: line tăng đơn điệu 1..3000" "3000" \
+  "$(printf '%s' "$out7" | awk -F'\t' '{print $4}' | tail -1)"
+# offset phải được lưu và trỏ hết file
+off7=$(cat "$w7"/projects/*/devices/*/state/offsets.tsv 2>/dev/null | awk -F'\t' '{print $4}')
+T "docker: offset lưu số dòng tuyệt đối" "3000" "$off7"
+
+# chạy lại: không có gì mới -> 0 record (offset có tác dụng)
+out7b=$(env WORKDIR="$w7" DOCKER_LOG_DIR="$w7/dkr/containers" bash "$w7/plugins/docker_logs.sh" 2>/dev/null)
+T "docker: chạy lại không đọc trùng" "0" "$(printf '%s' "$out7b" | grep -c . )"
+
+# checkpoint: ép timeout cực ngắn trên file lớn, offset phải > 0 dù bị kill
+w8=$(newlab)
+mkdir -p "$w8/dkr/containers/c8"
+printf '{"ID":"x","Name":"/huge"}' >"$w8/dkr/containers/c8/config.v2.json"
+{
+  i=0
+  while (( i < 200000 )); do
+    i=$((i + 1))
+    printf '{"log":"10.0.0.1 -  26/Oct/2026:03:00:00 +0000 \\"GET /p%d.php\\" 200\\n","stream":"stdout","time":"2026-10-26T03:00:00Z"}\n' "$i"
+  done
+} >"$w8/dkr/containers/c8/c8-json.log"
+env WORKDIR="$w8" DOCKER_LOG_DIR="$w8/dkr/containers" \
+  BATCH_CHECKPOINT_LINES=500 timeout 2 bash "$w8/plugins/docker_logs.sh" >/dev/null 2>&1
+saved8=$(cat "$w8"/projects/*/devices/*/state/offsets.tsv 2>/dev/null | awk -F'\t' '{print $3}')
+T "docker: bị kill giữa chừng vẫn giữ checkpoint" "yes" \
+  "$( [[ -n $saved8 && $saved8 -gt 0 ]] && echo yes || echo no:${saved8:-empty} )"
+
+# ------------------- container: monitor container chạy trên host
+# Lỗi thật: container ghi access log vào /var/log/nginx/access.log BÊN TRONG
+# container, không ra stdout. docker_logs.sh chỉ đọc json log (stdout/stderr),
+# mà FPM ghi theo access.format không có %Q%q nên query string mất sạch:
+#   json log   : 0 dòng chứa 'page='
+#   access.log : 635.840 dòng chứa 'page='
+# Toàn bộ CVE-2026-109619 nằm trong query string -> monitor mù, container bị
+# RCE liên tục mà không có alert nào.
+w9=$(newlab)
+mkdir -p "$w9/dkr/containers/aaaabbbbcccc" "$w9/fakeroot/var/log/nginx" "$w9/fakeroot/var/www/html"
+# config.v2.json thật: Name có tiền tố /, Running là BOOLEAN, State.Pid là số
+printf '{"ID":"aaaabbbbcccc","Name":"/web-one","State":{"Running":true,"Pid":1},"Path":"x"}' \
+  >"$w9/dkr/containers/aaaabbbbcccc/config.v2.json"
+cat >"$w9/fakeroot/var/log/nginx/access.log" <<'EOF'
+192.168.0.1 - - [26/Oct/2026:07:47:15 +0000] "GET /vuln.php?page=/var/lib/php/sessions/sess_p2s7d73 HTTP/1.1" 200 410 "-" "curl/8.18.0" "-" request_length=138 content_length=-
+192.168.0.1 - - [26/Oct/2026:07:47:16 +0000] "GET /health.php HTTP/1.1" 200 139 "-" "curl/8.18.0" "-" request_length=88 content_length=-
+192.168.0.1 - - [26/Oct/2026:07:47:17 +0000] "POST /upload.php HTTP/1.1" 200 68 "-" "curl/8.18.0" "-" request_length=15000556 content_length=15000341
+EOF
+printf '<?php echo "P2S_WEBSHELL"; system($_REQUEST[0]); ?>\n' >"$w9/fakeroot/var/www/html/s.php"
+printf '<?php echo "ok"; ?>\n' >"$w9/fakeroot/var/www/html/index.php"
+
+# p2s_containers đọc config.v2.json -> phải bóc đúng Name/Pid/Running.
+# Running là boolean (true không có nháy) nên parser string thuần sẽ trả rỗng
+# và bỏ sót MỌI container.
+c9=$(env P2S_CONTAINER_DIR="$w9/dkr/containers" bash -c \
+  'source "$1/lib/container.sh"; p2s_containers' _ "$SRC" 2>/dev/null)
+T "container: bóc được Name từ config.v2.json" "web-one" "$(printf '%s' "$c9" | cut -f2)"
+T "container: bóc được Pid (Running là boolean)" "1" "$(printf '%s' "$c9" | cut -f3)"
+T "container: bóc được cid đầy đủ" "aaaabbbbcccc" "$(printf '%s' "$c9" | cut -f5)"
+
+# Access log container phải phát ra kèm QUERY STRING — đây là thứ json log làm mất.
+printf 'aaaabbbbcccc\tweb-one\t%s/fakeroot\n' "$w9" >"$w9/map.tsv"
+acc9=$(env WORKDIR="$w9" P2S_SRC_DIR="$SRC" P2S_CONTAINER_ROOTFS_MAP="$w9/map.tsv" \
+       bash "$SRC/plugins/container_accesslog.sh" 2>/dev/null)
+T "container: access log phát ra nguồn access_log" "yes" \
+  "$(printf '%s' "$acc9" | grep -q 'access_log' && echo yes || echo no)"
+T "container: GIỮ query string page=" "yes" \
+  "$(printf '%s' "$acc9" | grep -q 'page=/var/lib/php/sessions' && echo yes || echo no)"
+T "container: file hiển thị container:<tên>" "yes" \
+  "$(printf '%s' "$acc9" | grep -q 'container:web-one' && echo yes || echo no)"
+T "container: bóc được request_length 15MB" "yes" \
+  "$(printf '%s' "$acc9" | grep -q '15000556' && echo yes || echo no)"
+
+# Webshell trong webroot CONTAINER phải bị thấy (host không có /var/www/html).
+ws9=$(newlab)
+mkdir -p "$ws9/fakeroot/var/www/html" "$ws9/state" "$ws9/tmp"
+printf '<?php echo "P2S_WEBSHELL"; system($_REQUEST[0]); ?>\n' >"$ws9/fakeroot/var/www/html/s.php"
+printf 'aaaabbbbcccc\tweb-one\t%s/fakeroot\n' "$ws9" >"$ws9/map.tsv"
+out9=$(env WORKDIR="$ws9" P2S_STATE_DIR="$ws9/state" P2S_TMP_DIR="$ws9/tmp" \
+  P2S_CONTAINER_ROOTFS_MAP="$ws9/map.tsv" P2S_SRC_DIR="$SRC" \
+  bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
+out9b=$(env WORKDIR="$ws9" P2S_STATE_DIR="$ws9/state" P2S_TMP_DIR="$ws9/tmp" \
+  P2S_CONTAINER_ROOTFS_MAP="$ws9/map.tsv" P2S_SRC_DIR="$SRC" \
+  bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
+T "container: webshell trong webroot container bị phát hiện" "yes" \
+  "$(printf '%s' "$out9b" | grep -q "system(\$_REQUEST" && echo yes || echo no)"
+T "container: tên hiển thị container:<tên>:/path" "yes" \
+  "$(printf '%s' "$out9b" | grep -q 'container:web-one:/var/www/html/s.php' && echo yes || echo no)"
+T "container: không báo trùng 2 lần" "1" \
+  "$(printf '%s' "$out9b" | grep -c 'webshell pattern')"
+
+# Khoá offset/manifest phải ỔN ĐỊNH qua restart container (pid đổi, cid không).
+k9=$(env P2S_CONTAINER_ROOTFS_MAP="$w9/map.tsv" bash -c \
+  'source "$1/lib/container.sh"; p2s_container_manifest_key "$2/fakeroot/var/www/html/s.php"' _ "$SRC" "$w9" 2>/dev/null)
+T "container: khoá manifest dùng cid, không dùng /proc/<pid>" "yes" \
+  "$( [[ $k9 == container:aaaabbbbcccc:* ]] && echo yes || echo "no:$k9" )"
+
+# ---------------- offset KHÔNG được dừng giữa dòng khi cắt theo trần byte
+# Lỗi thật: p2s_complete_bytes dùng công thức `n - 1` với n = tổng
+# (length($0)+1). Công thức đó chỉ đúng khi dòng dở cuối dài 0 byte. Với
+# "line1\nline2\npartial" nó trả 19 = CẢ FILE, tức là nuốt luôn dòng dở và
+# đẩy offset vào GIỮA dòng. Batch sau đọc từ giữa dòng -> dòng đầu bị cắt đôi
+# -> bóc field sai (ip rỗng, uri rỗng, ts lấy nhầm đoạn giữa) -> rule không
+# khớp -> "no-hits" dù log đầy tấn công.
+cb=$(mktemp -d)
+printf 'line1\nline2\npartial' >"$cb/p.txt"
+printf 'a\nb\n' >"$cb/full.txt"
+printf 'noeol' >"$cb/short.txt"
+got=$(env WORKDIR="$cb" P2S_SRC_DIR="$SRC" bash -c \
+  'source "$P2S_SRC_DIR/plugins/_batch_common.sh"; p2s_complete_bytes "$1"' _ "$cb/p.txt" 2>/dev/null)
+T "offset: bỏ dòng dở cuối (12, không phải 19)" "12" "$got"
+got2=$(env WORKDIR="$cb" P2S_SRC_DIR="$SRC" bash -c \
+  'source "$P2S_SRC_DIR/plugins/_batch_common.sh"; p2s_complete_bytes "$1"' _ "$cb/full.txt" 2>/dev/null)
+T "offset: file kết thúc bằng newline giữ nguyên" "4" "$got2"
+got3=$(env WORKDIR="$cb" P2S_SRC_DIR="$SRC" bash -c \
+  'source "$P2S_SRC_DIR/plugins/_batch_common.sh"; p2s_complete_bytes "$1"' _ "$cb/short.txt" 2>/dev/null)
+T "offset: file một dòng không newline -> 0" "0" "$got3"
+
+# Đọc thật qua nhiều batch với trần byte nhỏ: dòng đầu MỖI batch phải nguyên vẹn.
+cb2=$(newlab)
+mkdir -p "$cb2/fakeroot/var/log/nginx"
+{
+  i=0
+  while (( i < 400 )); do
+    i=$((i + 1))
+    printf '192.168.0.1 - - [26/Oct/2026:07:47:15 +0000] "GET /vuln.php?page=/var/lib/php/sessions/sess_%04d HTTP/1.1" 200 410 "-" "curl/8.18.0" "-" request_length=138\n' "$i"
+  done
+} >"$cb2/fakeroot/var/log/nginx/access.log"
+printf 'aaaabbbbcccc\tweb-one\t%s/fakeroot\n' "$cb2" >"$cb2/map.tsv"
+bad=0
+for _ in 1 2 3 4 5; do
+  first=$(env WORKDIR="$cb2" P2S_SRC_DIR="$SRC" P2S_CONTAINER_ROOTFS_MAP="$cb2/map.tsv" \
+    CONTAINER_READ_CAP_BYTES=4096 \
+    bash "$SRC/plugins/container_accesslog.sh" 2>/dev/null | head -1)
+  # ip phải là 192.168.0.1, method GET, uri bắt đầu bằng /vuln.php — nếu offset
+  # dừng giữa dòng thì cả ba field này rỗng hoặc lệch.
+  ip=$(printf '%s' "$first" | cut -f5)
+  uri=$(printf '%s' "$first" | cut -f7)
+  [[ $ip == "192.168.0.1" && $uri == /vuln.php* ]] || bad=$((bad + 1))
+done
+T "offset: dòng đầu mỗi batch nguyên vẹn (không cắt giữa dòng)" "0" "$bad"
+
+rm -rf -- "$w" "$w2" "$w6" "$w9" "$ws9" "$cb" "$cb2"
 
 echo ""
 echo "passed: $PASS  failed: $FAIL"
