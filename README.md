@@ -9,7 +9,18 @@ Hệ thống giám sát thời gian thực bằng Bash script, tự động phá
 ## 🚀 Quick Start
 
 ### 1. Tải công cụ
-- **Download:** [github.com/daothinh/php2shell-monitor-rz/releases](https://github.com/daothinh/php2shell-monitor-rz/releases)
+- **Tải trực tiếp:** [php2shell-monitor.sh](https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh)
+- **Checksum:** [php2shell-monitor.sh.sha256](https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh.sha256)
+- **Trang Release:** [github.com/daothinh/php2shell-monitor-rz/releases](https://github.com/daothinh/php2shell-monitor-rz/releases)
+
+```bash
+curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh
+curl -LO https://github.com/daothinh/php2shell-monitor-rz/releases/latest/download/php2shell-monitor.sh.sha256
+echo "$(cut -d' ' -f1 php2shell-monitor.sh.sha256)  php2shell-monitor.sh" | sha256sum -c -
+chmod +x php2shell-monitor.sh
+```
+
+> File `.sha256` sinh từ pipeline build nên bên trong ghi đường dẫn `dist/php2shell-monitor.sh`; lệnh trên ghép lại checksum với tên file sau khi tải để xác minh đúng.
 
 ### 2. Thiết lập nhận thông báo qua Telegram
 
