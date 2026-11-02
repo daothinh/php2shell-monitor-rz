@@ -1,6 +1,7 @@
 """Telegram: client gửi tin + bot polling xử lý mã pairing + format alert."""
 import asyncio
 import html
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -25,6 +26,11 @@ _SEV_EMOJI = {
     "LOW": "ℹ️", "INFO": "ℹ️",
 }
 _SEV_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "MODERATE": 3, "LOW": 2, "INFO": 1}
+
+# Câu "Sự kiện" trên mọi alert. Operator chốt: một câu duy nhất, không suy ra
+# từ severity — "Mức độ" không còn hiện trên tin nhắn nên câu này cũng không
+# được đổi theo severity nữa. Severity vẫn lưu trong DB để lọc/tra cứu.
+EVENT_TEXT = "Phát hiện nghi vấn khai thác php2Shell"
 
 # Alert headline: exactly two messages.
 #   "Server bị chiếm quyền (RCE)" — any hit from an exploitation-success rule
@@ -109,34 +115,129 @@ def _parse_ts(ts_raw: Any) -> Optional[datetime]:
 
 
 def _headline(alert: dict) -> str:
-    """What the alert says happened. Driven by the alert's own severity."""
-    sev = _sev(alert)
-    if sev == "CRITICAL" or is_rce(alert):
-        return "Server bị chiếm quyền (RCE)"
-    if sev == "INFO":
-        return "Dấu hiệu dò quét php2shell"
-    return "Server đang bị khai thác php2shell"
-def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
-    """One batch alert -> one compact Telegram message (khung cố định).
+    """Sự kiện hiển thị trên mọi alert.
 
-    🛡 CENTRAL SECURITY ALERT · 📅 thời điểm gửi
-    🚨 Mức độ · ⚠️ Sự kiện · 📊 Tổng số Events
-    📦 Dự án · 🖥 Môi trường/OS · 👤 User · 🏷 Hostname · 🌐 IP LAN
-    (+ 🐳 Container — chỉ khi alert sinh từ log/artifact của container,
-    để phân biệt alert của host và của container nào)
-
-    Rule chi tiết, cửa sổ sự kiện, batch id và toàn bộ evidence nằm trên
-    server (`GET /api/v1/alerts/<id>`) và evidence mirror — tin nhắn giữ
-    đúng khung cố định theo yêu cầu operator.
+    Operator chốt: MỌI alert đều dùng đúng một câu, không phân biệt severity —
+    "Mức độ" không còn hiện trên tin nhắn nên câu này cũng không được suy ra từ
+    severity nữa. Severity vẫn lưu trong DB để lọc/tra cứu trên server.
     """
-    esc = html.escape
-    sev = _sev(alert)
+    return EVENT_TEXT
 
+
+# Giới hạn Telegram: 4096 ký tự, đo SAU khi parse entity. Tag HTML không tính,
+# nên budget phải tính trên bản đã bỏ tag — nếu đo trên source sẽ tưởng thiếu
+# chỗ mà cắt oan (đo thật: alert 1563 ký tự source chỉ còn 1243 khi parse).
+TG_LIMIT = 4096
+
+# Mức tối thiểu của một dòng raw để còn đáng cắt mà hiện; dưới ngưỡng này thì
+# thà bỏ nhóm và báo "… +N nhóm" còn hơn hiện một mẩu vô nghĩa.
+MIN_RAW_CHARS = 40
+
+_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+
+
+def parsed_len(text: str) -> int:
+    """Độ dài Telegram thực sự đếm: bỏ tag HTML, giải entity."""
+    return len(html.unescape(_TAG_RE.sub("", text)))
+
+
+def _esc(s: Any) -> str:
+    return html.escape(str(s if s is not None else ""), quote=False)
+
+
+def _preview_groups(alert: dict) -> list[dict]:
+    """Các nhóm event monitor đã gộp sẵn (alert["preview"]).
+
+    Monitor gửi kèm tối đa ALERT_PREVIEW_MAX nhóm, đã de-dup và xếp nhóm
+    impact=rce lên đầu. Server chỉ render, không gộp lại: hai bên phải nhìn
+    cùng một tập để "… +N nhóm" khớp với những gì đã hiện.
+    """
+    out = []
+    for g in alert.get("preview") or []:
+        if not isinstance(g, dict):
+            continue
+        raw = str(g.get("raw") or "")
+        if not raw:
+            continue
+        out.append({
+            "raw": raw,
+            "file": str(g.get("file") or ""),
+            "line": int(g.get("line") or 0),
+            "lines": int(g.get("lines") or 0),
+            "hits": int(g.get("hits") or 1),
+            "rce": str(g.get("impact") or "") == "rce",
+        })
+    out.sort(key=lambda g: (0 if g["rce"] else 1, -g["hits"]))
+    return out
+
+
+def _path_line(idx: int, g: dict) -> str:
+    """Dòng đường dẫn file nguồn: nguyên văn, kèm số dòng + số dòng khác."""
+    path = g["file"] or "?"
+    if g["line"]:
+        path = f"{path}:{g['line']}"
+    extra = g["lines"] - 1
+    if extra > 0:
+        path += f" (+{extra})"
+    cnt = f"×{g['hits']} · " if g["hits"] > 1 else ""
+    return f"<b>{idx}.</b> {cnt}<code>{_esc(path)}</code>"
+
+
+def _raw_line(raw: str) -> str:
+    return f"   <code>{_esc(raw)}</code>"
+
+
+def _tail(more: int) -> str:
+    """Đuôi khối khi còn nhóm chưa hiện được — chỉ nêu số nhóm."""
+    return f"<i>… +{more} nhóm</i>" if more > 0 else ""
+
+
+def _fit_prefix(base: list[str], lines: list[str], path: str, tail: str,
+                raw: str, limit: int) -> Optional[str]:
+    """Tiền tố dài nhất của raw sao cho cả tin vẫn <= limit, đóng bằng '…'.
+
+    Binary search trên độ dài tiền tố: luôn hội tụ, và tính đúng chi phí escape
+    HTML (một raw chứa nhiều `&` sẽ dài ra sau khi escape).
+    """
+    def fits(n: int) -> bool:
+        cut = raw[:n] + "…" if n < len(raw) else raw
+        text = "\n".join(list(base) + list(lines) + [path, _raw_line(cut)]
+                         + ([tail] if tail else []))
+        return parsed_len(text) <= limit
+
+    if not fits(0):
+        return None
+    lo, hi = 0, len(raw)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return raw[:lo] + "…" if lo < len(raw) else raw
+
+
+def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
+    """One batch alert -> ONE Telegram message, never split.
+
+    🛡 CENTRAL SECURITY ALERT · 📅 thời điểm
+    ⚠️ Sự kiện (câu cố định)
+    📦 Dự án · 🖥 Môi trường/OS · 👤 User · 🏷 Hostname · 🌐 IP LAN · 🐳 Container
+    🧩 Event logs (N nhóm / M events) + raw line của từng nhóm
+
+    Envelope là BẤT BIẾN: Môi trường/OS/User/Hostname/IP luôn hiện đủ để biết
+    server nào đang bị ảnh hưởng. Khi thiếu chỗ, CHỈ event logs co lại:
+      1. nhóm nào vừa nguyên văn thì nhận nguyên văn
+      2. nhóm kế tiếp bị cắt tiền tố + "…" để lấp hết chỗ còn lại
+      3. hết chỗ thì đóng bằng "… +N nhóm"
+    Không bao giờ sinh tin thứ hai, không bao giờ cắt mất dòng Môi trường/OS.
+    """
+    esc = _esc
     when = (_parse_ts(alert.get("ts_utc") or alert.get("ts") or alert.get("window_end"))
             or datetime.now(tz)).astimezone(tz)
 
-    total = int(alert.get("hits") or len(alert.get("evidence") or []))
-    what = esc(_headline(alert))
+    total = int(alert.get("hits") or len(alert.get("preview") or [])
+                or len(alert.get("evidence") or []))
 
     # "User" is the OS account the monitor runs as — the account that would own
     # any dropped shell. "Hostname" is what the machine calls itself. Both come
@@ -152,9 +253,7 @@ def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
         "🛡 <b>CENTRAL SECURITY ALERT</b>",
         f"📅 <i>{when:%d/%m/%Y} - {when:%H:%M}</i>",
         "",
-        f"🚨 <b>Mức độ:</b> <code>{esc(sev)}</code>",
-        f"⚠️ <b>Sự kiện:</b> {what}",
-        f"📊 <b>Tổng số Events:</b> <code>{total}</code>",
+        f"⚠️ <b>Sự kiện:</b> {esc(_headline(alert))}",
         "",
         f"📦 <b>Dự án:</b> <code>{esc(project_name[:64])}</code>",
         f"🖥 <b>Môi trường / OS:</b> <b>[{esc(env)}]</b> <code>{esc(os_name)}</code>",
@@ -170,7 +269,64 @@ def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
         lines.append(f"🐳 <b>Container:</b> <code>{esc(', '.join(containers))}</code>")
 
     lines.append(f"🌐 <b>IP LAN:</b> <code>{esc(lan_ip)}</code>")
-    return "\n".join(lines)
+
+    groups = _preview_groups(alert)
+    if not groups:
+        # Agent cũ chưa gửi preview: nêu tên rule để tin nhắn vẫn có thông tin.
+        rules = alert.get("rules")
+        if isinstance(rules, str):
+            try:
+                rules = json.loads(rules or "[]")
+            except ValueError:
+                rules = []
+        if not isinstance(rules, list):
+            rules = []
+        names = ", ".join(str(r.get("rule_id")) for r in rules if isinstance(r, dict))
+        lines += ["", "🧩 <b>Event logs (0 nhóm / 0 events)</b>",
+                  f"<i>agent cũ chưa gửi raw event{': ' + esc(names) if names else ''}</i>"]
+        return "\n".join(lines)
+
+    # tổng số nhóm thật (preview_meta = "<hits>|<unique>" do monitor tính)
+    uniq = len(groups)
+    try:
+        meta = str(alert.get("preview_meta") or "")
+        if "|" in meta:
+            uniq = max(uniq, int(meta.split("|", 1)[1]))
+    except (TypeError, ValueError):
+        pass
+
+    base = lines + ["", f"🧩 <b>Event logs ({uniq} nhóm / {total} events)</b>"]
+
+    body: list[str] = []
+    shown = 0
+    for idx, g in enumerate(groups, 1):
+        tail = _tail(uniq - idx)
+        path = _path_line(idx, g)
+        block = [path, _raw_line(g["raw"])]
+
+        if parsed_len("\n".join(base + body + block + ([tail] if tail else []))) <= TG_LIMIT:
+            body += block
+            shown = idx
+            continue
+
+        # Không vừa nguyên văn: lấp phần còn lại bằng tiền tố + "…".
+        cut = _fit_prefix(base, body, path, tail, g["raw"], TG_LIMIT)
+        if cut is not None and len(cut) > MIN_RAW_CHARS:
+            body += [path, _raw_line(cut)]
+            shown = idx
+        break
+
+    if shown == 0:
+        # Cứu hộ: ngay nhóm đầu cũng không vừa (raw khổng lồ) — vẫn phải 1 tin.
+        g = groups[0]
+        path = _path_line(1, g)
+        tail = _tail(uniq - 1)
+        cut = _fit_prefix(base, [], path, tail, g["raw"], TG_LIMIT) or "…"
+        body = [path, _raw_line(cut)]
+        shown = 1
+
+    tail = _tail(uniq - shown)
+    return "\n".join(base + body + ([tail] if tail else []))
 
 
 class TelegramClient:

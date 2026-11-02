@@ -256,10 +256,11 @@ def test_telegram_message_matches_compact_template(env):
     lines = text.split("\n")
     assert lines[0] == "🛡 <b>CENTRAL SECURITY ALERT</b>"
     assert lines[1].startswith("📅 <i>24/10/2026 - ")
-    # P2S-020 carries impact=rce -> CRITICAL, headline must say the box is owned
-    assert "🚨 <b>Mức độ:</b> <code>CRITICAL</code>" in text
-    assert "⚠️ <b>Sự kiện:</b> Server bị chiếm quyền (RCE)" in text
-    assert "📊 <b>Tổng số Events:</b> <code>3</code>" in text
+    # "Mức độ" đã bị tắt theo yêu cầu operator; "Sự kiện" là câu cố định,
+    # KHÔNG suy ra từ severity nữa.
+    assert "Mức độ" not in text
+    assert "⚠️ <b>Sự kiện:</b> Phát hiện nghi vấn khai thác php2Shell" in text
+    assert "📊" not in text
     assert "📦 <b>Dự án:</b> <code>khach-hang-a</code>" in text
     assert "🖥 <b>Môi trường / OS:</b> <b>[Docker Container]</b> <code>Ubuntu 24.04.1 LTS</code>" in text
     assert "👤 <b>User:</b> <code>root</code>" in text
@@ -278,9 +279,9 @@ def test_telegram_message_subminute_window_is_escaped(env):
     client.post("/api/v1/ingest-log", headers={"X-API-Key": key},
                 json={"host": "web01", "alerts": [a]})
     text = tg.sent[0][1]
-    # Số event thay cho "hit / phút"; không còn ký tự < nào lọt vào HTML.
-    assert "📊 <b>Tổng số Events:</b> <code>3</code>" in text
+    # Không còn "hit / phút" nên không còn nguy cơ "<1 phút" lọt vào HTML.
     assert "<1 phút" not in text
+    assert "Mức độ" not in text
 
 
 def test_telegram_message_without_lan_ip(env):
@@ -696,23 +697,18 @@ def test_repair_same_name_different_chat_creates_separate_project(env):
 
 
 # ---------------------------------------------------------------- alert format
-def test_headline_only_critical_on_rce_evidence():
-    """CRITICAL = server đã bị chiếm quyền. Chỉ bằng chứng RCE mới được nói vậy."""
-    from app.telegram import _headline
+def test_headline_is_fixed_text_for_every_severity():
+    """Sự kiện trên tin nhắn KHÔNG còn phụ thuộc severity.
 
-    def h(rule_id, sev="CRITICAL"):
-        return _headline({"severity": sev, "evidence": [{"rule_id": rule_id}]})
+    Operator chốt một câu duy nhất; severity vẫn được lưu trong DB và vẫn dùng
+    để chọn nhóm/ưu tiên, nhưng không đổi câu chữ trên tin nhắn.
+    """
+    from app.telegram import EVENT_TEXT, _headline
 
-    # có shell trên đĩa / lệnh đã chạy / LFI đã đọc được file
-    for rid in ("P2S-020", "P2S-021", "P2S-022", "P2S-024", "P2S-025",
-                "P2S-056", "P2S-057"):
-        assert h(rid) == "Server bị chiếm quyền (RCE)", rid
-
-    # chỉ là dò quét / đang khai thác, chưa chứng minh được gì
-    assert h("P2S-050", "MODERATE") == "Server đang bị khai thác php2shell"
-    assert h("P2S-051", "MODERATE") == "Server đang bị khai thác php2shell"
-    assert h("P2S-054", "MODERATE") == "Server đang bị khai thác php2shell"
-    assert h("P2S-050", "INFO") == "Dấu hiệu dò quét php2shell"
+    for rid in ("P2S-020", "P2S-021", "P2S-056", "P2S-050", "P2S-054"):
+        for sev in ("CRITICAL", "HIGH", "MODERATE", "INFO"):
+            assert _headline({"severity": sev,
+                              "evidence": [{"rule_id": rid}]}) == EVENT_TEXT, (rid, sev)
 
 
 def test_lfi_attempt_vs_lfi_success():
@@ -729,13 +725,16 @@ def test_lfi_attempt_vs_lfi_success():
     attempt = {"severity": "INFO", "evidence": [
         {"rule_id": "P2S-050,P2S-051", "uri": uri, "status": "404"}]}
     assert is_rce(attempt) is False
-    assert _headline(attempt) == "Dấu hiệu dò quét php2shell"
 
     # đã đọc được: 2xx, P2S-057 fire
     success = {"severity": "CRITICAL", "evidence": [
         {"rule_id": "P2S-050,P2S-051,P2S-057", "uri": uri, "status": "200"}]}
     assert is_rce(success) is True
-    assert _headline(success) == "Server bị chiếm quyền (RCE)"
+
+    # câu "Sự kiện" giống nhau ở cả hai — khác biệt nằm ở nhóm RCE được xếp
+    # lên đầu khối Event logs, không phải ở câu chữ.
+    from app.telegram import EVENT_TEXT
+    assert _headline(attempt) == _headline(success) == EVENT_TEXT
 
 
 def test_merged_rule_id_still_detects_rce():
@@ -749,9 +748,14 @@ def test_merged_rule_id_still_detects_rce():
 
 
 def test_format_alert_matches_template():
-    """Khung cố định 12 dòng theo yêu cầu operator — KHÔNG rule breakdown,
-    window, batch, mẫu evidence (chi tiết nằm trên server)."""
-    from datetime import datetime
+    """Khung tin nhắn theo yêu cầu operator (bản chốt):
+
+    - KHÔNG còn dòng "Mức độ" (severity chỉ lưu trong DB để lọc).
+    - "Sự kiện" là câu CỐ ĐỊNH cho mọi alert.
+    - KHÔNG còn "Tổng số Events" (đã nằm trong header Event logs).
+    - Envelope (Dự án/OS/User/Hostname/IP) luôn đủ.
+    - Khối Event logs in raw line + đường dẫn file nguồn.
+    """
     from zoneinfo import ZoneInfo
     from app.telegram import format_alert
 
@@ -766,9 +770,17 @@ def test_format_alert_matches_template():
         "window_end": "2026-10-25T16:50:00Z",
         "rules": [{"rule_id": "P2S-050", "hits": 4211},
                   {"rule_id": "P2S-017", "hits": 2529}],
-        "evidence": [{"rule_id": "P2S-050", "impact": "",
-                      "ip": "203.0.113.42",
-                      "raw": 'GET /page.php?file=/var/lib/php/sessions/sess_ab12 HTTP/1.1'}],
+        "preview_meta": "6740|2",
+        "preview": [
+            {"rule_id": "P2S-050", "hits": 4211, "impact": "",
+             "file": "/var/log/nginx/access.log", "line": 4211, "lines": 4211,
+             "raw": "203.0.113.42 - - [25/Oct/2026:16:45:01 +0000] \"GET /page.php"
+                    "?file=/var/lib/php/sessions/sess_ab12 HTTP/1.1\" 200 5"},
+            {"rule_id": "P2S-017", "hits": 2529, "impact": "",
+             "file": "/var/log/nginx/access.log", "line": 12, "lines": 2529,
+             "raw": "203.0.113.42 - - [25/Oct/2026:16:46:00 +0000] \"POST /upload.php"
+                    " HTTP/1.1\" 200 68 PHP_SESSION_UPLOAD_PROGRESS"},
+        ],
     }
     msg = format_alert("prod-shop", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
     lines = msg.split("\n")
@@ -776,20 +788,26 @@ def test_format_alert_matches_template():
         "🛡 <b>CENTRAL SECURITY ALERT</b>",
         "📅 <i>25/10/2026 - 23:50</i>",
         "",
-        "🚨 <b>Mức độ:</b> <code>MODERATE</code>",
-        "⚠️ <b>Sự kiện:</b> Server đang bị khai thác php2shell",
-        "📊 <b>Tổng số Events:</b> <code>6740</code>",
+        "⚠️ <b>Sự kiện:</b> Phát hiện nghi vấn khai thác php2Shell",
         "",
         "📦 <b>Dự án:</b> <code>prod-shop</code>",
         "🖥 <b>Môi trường / OS:</b> <b>[Docker Container]</b> <code>Ubuntu 24.04.1 LTS (Docker)</code>",
         "👤 <b>User:</b> <code>www-data</code>",
         "🏷 <b>Hostname:</b> <code>ip-10-0-1-5</code>",
         "🌐 <b>IP LAN:</b> <code>10.0.1.5</code>",
+        "",
+        "🧩 <b>Event logs (2 nhóm / 6740 events)</b>",
+        "<b>1.</b> ×4211 · <code>/var/log/nginx/access.log:4211 (+4210)</code>",
+        "   <code>203.0.113.42 - - [25/Oct/2026:16:45:01 +0000] \"GET /page.php"
+        "?file=/var/lib/php/sessions/sess_ab12 HTTP/1.1\" 200 5</code>",
+        "<b>2.</b> ×2529 · <code>/var/log/nginx/access.log:12 (+2528)</code>",
+        "   <code>203.0.113.42 - - [25/Oct/2026:16:46:00 +0000] \"POST /upload.php"
+        " HTTP/1.1\" 200 68 PHP_SESSION_UPLOAD_PROGRESS</code>",
     ]
-    # các thành phần đã bỏ theo yêu cầu: không xuất hiện trở lại
-    for gone in ("🧩", "⏱", "🔖", "🔎", "P2S-050", "23:45", "20261025T165000Z"):
+    # các thành phần đã bỏ theo yêu cầu: không được xuất hiện trở lại
+    for gone in ("Mức độ", "Tổng số Events", "⏱", "🔖", "🔎", "P2S-050", "23:45",
+                 "20261025T165000Z"):
         assert gone not in msg, gone
-    assert len(msg) <= 4096
 
 
 def test_format_alert_container_line():
@@ -808,7 +826,7 @@ def test_format_alert_container_line():
     assert "🐳 <b>Container:</b> <code>php-web, db-1</code>" in lines
     assert lines.index("🐳 <b>Container:</b> <code>php-web, db-1</code>") == \
         lines.index("🏷 <b>Hostname:</b> <code>egghead</code>") + 1
-    assert lines[-1] == "🌐 <b>IP LAN:</b> <code>192.168.22.191</code>"
+    assert "🌐 <b>IP LAN:</b> <code>192.168.22.191</code>" in lines
 
     host_only = format_alert("lab-group", base, ZoneInfo("Asia/Ho_Chi_Minh"))
     assert "🐳" not in host_only
@@ -818,18 +836,170 @@ def test_format_alert_container_line():
     assert many.count(", ") <= 4
 
 
-def test_format_alert_critical_uses_rce_headline():
+def test_format_alert_event_text_is_fixed():
+    """Sự kiện là câu cố định cho MỌI severity — không suy ra từ CRITICAL/INFO."""
+    from zoneinfo import ZoneInfo
+    from app.telegram import EVENT_TEXT, format_alert
+
+    for sev in ("CRITICAL", "HIGH", "MODERATE", "INFO"):
+        alert = {"severity": sev, "hits": 3, "host": "web-01", "user": "www-data",
+                 "hostname": "web-01", "lan_ip": "10.0.1.5",
+                 "ts_utc": "2026-10-25T16:50:00Z",
+                 "preview": [{"rule_id": "P2S-056", "impact": "rce",
+                              "file": "/var/www/html/s.php", "line": 0,
+                              "raw": "webroot webshell pattern"}]}
+        msg = format_alert("prod", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
+        assert f"⚠️ <b>Sự kiện:</b> {EVENT_TEXT}" in msg, sev
+        assert "Mức độ" not in msg
+
+
+# ------------------------------------------- alert Telegram: 1 tin, co giãn
+def _alert_with_preview(n_groups=5, raw_len=185, total=2465):
+    groups = []
+    for i in range(n_groups):
+        groups.append({
+            "rule_id": "P2S-021", "hits": 1, "severity": "CRITICAL", "impact": "rce",
+            "source": "auditd", "file": "/var/log/audit/audit.log", "line": 1000 + i,
+            "lines": 1,
+            "raw": f"type=EXECVE msg=audit(169862400{i}): " + "z" * (raw_len - 34),
+        })
+    return {"severity": "CRITICAL", "hits": total, "env": "Host",
+            "os": "Ubuntu 24.04.1 LTS", "user": "root", "hostname": "web-01",
+            "lan_ip": "10.0.1.5", "ts_utc": "2026-10-26T02:30:00Z",
+            "preview": groups, "preview_meta": f"{total}|{n_groups}"}
+
+
+def test_alert_is_always_exactly_one_message():
+    """Mọi mức raw đều chỉ sinh MỘT message — không bao giờ tách tin thứ hai.
+
+    Từng có phương án tách tin khi raw dài; operator bác vì gây nhầm lẫn khi
+    theo dõi. format_alert trả str (không phải list) là bất biến.
+    """
     from zoneinfo import ZoneInfo
     from app.telegram import format_alert
 
-    alert = {"severity": "CRITICAL", "hits": 3, "host": "web-01",
-             "user": "www-data", "hostname": "web-01", "lan_ip": "10.0.1.5",
-             "ts_utc": "2026-10-25T16:50:00Z",
-             "evidence": [{"rule_id": "P2S-056", "impact": "rce"}]}
-    msg = format_alert("prod", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
-    assert "🚨 <b>Mức độ:</b> <code>CRITICAL</code>" in msg
-    assert "⚠️ <b>Sự kiện:</b> Server bị chiếm quyền (RCE)" in msg
-    assert "📊 <b>Tổng số Events:</b> <code>3</code>" in msg
+    for raw_len in (185, 300, 700, 900, 1500, 3000, 8000):
+        msg = format_alert("p", _alert_with_preview(8, raw_len),
+                           ZoneInfo("Asia/Ho_Chi_Minh"))
+        assert isinstance(msg, str)
+        assert msg.count("CENTRAL SECURITY ALERT") == 1, raw_len
+
+
+def test_alert_never_exceeds_telegram_limit():
+    """Budget đo trên độ dài SAU parse entity (Telegram bỏ qua tag HTML)."""
+    from zoneinfo import ZoneInfo
+    from app.telegram import TG_LIMIT, format_alert, parsed_len
+
+    for raw_len in (185, 300, 700, 900, 1500, 3000, 8000):
+        msg = format_alert("p", _alert_with_preview(8, raw_len),
+                           ZoneInfo("Asia/Ho_Chi_Minh"))
+        assert parsed_len(msg) <= TG_LIMIT, (raw_len, parsed_len(msg))
+
+
+def test_alert_envelope_never_dropped_for_long_raw():
+    """Môi trường/OS/User/Hostname/IP phải còn đủ dù raw dài tới đâu.
+
+    Đây là điểm operator nhấn: thiếu envelope thì không biết server nào bị ảnh
+    hưởng. Thiếu chỗ thì CHỈ event logs co lại.
+    """
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert
+
+    for raw_len in (185, 900, 2000, 8000):
+        msg = format_alert("prod-shop", _alert_with_preview(8, raw_len),
+                           ZoneInfo("Asia/Ho_Chi_Minh"))
+        assert "📦 <b>Dự án:</b> <code>prod-shop</code>" in msg, raw_len
+        assert "🖥 <b>Môi trường / OS:</b> <b>[Host]</b> <code>Ubuntu 24.04.1 LTS</code>" in msg
+        assert "👤 <b>User:</b> <code>root</code>" in msg
+        assert "🏷 <b>Hostname:</b> <code>web-01</code>" in msg
+        assert "🌐 <b>IP LAN:</b> <code>10.0.1.5</code>" in msg
+
+
+def test_alert_short_raw_is_verbatim():
+    """Raw ngắn (thực tế nginx 185–192 ký tự): hiện NGUYÊN VĂN, không cắt."""
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert
+
+    alert = _alert_with_preview(5, 185)
+    msg = format_alert("p", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
+    for g in alert["preview"]:
+        assert g["raw"] in msg, g["line"]
+        assert "…</code>" not in msg
+
+
+def test_alert_truncates_only_at_limit():
+    """Raw dài chạm trần mới bị cắt, và cắt bằng '…' không kèm nhãn."""
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert
+
+    msg = format_alert("p", _alert_with_preview(3, 3000), ZoneInfo("Asia/Ho_Chi_Minh"))
+    assert "…</code>" in msg
+    assert "cắt" not in msg          # không có nhãn "[cắt — xem raw đầy đủ…]"
+    assert "xem đủ trên server" not in msg
+
+
+def test_alert_tail_counts_groups_only():
+    """Đuôi khối: '… +N nhóm', không kèm số event."""
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert
+
+    alert = _alert_with_preview(8, 900, total=900)
+    alert["preview_meta"] = "900|469"        # monitor báo còn 469 nhóm
+    msg = format_alert("p", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
+    tail = [l for l in msg.split("\n") if l.startswith("<i>…")]
+    assert tail, "phải có dòng đuôi khi còn nhóm chưa hiện"
+    assert "nhóm" in tail[0]
+    assert "events" not in tail[0]
+
+
+def test_alert_rce_group_sorted_first():
+    """Nhóm impact=rce lên đầu, kể cả khi ít hit hơn nhóm scan."""
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert
+
+    alert = {
+        "severity": "CRITICAL", "hits": 5000, "env": "Host", "os": "Debian 12",
+        "user": "www-data", "hostname": "web-01", "lan_ip": "10.0.1.5",
+        "ts_utc": "2026-10-26T02:30:00Z", "preview_meta": "5000|2",
+        "preview": [
+            {"rule_id": "P2S-050", "hits": 4999, "impact": "",
+             "file": "/var/log/nginx/access.log", "line": 10, "lines": 4999,
+             "raw": "scan line"},
+            {"rule_id": "P2S-021", "hits": 1, "impact": "rce",
+             "file": "/var/log/audit/audit.log", "line": 20, "lines": 1,
+             "raw": 'type=EXECVE a0="sh"'},
+        ],
+    }
+    msg = format_alert("p", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
+    assert msg.index("/var/log/audit/audit.log") < msg.index("/var/log/nginx/access.log")
+
+
+def test_alert_legacy_agent_without_preview():
+    """Agent cũ chưa gửi preview: vẫn 1 tin, nêu tên rule, không vỡ."""
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert
+
+    alert = {"severity": "MODERATE", "hits": 3, "env": "Host", "os": "Ubuntu",
+             "user": "root", "hostname": "h1", "lan_ip": "10.0.0.2",
+             "ts_utc": "2026-10-25T14:35:08Z",
+             "rules": [{"rule_id": "P2S-017", "hits": 3}]}
+    msg = format_alert("lab-1", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
+    assert "🧩 <b>Event logs (0 nhóm / 0 events)</b>" in msg
+    assert "P2S-017" in msg
+    assert "Môi trường / OS" in msg
+
+
+def test_alert_escapes_html_in_raw():
+    """Raw chứa < > & không được phá HTML của Telegram."""
+    from zoneinfo import ZoneInfo
+    from app.telegram import format_alert, parsed_len
+
+    alert = _alert_with_preview(1, 100)
+    alert["preview"][0]["raw"] = '<script>alert(1)</script> & "x"'
+    msg = format_alert("p", alert, ZoneInfo("Asia/Ho_Chi_Minh"))
+    assert "<script>" not in msg
+    assert "&lt;script&gt;" in msg
+    assert parsed_len(msg) > 0
 
 
 # ------------------------------------------------------------ evidence layout

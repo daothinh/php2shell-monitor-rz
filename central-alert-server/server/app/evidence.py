@@ -101,6 +101,14 @@ def normalize(alert: dict, default_host: str = "", default_lan_ip: str = "",
     a["user"] = str(a.get("user") or default_user or "")
     a["os"] = str(a.get("os") or default_os or "")
     a["env"] = str(a.get("env") or default_env or "")
+
+    # preview: các nhóm event monitor gửi kèm để render tin Telegram ngay.
+    # Phải giữ qua normalize — nó là nguồn duy nhất của raw line lúc gửi tin,
+    # vì file evidence được upload SAU alert (xem central.sh upload_evidence).
+    # Không suy ra từ evidence[]: evidence[] rỗng khi MAX_EVIDENCE_INLINE=0.
+    prev = a.get("preview")
+    a["preview"] = [g for g in prev if isinstance(g, dict)] if isinstance(prev, list) else []
+    a["preview_meta"] = str(a.get("preview_meta") or "")
     return a
 
 
