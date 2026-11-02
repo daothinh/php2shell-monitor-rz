@@ -24,6 +24,8 @@ p2s_device_init || exit 0
 [[ -f $WORKDIR/conf/default.conf ]] && source "$WORKDIR/conf/default.conf"
 
 MAX_EVIDENCE_INLINE=${MAX_EVIDENCE_INLINE:-0}
+# Số nhóm event nhét kèm alert để render Telegram. 0 = tắt.
+ALERT_PREVIEW_MAX=${ALERT_PREVIEW_MAX:-8}
 
 _rank() {
   case ${1^^} in
@@ -148,6 +150,27 @@ if [[ -n ${MAX_EVIDENCE_INLINE:-} && ${MAX_EVIDENCE_INLINE:-0} =~ ^[0-9]+$ ]] \
   (( total > MAX_EVIDENCE_INLINE )) && truncated=true
 fi
 
+# ------------------------------------------------- 3b. preview cho tin Telegram
+# Alert phải tự đủ để đọc trên Telegram: kèm ALERT_PREVIEW_MAX nhóm event đã gộp
+# trùng, giữ NGUYÊN VĂN dòng log gốc. Nhóm impact=rce xếp trước để lệnh đã chạy
+# không bị chìm dưới hàng nghìn dòng scan. Đây KHÔNG phải evidence[]: evidence[]
+# là bản đầy đủ (và rỗng khi MAX_EVIDENCE_INLINE=0), preview chỉ là ảnh chụp nhỏ
+# để render, luôn có kể cả khi evidence[] rỗng.
+# preview_meta = "<tổng hit>\t<tổng số nhóm>" để server in "… +N nhóm".
+preview='[]'
+preview_meta=''
+if [[ ${ALERT_PREVIEW_MAX:-8} =~ ^[0-9]+$ ]] && (( ALERT_PREVIEW_MAX > 0 )); then
+  meta_file=$P2S_TMP_DIR/report.$BATCH.preview.meta
+  : >"$meta_file"
+  if [[ -s $EVIDENCE ]]; then
+    preview="[$(awk -v outmeta="$meta_file" -v max="$ALERT_PREVIEW_MAX" \
+      -f "$WORKDIR/lib/preview.awk" "$EVIDENCE" | paste -sd, -)]"
+    IFS=$'\t' read -r _pv_total _pv_uniq <"$meta_file" || true
+    preview_meta="${_pv_total:-0}|${_pv_uniq:-0}"
+  fi
+  rm -f -- "$meta_file"
+fi
+
 # ------------------------------------------------- 4. the single alert
 alert=$(json_obj \
   "ts_utc" "$(json_str "$(utc_now)")" \
@@ -164,6 +187,8 @@ alert=$(json_obj \
   "hits" "$(json_num "$total")" \
   "rules" "$(_rule_counts_json)" \
   "severities" "$(_sev_counts_json)" \
+  "preview" "$preview" \
+  "preview_meta" "$(json_str "$preview_meta")" \
   "evidence_file" "$(json_str "$EVIDENCE")" \
   "evidence_count" "$(json_num "$total")" \
   "evidence_truncated" "$truncated" \

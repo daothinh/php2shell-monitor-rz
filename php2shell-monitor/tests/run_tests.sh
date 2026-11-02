@@ -211,6 +211,52 @@ T "alert: preview báo truncated" "true" "$(jq -r '.evidence_truncated' "$alert"
 T "alert: full evidence still on disk" "3" \
   "$(wc -l <"$w/projects/test-project/devices/test-device/evidence/20261024T001500Z.jsonl" | tr -d ' ')"
 
+# ------------------------------------------- preview: event nhóm cho Telegram
+# Alert phải tự đủ để render tin Telegram: kèm tối đa ALERT_PREVIEW_MAX nhóm
+# event đã gộp trùng, giữ NGUYÊN VĂN dòng log gốc + đường dẫn file.
+w3=$(newlab)
+hits3="$w3/hits3.tsv"
+{
+  # 4 dòng cùng một dạng request, chỉ khác mốc thời gian + id phiên -> 1 nhóm
+  for i in 1 2 3 4; do
+    printf '%s\n' $'2026-10-24T00:00:0'"$i"$'Z\taccess_log\t/var/log/nginx/access.log\t'"$((100+i))"$'\t1.2.3.4\tGET\t/vuln.php?page=/var/lib/php/sessions/sess_p2sabcdef'"$i"$'\t200\tcurl\t\tGET /vuln.php HTTP/1.1\tP2S-050,P2S-051\tCRITICAL\t'
+  done
+  # shell trên đĩa: impact=rce, chỉ 1 hit -> phải xếp ĐẦU dù ít hit nhất
+  printf '%s\n' $'2026-10-24T00:00:09Z\twebroot\t/var/www/html/s.php\t7\t\t\t\t\t\t\twebroot webshell pattern: system($_REQUEST)\tP2S-056\tCRITICAL\trce'
+} >"$hits3"
+report "$w3" "$hits3" "20261024T020000Z"
+alert3=$(tail -1 "$w3/projects/test-project/devices/test-device/alerts/queue.jsonl")
+
+T "preview: có 2 nhóm sau gộp"           "2"    "$(jq -r '.preview|length' <<<"$alert3")"
+T "preview: gộp 4 dòng trùng thành 1 nhóm" "1"  "$(jq -r '[.preview[]|select(.hits==4)]|length' <<<"$alert3")"
+T "preview: meta tổng hit|số nhóm"       "5|2"  "$(jq -r '.preview_meta' <<<"$alert3")"
+T "preview: nhóm rce xếp đầu"            "P2S-056" "$(jq -r '.preview[0].rule_id' <<<"$alert3")"
+T "preview: raw giữ nguyên văn"          "GET /vuln.php HTTP/1.1" "$(jq -r '.preview[1].raw' <<<"$alert3")"
+T "preview: đường dẫn file nguồn"        "/var/log/nginx/access.log" "$(jq -r '.preview[1].file' <<<"$alert3")"
+T "preview: số dòng khác nhau"           "4"    "$(jq -r '.preview[1].lines' <<<"$alert3")"
+
+# ALERT_PREVIEW_MAX giới hạn số nhóm gửi kèm; meta vẫn báo tổng số nhóm thật
+grep -v '^ALERT_PREVIEW_MAX=' "$w3/conf/default.conf" >"$w3/conf/default.conf.new"
+printf 'ALERT_PREVIEW_MAX=1\n' >>"$w3/conf/default.conf.new"
+mv -f "$w3/conf/default.conf.new" "$w3/conf/default.conf"
+report "$w3" "$hits3" "20261024T020500Z"
+q3=$w3/projects/test-project/devices/test-device/alerts/queue.jsonl
+T "preview: tôn trọng ALERT_PREVIEW_MAX"  "1"   "$(jq -r '.preview|length' "$q3" | tail -1)"
+T "preview: meta vẫn đủ tổng nhóm"        "5|2" "$(jq -r '.preview_meta' "$q3" | tail -1)"
+
+# tắt hẳn: preview rỗng, alert vẫn hợp lệ
+grep -v '^ALERT_PREVIEW_MAX=' "$w3/conf/default.conf" >"$w3/conf/default.conf.new"
+printf 'ALERT_PREVIEW_MAX=0\n' >>"$w3/conf/default.conf.new"
+mv -f "$w3/conf/default.conf.new" "$w3/conf/default.conf"
+report "$w3" "$hits3" "20261024T021000Z"
+T "preview: tắt -> mảng rỗng"             "0"   "$(jq -r '.preview|length' "$q3" | tail -1)"
+
+# preview.awk phải chịu được JSON có khoảng trắng sau dấu hai chấm (bản cũ)
+printf '%s\n' '{"ts_utc": "x", "rule_id": "P2S-050", "severity": "HIGH", "impact": "", "source": "access_log", "file": "/a.log", "line": 5, "raw": "line one"}' \
+  >"$w3/spaced.jsonl"
+T "preview: đọc JSON có khoảng trắng" "line one" \
+  "$(awk -f "$SRC/lib/preview.awk" "$w3/spaced.jsonl" | jq -r '.raw')"
+
 # ---------------------------------------------------------------- pair (chat-id)
 # Fake central server: một stub `curl` đếm lượt poll và trả lời theo kịch bản,
 # giữ test không phụ thuộc server thật hay mạng.
