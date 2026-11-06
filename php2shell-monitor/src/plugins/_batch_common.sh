@@ -7,6 +7,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/stream.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/paths.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/state.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/time_utc.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/readcap.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/health.sh"
 
 p2s_device_init || exit 1
 # Each plugin process owns the offsets of the files it read; persist them on exit.
@@ -15,7 +17,15 @@ p2s_device_init || exit 1
 # thoát, nhưng process awk con đã chết theo và file tiến độ của nó chưa được
 # đọc vào state. Đọc lại ở đây để phần đã quét không bị mất trắng.
 P2S_AWK_PROGRESS=${P2S_AWK_PROGRESS:-}
+P2S_AWK_FILE=${P2S_AWK_FILE:-}
+P2S_AWK_INO=${P2S_AWK_INO:-}
+P2S_AWK_BASE=${P2S_AWK_BASE:-0}
 trap 'p2s_rescue_progress; state_save_offsets' EXIT
+
+# Trần byte / trần thời gian cho MỘT nguồn trong MỘT batch. Đặt ở _batch_common
+# để mọi plugin đọc file đều dùng chung một luật (xem lib/readcap.sh).
+P2S_READ_CAP_BYTES=${P2S_READ_CAP_BYTES:-33554432}
+P2S_READ_TIMEOUT=${P2S_READ_TIMEOUT:-45}
 
 # Đọc mốc tiến độ awk còn sót lại (nếu plugin bị kill giữa chừng) vào state.
 p2s_rescue_progress() {
@@ -24,7 +34,8 @@ p2s_rescue_progress() {
   local ppos pline
   IFS=$'\t' read -r ppos pline <"$P2S_AWK_PROGRESS" || return 0
   [[ $ppos =~ ^[0-9]+$ ]] || return 0
-  state_offset_set "$P2S_AWK_FILE" "$P2S_AWK_INO" "$ppos" "${pline:-0}"
+  state_offset_set "$P2S_AWK_FILE" "$P2S_AWK_INO" \
+    "$(( ${P2S_AWK_BASE:-0} + ppos ))" "${pline:-0}"
   rm -f -- "$P2S_AWK_PROGRESS"
   return 0
 }
@@ -64,30 +75,26 @@ p2s_complete_bytes() {
 batch_read() {
   local file=$1 parse_fn=$2
   [[ -f $file && -r $file ]] || return 0
+  [[ $(p2s_file_kind "$file") == regular ]] || return 0
   local ino size pos line_no
-  ino=$(stat -c '%i' -- "$file") || return 0
-  size=$(stat -c '%s' -- "$file") || return 0
+  ino=$(stat -Lc '%i' -- "$file" 2>/dev/null) || return 0
+  size=$(stat -Lc '%s' -- "$file" 2>/dev/null) || return 0
   IFS=$'\t' read -r pos line_no <<<"$(state_offset_get "$file" "$ino")"
   (( pos <= size )) || { pos=0; line_no=0; }
   (( size > pos )) || return 0
 
   local chunk="$P2S_TMP_DIR/batch.chunk.$$"
-  tail -c +"$((pos + 1))" -- "$file" 2>/dev/null >"$chunk"
-  local complete_bytes newpos
-  if [[ $(tail -c1 -- "$chunk" 2>/dev/null | wc -l) -eq 0 ]]; then
-    # last line has no newline yet: keep it for the next batch.
-    # LC_ALL=C: length() must count BYTES to match head -c (UTF-8 locale counts chars).
-    complete_bytes=$(p2s_complete_bytes "$chunk")
-    [[ -z $complete_bytes || $complete_bytes -le 0 ]] && complete_bytes=0
-    if (( complete_bytes > 0 )); then
-      head -c "$complete_bytes" -- "$chunk" >"$chunk.full"
-      mv -f -- "$chunk.full" "$chunk"
-    else
-      : >"$chunk"
-    fi
-    newpos=$((pos + complete_bytes))
-  else
-    newpos=$size
+  p2s_read_chunk "$file" "$pos" "$size" \
+    "${P2S_READ_CAP_BYTES:-33554432}" "${P2S_READ_TIMEOUT:-45}" "$chunk" || {
+    rm -f -- "$chunk"; return 0; }
+  local base=$P2S_RD_BASE newpos line_used
+  newpos=$((base + P2S_TRIM_BYTES))
+  if (( P2S_RD_TIMEOUT )); then
+    # Bị cắt vì trần thời gian: giữ phần đã đọc, batch sau đọc tiếp từ newpos.
+    echo "readcap: timeout đọc $file tại byte $newpos (${P2S_READ_TIMEOUT}s)" >&2
+  fi
+  if (( P2S_RD_JUMPED )); then
+    echo "readcap: $file lớn hơn trần — bỏ qua phần đầu, bắt đầu từ byte $base" >&2
   fi
 
   # No per-batch event cap: breaking out of this loop advanced the offset to
@@ -105,21 +112,22 @@ batch_read() {
   # tự và offset sẽ trôi với log có tiếng Việt hoặc emoji.
   local count=0 line consumed=0 ckpt=${BATCH_CHECKPOINT_LINES:-1000}
   local LC_ALL=C
+  line_used=$line_no
   while IFS= read -r line; do
     [[ -z $line ]] && continue
     count=$((count + 1))
-    line_no=$((line_no + 1))
+    line_used=$((line_used + 1))
     consumed=$((consumed + ${#line} + 1))
     P2S_FILE=$file
-    P2S_LINE=$line_no
+    P2S_LINE=$line_used
     export P2S_FILE P2S_LINE
     "$parse_fn" "$line" || true
     if (( count % ckpt == 0 )); then
-      state_offset_set "$file" "$ino" "$((pos + consumed))" "$line_no"
+      state_offset_set "$file" "$ino" "$((base + consumed))" "$line_used"
     fi
   done <"$chunk"
 
-  state_offset_set "$file" "$ino" "$newpos" "$line_no"
+  state_offset_set "$file" "$ino" "$newpos" "$line_used"
   rm -f -- "$chunk"
   return 0
 }
@@ -130,31 +138,19 @@ batch_read() {
 parse_access_file() {
   local file=$1 src=$2
   [[ -f $file && -r $file ]] || return 0
+  [[ $(p2s_file_kind "$file") == regular ]] || return 0
   local ino size pos line_no
-  ino=$(stat -c '%i' -- "$file") || return 0
-  size=$(stat -c '%s' -- "$file") || return 0
+  ino=$(stat -Lc '%i' -- "$file" 2>/dev/null) || return 0
+  size=$(stat -Lc '%s' -- "$file" 2>/dev/null) || return 0
   IFS=$'\t' read -r pos line_no <<<"$(state_offset_get "$file" "$ino")"
   (( pos <= size )) || { pos=0; line_no=0; }
   (( size > pos )) || return 0
 
   local chunk="$P2S_TMP_DIR/access.chunk.$$"
-  tail -c +"$((pos + 1))" -- "$file" 2>/dev/null >"$chunk"
-  local newpos
-  if [[ $(tail -c1 -- "$chunk" 2>/dev/null | wc -l) -eq 0 ]]; then
-    local complete_bytes
-    # LC_ALL=C: length() must count BYTES to match head -c (UTF-8 counts chars).
-    complete_bytes=$(p2s_complete_bytes "$chunk")
-    [[ -z $complete_bytes || $complete_bytes -le 0 ]] && complete_bytes=0
-    if (( complete_bytes > 0 )); then
-      head -c "$complete_bytes" -- "$chunk" >"$chunk.full"
-      mv -f -- "$chunk.full" "$chunk"
-    else
-      : >"$chunk"
-    fi
-    newpos=$((pos + complete_bytes))
-  else
-    newpos=$size
-  fi
+  p2s_read_chunk "$file" "$pos" "$size" \
+    "${P2S_READ_CAP_BYTES:-33554432}" "${P2S_READ_TIMEOUT:-45}" "$chunk" || {
+    rm -f -- "$chunk"; return 0; }
+  local newpos=$((P2S_RD_BASE + P2S_TRIM_BYTES))
 
   local emitted=0
   if [[ -s $chunk ]]; then
@@ -182,53 +178,43 @@ batch_parse_awk() {
   local file=$1 src=$2 awkf=$3
   shift 3
   [[ -f $file && -r $file ]] || return 0
+  [[ $(p2s_file_kind "$file") == regular ]] || return 0
   local ino size pos line_no
-  ino=$(stat -c '%i' -- "$file") || return 0
-  size=$(stat -c '%s' -- "$file") || return 0
+  ino=$(stat -Lc '%i' -- "$file" 2>/dev/null) || return 0
+  size=$(stat -Lc '%s' -- "$file" 2>/dev/null) || return 0
   IFS=$'\t' read -r pos line_no <<<"$(state_offset_get "$file" "$ino")"
   (( pos <= size )) || { pos=0; line_no=0; }
   (( size > pos )) || return 0
 
   local chunk="$P2S_TMP_DIR/awk.chunk.$$"
-  tail -c +"$((pos + 1))" -- "$file" 2>/dev/null >"$chunk"
-  local newpos
-  if [[ $(tail -c1 -- "$chunk" 2>/dev/null | wc -l) -eq 0 ]]; then
-    # last line has no newline yet: leave it for the next batch
-    local complete_bytes
-    complete_bytes=$(p2s_complete_bytes "$chunk")
-    [[ -z $complete_bytes || $complete_bytes -le 0 ]] && complete_bytes=0
-    if (( complete_bytes > 0 )); then
-      head -c "$complete_bytes" -- "$chunk" >"$chunk.full"
-      mv -f -- "$chunk.full" "$chunk"
-    else
-      : >"$chunk"
-    fi
-    newpos=$((pos + complete_bytes))
-  else
-    newpos=$size
-  fi
+  p2s_read_chunk "$file" "$pos" "$size" \
+    "${P2S_READ_CAP_BYTES:-33554432}" "${P2S_READ_TIMEOUT:-45}" "$chunk" || {
+    rm -f -- "$chunk"; return 0; }
+  local newpos=$((P2S_RD_BASE + P2S_TRIM_BYTES))
 
   local emitted=0
   if [[ -s $chunk ]]; then
-    # File tiến độ: awk ghi "<byte_tuyệt_đối>\t<dòng_tuyệt_đối>" định kỳ.
-    # Nếu plugin bị PLUGIN_TIMEOUT cắt giữa chừng, trap EXIT gọi
+    # File tiến độ: awk ghi "<byte_tương_đối_trong_chunk>\t<dòng_tương_đối>"
+    # định kỳ. Nếu plugin bị PLUGIN_TIMEOUT cắt giữa chừng, trap EXIT gọi
     # p2s_rescue_progress đọc nốt mốc này — phần đã quét không bị mất trắng.
+    # Mốc là TƯƠNG ĐỐI vì base có thể đã nhảy (readcap); P2S_AWK_BASE cộng lại.
     local prog="$P2S_TMP_DIR/awk.prog.$$"
     : >"$prog"
     P2S_AWK_PROGRESS=$prog
     P2S_AWK_FILE=$file
     P2S_AWK_INO=$ino
+    P2S_AWK_BASE=$P2S_RD_BASE
     awk -f "$P2S_SRC_DIR/lib/$awkf" -v src="$src" \
         -v realfile="$file" -v startline="$line_no" \
-        -v basepos="$pos" -v progressfile="$prog" \
+        -v basepos=0 -v progressfile="$prog" \
         -v progress_every="${BATCH_CHECKPOINT_LINES:-2000}" \
         "$@" "$chunk" | tee "$chunk.out"
     emitted=$(wc -l <"$chunk.out")
     if [[ -s $prog ]]; then
       local ppos pline
       IFS=$'\t' read -r ppos pline <"$prog"
-      if [[ -n $ppos && $ppos -gt $pos ]]; then
-        state_offset_set "$file" "$ino" "$ppos" "$pline"
+      if [[ $ppos =~ ^[0-9]+$ ]] && (( P2S_RD_BASE + ppos > pos )); then
+        state_offset_set "$file" "$ino" "$((P2S_RD_BASE + ppos))" "$pline"
       fi
     fi
     rm -f -- "$prog"

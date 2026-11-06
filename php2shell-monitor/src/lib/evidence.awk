@@ -50,6 +50,12 @@ function rec(ts, rule, sev, source, file, line, ip, method, uri, status, ua, pid
   if (sev == "") sev = "INFO"
   total++
   if (impact == "rce") rce_hits++
+  # source=health: sự kiện của CHÍNH monitor (nguồn log bị mù, plugin bị
+  # PLUGIN_TIMEOUT cắt). Không phải tấn công, nên không được là CRITICAL, nhưng
+  # cũng KHÔNG được chìm vào INFO: alert INFO bị bỏ qua đúng lúc kênh cảnh báo
+  # đang hỏng — đó là lý do sự cố container_accesslog tồn tại bao lâu mà không ai
+  # thấy. Đếm riêng để nâng mức tối thiểu ở END.
+  if ($2 == "health") health_hits++
 
   # one raw line can satisfy several rules (comma list): count each separately
   n = split(rule, rl, ",")
@@ -77,6 +83,9 @@ END {
   if (rce_hits > 0)                  final_sev = "CRITICAL"
   else if (total >= crit_threshold)  final_sev = "MODERATE"
   else                               final_sev = "INFO"
+  # Sàn HIGH cho sự kiện sức khoẻ: "monitor đang mù" phải đọc được ngay trên
+  # Telegram, không phải một dòng INFO lẫn trong batch nhiễu.
+  if (health_hits > 0 && final_sev != "CRITICAL") final_sev = "HIGH"
 
   printf "%d\t%s\t%d\n", total, final_sev, rce_hits > (outcounts)
   for (k in rule_count) printf "R\t%s\t%d\n", k, rule_count[k] > (outcounts)

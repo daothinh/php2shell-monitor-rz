@@ -138,7 +138,7 @@ cmd_pair() {
   local resp pair_ref warn rbot
   resp=$("${CURL[@]}" -X POST "$server/api/v1/register-chatid" \
     -H 'Content-Type: application/json' \
-    -d "{\"project_name\":\"$(json_escape "$proj")\",\"chat_id\":\"$(json_escape "$chatid")\",\"device\":\"$(json_escape "$DEVICE")\"}") \
+    -d "{\"project_name\":\"$(json_escape "$proj")\",\"chat_id\":\"$(json_escape "$chatid")\",\"device\":\"$(json_escape "$DEVICE")\",\"monitor_version\":\"$(json_escape "${P2S_VERSION:-dev}")\"}") \
     || die "không gọi được $server — kiểm tra đường mạng/URL: $server"
   pair_ref=$(json_get "$resp" pair_ref)
   [[ -n $pair_ref ]] || die "server trả về không có pair_ref: $resp"
@@ -186,13 +186,14 @@ post_alerts() { # các dòng JSON làm tham số -> 0 chỉ khi server NHẬN (H
   os_name=$(os_pretty); env_kind=$(env_label)
   payload_file=$P2S_TMP_DIR/payload.$$.json
   {
-    printf '{"host":"%s","device":"%s","lan_ip":"%s","user":"%s","os":"%s","env":"%s","alerts":[' \
+    printf '{"host":"%s","device":"%s","lan_ip":"%s","user":"%s","os":"%s","env":"%s","monitor_version":"%s","alerts":[' \
       "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" \
       "$(json_escape "$DEVICE")" \
       "$(json_escape "$(lan_ip)")" \
       "$(json_escape "$(id -un 2>/dev/null || echo unknown)")" \
       "$(json_escape "$os_name")" \
-      "$(json_escape "$env_kind")"
+      "$(json_escape "$env_kind")" \
+      "$(json_escape "${P2S_VERSION:-dev}")"
     printf '%s\n' "$@" | paste -sd, -
     printf ']}'
   } >"$payload_file" || { rm -f -- "$payload_file"; return 1; }
@@ -316,6 +317,10 @@ drain_spool() { # gửi spool trước (FIFO); thành công -> xoá đúng số 
   if post_alerts "${batch[@]}"; then
     tail -n +"$((n + 1))" -- "$f" >"$f.2" && mv -f -- "$f.2" "$f"
     printf '%s: đã gửi %d alert từ spool\n' "$P2S_PROG" "$n"
+    # Evidence của alert gửi bù cũng phải lên: alert đã tới server mà thiếu file
+    # mirror thì tin nhắn không có raw, và lịch sử trên server vĩnh viễn mù.
+    local _l
+    for _l in "${batch[@]}"; do upload_evidence "$_l" || true; done
   fi
 }
 
@@ -354,28 +359,10 @@ cmd_agent() {
   done
 }
 
-cmd_test() {
-  load_conf
-  local ts payload resp
-  ts=$(utc_now)
-  payload=$(printf '{"host":"%s","lan_ip":"%s","user":"%s","os":"%s","env":"%s","alerts":[{"ts_utc":"%s","rule_id":"TEST-001","severity":"INFO","tier":"TEST","message":"Alert thử từ php2shell-monitor (%s) — đường truyền ghép nối hoạt động!"}]}' \
-    "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" \
-    "$(json_escape "$(lan_ip)")" \
-    "$(json_escape "$(id -un 2>/dev/null || echo unknown)")" \
-    "$(json_escape "$(os_pretty)")" \
-    "$(json_escape "$(env_label)")" \
-    "$ts" "$DEVICE")
-  resp=$("${CURL[@]}" -X POST "$SERVER_URL/api/v1/ingest-log" \
-    -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
-    --data "$payload") || die "không gọi được $SERVER_URL"
-  printf 'Phản hồi server: %s\n' "$resp"
-  printf 'Nếu delivered >= 1, hãy kiểm tra Telegram — alert thử phải xuất hiện.\n'
-}
 
 case ${1:-help} in
   pair)  shift; cmd_pair "$@" ;;
   agent) cmd_agent ;;
-  test)  cmd_test ;;
   # Health-check ghép nối cho guard của main.sh: 0=sống 1=bị từ chối 2=không rõ
   is-alive) check_pairing; exit $? ;;
   *) die "central.sh {pair --chatid <id>} | agent | test | is-alive" ;;

@@ -17,6 +17,20 @@
 #
 # Đường dẫn host tới file trong container lấy qua /proc/<pid>/root (xem
 # lib/container.sh) — độc lập storage driver, không cần mount lại.
+#
+# HAI LỚP CHỐNG TREO (bản 1.4.12)
+# 1. nginx official image để /var/log/nginx/access.log là SYMLINK tới
+#    /dev/stdout. Đọc từ host, đích tuyệt đối /dev/stdout được giải theo
+#    namespace của HOST, tức /proc/<pid-của-chính-plugin>/fd/1; plugins.sh lại
+#    redirect stdout của plugin vào một file, nên `-f` ĐÚNG và `tail` đọc chính
+#    file đang được plugin ghi ra -> file tự dài ra trong lúc đọc -> không bao
+#    giờ tới EOF. Đo trên lab: rc=124 mỗi batch, 0 dòng, và vì vòng lặp đứng ở
+#    container ĐẦU TIÊN nên access log thật của DVWA không bao giờ được đọc.
+#    Xử lý: phân loại bằng readlink TRƯỚC (p2s_file_kind); `stdout` thì bỏ qua
+#    ở đây và để docker_logs đọc /var/lib/docker/containers/<cid>/<cid>-json.log
+#    — đó mới là nội dung thật của stdout. Không im lặng: ghi health note.
+# 2. Mỗi file có trần byte và trần thời gian riêng (lib/readcap.sh); hết hạn
+#    thì giữ phần đã đọc, lưu cursor, đi tiếp container kế tiếp.
 set -u
 source "$(dirname "${BASH_SOURCE[0]}")/_batch_common.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/container.sh"
@@ -35,18 +49,13 @@ CONTAINER_ACCESS_GLOBS=(
   'var/log/httpd/*access*.log'
   'var/log/nginx/access.log.*'
 )
-
-# Trần kích thước đọc cho MỘT lượt của MỘT file. Lượt quét đầu trên container
-# đã chạy lâu có thể gặp file 100+ MB; đọc hết một lần thì plugin vượt
-# PLUGIN_TIMEOUT và batch sau lại đọc lại từ đầu. Cắt theo trần, các batch sau
-# đọc tiếp phần còn lại — không mất dòng nào, chỉ trải ra nhiều batch.
 CONTAINER_READ_CAP_BYTES=${CONTAINER_READ_CAP_BYTES:-16777216}
 
 # parse_container_access <hostpath> <cid> <name> <rel>
 # Như parse_access_file nhưng: (a) giới hạn byte mỗi lượt, (b) tên file hiển
 # thị là container:<tên> thay vì đường dẫn /proc/<pid>/root dài dằng dặc.
 #
-# KHOÁ OFFSET: dùng "<cid>:<rel>" chứ KHÔNG dùng đường dẫn /proc/<pid>/root.
+# KHOÁ OFFSET: dùng "<cid>/<rel>" chứ KHÔNG dùng đường dẫn /proc/<pid>/root.
 # Container restart thì PID đổi, đường dẫn /proc cũ biến mất, offset theo
 # đường dẫn sẽ trỏ vào key không bao giờ gặp lại -> đọc lại từ byte 0 sau mỗi
 # lần restart. CID thì ổn định suốt vòng đời container, và <rel> ổn định trong
@@ -57,33 +66,22 @@ parse_container_access() {
   [[ -f $file && -r $file ]] || return 0
   local key="container:$cid/$rel"
   local ino size pos line_no
-  ino=$(stat -c '%i' -- "$file") || return 0
-  size=$(stat -c '%s' -- "$file") || return 0
+  ino=$(stat -Lc '%i' -- "$file" 2>/dev/null) || return 0
+  size=$(stat -Lc '%s' -- "$file" 2>/dev/null) || return 0
   IFS=$'\t' read -r pos line_no <<<"$(state_offset_get "$key" "$ino")"
   (( pos <= size )) || { pos=0; line_no=0; }
   (( size > pos )) || return 0
 
-  local avail=$((size - pos))
-  local want=$avail
-  (( want > CONTAINER_READ_CAP_BYTES )) && want=$CONTAINER_READ_CAP_BYTES
-
   local chunk="$P2S_TMP_DIR/cacc.chunk.$$"
-  tail -c +"$((pos + 1))" -- "$file" 2>/dev/null | head -c "$want" >"$chunk"
-  # Dòng cuối có thể bị cắt giữa chừng vì trần byte: bỏ nó lại cho batch sau.
-  local newpos
-  if [[ $(tail -c1 -- "$chunk" 2>/dev/null | wc -l) -eq 0 ]]; then
-    local complete_bytes
-    complete_bytes=$(p2s_complete_bytes "$chunk")
-    [[ -z $complete_bytes || $complete_bytes -le 0 ]] && complete_bytes=0
-    if (( complete_bytes > 0 )); then
-      head -c "$complete_bytes" -- "$chunk" >"$chunk.full"
-      mv -f -- "$chunk.full" "$chunk"
-    else
-      : >"$chunk"
-    fi
-    newpos=$((pos + complete_bytes))
+  p2s_read_chunk "$file" "$pos" "$size" "$CONTAINER_READ_CAP_BYTES" \
+    "${P2S_READ_TIMEOUT:-45}" "$chunk" || { rm -f -- "$chunk"; return 1; }
+  local newpos=$((P2S_RD_BASE + P2S_TRIM_BYTES))
+  if (( P2S_RD_TIMEOUT )); then
+    echo "readcap: timeout đọc $name:$rel tại byte $newpos (${P2S_READ_TIMEOUT}s)" >&2
+    p2s_health_note "container_accesslog/$cid/$rel" degraded \
+      "timeout ${P2S_READ_TIMEOUT}s tai byte $newpos"
   else
-    newpos=$((pos + want))
+    p2s_health_note "container_accesslog/$cid/$rel" ok
   fi
 
   local emitted=0 read_lines=0
@@ -91,7 +89,8 @@ parse_container_access() {
     # realfile: alert phải chỉ được container nào, không phải đường dẫn
     # /proc/<pid>/root/var/log/nginx/access.log.
     awk -f "$P2S_SRC_DIR/lib/accesslog.awk" -v src=access_log \
-        -v realfile="container:$name:${cid:0:12}" -v startline="$line_no" "$chunk" | tee "$chunk.out"
+        -v realfile="container:$name:$abspath" -v startline="$line_no" "$chunk" \
+      | tee "$chunk.out"
     emitted=$(wc -l <"$chunk.out")
     read_lines=$(LC_ALL=C awk 'END { print NR }' "$chunk" 2>/dev/null)
     [[ -n $read_lines ]] || read_lines=$emitted
@@ -112,9 +111,27 @@ while IFS=$'\t' read -r _short name _pid rootfs cid; do
   for rel in "${CONTAINER_ACCESS_GLOBS[@]}"; do
     for f in "$rootfs"/$rel; do
       [[ -f $f && -r $f ]] || continue
-      # rel chuẩn hoá: bỏ tiền tố rootfs để làm khoá offset ổn định
+      # khoá offset: bỏ tiền tố rootfs (ổn định qua restart/đổi PID)
       relpath=${f#"$rootfs"/}
-      parse_container_access "$f" "$cid" "$name" "$relpath"
+      # đường dẫn HIỂN THỊ phải tuyệt đối bên trong container: giữ dấu "/"
+      abspath=/${relpath}
+      case $(p2s_file_kind "$f") in
+        regular)
+          parse_container_access "$f" "$cid" "$name" "$relpath" || true
+          ;;
+        stdout)
+          # access.log -> /dev/stdout (nginx:alpine, nginx:official). Nội dung
+          # thật nằm ở json log; docker_logs đọc nó. Ghi nhận để người trực ca
+          # biết nguồn này KHÔNG được đọc ở đây, thay vì im lặng.
+          p2s_health_note "container_accesslog/$cid/$relpath" ok
+          printf 'container_accesslog: %s:%s -> /dev/stdout, bỏ qua (docker_logs đọc json log)\n' \
+            "$name" "$relpath" >&2
+          ;;
+        *)
+          p2s_health_note "container_accesslog/$cid/$relpath" degraded \
+            "không phải regular file ($(stat -Lc '%F' -- "$f" 2>/dev/null))"
+          ;;
+      esac
     done
   done
   shopt -u nullglob

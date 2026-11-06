@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 
-from . import db, migrate
+from . import db, migrate, preview
 from .config import Config, load_config
 from .routes import router
 from .telegram import PairingBot, TelegramClient
@@ -48,6 +48,32 @@ async def _cleanup_loop(cfg: Config) -> None:
         try:
             db.cleanup(cfg.database_path, cfg.reveal_ttl_sec, cfg.retention_days)
             _prune_evidence(cfg)
+            # reported_events phải có trần: không dọn thì mỗi event một dòng,
+            # batch 88k hit sẽ làm bảng phình vô hạn.
+            try:
+                n = db.prune_reported_events(
+                    cfg.database_path, int(cfg.dedup_window_sec or 604800))
+                if n:
+                    log.info("dọn %d ident dedup quá cửa sổ", n)
+            except Exception:  # noqa: BLE001
+                log.exception("dọn reported_events lỗi")
+            # Vá dần lịch sử: alert cũ do monitor <= 1.4.2 gửi lên không có raw
+            # row nào trong alert_hits. Chạy nền, mỗi vòng một lô nhỏ.
+            try:
+                fixed, rows = preview.backfill_alert_hits(cfg, cfg.database_path)
+                if fixed:
+                    log.info("vá alert_hits từ evidence: %d alert, %d row", fixed, rows)
+            except Exception:  # noqa: BLE001 — housekeeping không được làm chết loop
+                log.exception("vá alert_hits lỗi")
+            # Alert bị hoãn vì thiếu raw: thử gửi bù mỗi vòng (evidence có thể
+            # lên muộn, hoặc backfill vừa nạp raw từ file).
+            try:
+                n = await preview.flush_awaiting(cfg, cfg.database_path,
+                                                 app.state.telegram, app.state.tz)
+                if n:
+                    log.info("gửi bù %d alert đang chờ raw", n)
+            except Exception:  # noqa: BLE001
+                log.exception("gửi bù alert lỗi")
         except Exception:  # noqa: BLE001
             log.exception("cleanup lỗi")
         await asyncio.sleep(900)  # 15 phút
@@ -87,6 +113,15 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 — never block startup on housekeeping
         log.warning("gộp thư mục evidence thất bại: %s", exc)
 
+    # Vá NGAY một lô lịch sử lúc khởi động: alert cũ thiếu raw row thì /search và
+    # /alerts/{id} vẫn mù cho tới vòng cleanup đầu tiên (15 phút).
+    try:
+        fixed, rows = preview.backfill_alert_hits(cfg, cfg.database_path)
+        if fixed:
+            log.info("vá alert_hits lúc khởi động: %d alert, %d row", fixed, rows)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("vá alert_hits lúc khởi động thất bại: %s", exc)
+
     tg = getattr(app.state, "telegram", None) or TelegramClient(cfg.bot_token or "unset")
     app.state.telegram = tg
     tasks = [asyncio.create_task(_cleanup_loop(cfg), name="cleanup")]
@@ -104,7 +139,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Central Security Alert Server",
-    version="1.0.0",
+    version="1.3.0",
     description="Tiếp nhận alert bảo mật (php2shell-monitor) và bắn cảnh báo Telegram theo dự án.",
     lifespan=lifespan,
 )

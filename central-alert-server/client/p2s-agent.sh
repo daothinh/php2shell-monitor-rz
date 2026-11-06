@@ -158,7 +158,7 @@ EOF
 
   printf '\n⏳ Đang nhận API key (ghép nối TỰ ĐỘNG — không cần /confirm)...\n'
 
-  local i st status api_key elapsed
+  local i st status api_key
   for ((i = 0; i < PAIR_TIMEOUT; i += 3)); do
     sleep 3
     if ! st=$("${CURL[@]}" "$server/api/v1/pairing-status?code=$pair_ref"); then
@@ -242,6 +242,32 @@ post_alerts() { # các dòng JSON làm tham số -> 0 nếu server nhận
     --data "$payload" >/dev/null
 }
 
+# upload_evidence <alert_json_line>
+# Gửi file evidence của batch dạng gzip thô qua kênh riêng (/ingest-evidence).
+# Alert chỉ mang metadata (evidence[] rỗng khi MAX_EVIDENCE_INLINE=0), nên đây là
+# kênh duy nhất chở raw line lên server. Không có bước này thì mọi alert đều
+# hiện "Event logs 0 nhóm" trên Telegram dù monitor phát hiện đúng.
+upload_evidence() {
+  local line=$1 batch evf
+  batch=$(printf '%s' "$line" | sed -n 's/.*"batch_id":"\([^"]*\)".*/\1/p')
+  evf=$(printf '%s' "$line" | sed -n 's/.*"evidence_file":"\([^"]*\)".*/\1/p')
+  [[ -n $batch && -n $evf && -r $evf ]] || return 0
+  local gz
+  gz=$(mktemp)
+  gzip -6 -c -- "$evf" >"$gz" || { rm -f -- "$gz"; return 1; }
+  local rc=0
+  "${CURL[@]}" --max-time 300 -X POST "$SERVER_URL/api/v1/ingest-evidence" \
+    -H "X-API-Key: $API_KEY" \
+    -H "X-Batch-Id: $batch" \
+    -H "X-Hostname: $(hostname 2>/dev/null || echo unknown)" \
+    -H "X-Lan-Ip: $(lan_ip)" \
+    -H "X-User: $(id -un 2>/dev/null || echo unknown)" \
+    -H 'Content-Type: application/gzip' \
+    --data-binary "@$gz" >/dev/null || rc=$?
+  rm -f -- "$gz"
+  return $rc
+}
+
 # Đọc dòng mới hoàn chỉnh từ $ALERT_FILE; aware-rotation theo inode.
 # An toàn khi file đang được ghi cùng lúc (scan append từng dòng): chỉ tiêu thụ
 # đúng số byte đã stat, và nếu dòng cuối chưa có \n thì bỏ cả dòng đó lại cho chu kỳ sau.
@@ -308,6 +334,8 @@ drain_spool() {
   if post_alerts "${batch[@]}"; then
     tail -n +"$((n + 1))" -- "$f" >"$f.2" && mv -f -- "$f.2" "$f"
     printf '%s: đã gửi %d alert từ spool\n' "$PROG" "$n"
+    local _l
+    for _l in "${batch[@]}"; do upload_evidence "$_l" || true; done
   fi
 }
 
@@ -331,6 +359,12 @@ cmd_run() {
       while ((sent < ${#NEW_LINES[@]})); do
         local -a part=("${NEW_LINES[@]:sent:BATCH_MAX}")
         if post_alerts "${part[@]}"; then
+          # Evidence của từng batch phải lên server, nếu không alert đã tới mà
+          # không có raw: server không dựng lại được preview[] và /search mù.
+          # Agent này chạy được với monitor <= 1.4.2 vì alert cũ vẫn mang
+          # evidence_file trỏ tới file local.
+          local _l
+          for _l in "${part[@]}"; do upload_evidence "$_l" || true; done
           sent=$((sent + ${#part[@]}))
         else
           spool_append "${NEW_LINES[@]:sent}"

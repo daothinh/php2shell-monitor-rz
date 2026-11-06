@@ -12,10 +12,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/container.sh"
 plugin_name=webroot
 export plugin_name
 MANIFEST=$P2S_STATE_DIR/webroot.manifest.tsv
-# Danh sách webshell đang thực sự nằm trên đĩa (path + đoạn code khớp).
-# KHÔNG phải dedup: mỗi batch quét lại và báo lại chừng nào file còn đó.
+# Tập webshell ĐÃ BÁO: mỗi dòng "<khoá ổn định>\t<đoạn code khớp>".
+# Dùng để chặn spam, không phải để báo cáo trạng thái (xem khối content scan).
 SHELLS=$P2S_STATE_DIR/webroot.shells.tsv
 SHELLS_NOW=$P2S_STATE_DIR/webroot.shells.now.$$
+SHELLS_DISP=$P2S_STATE_DIR/webroot.shells.disp.$$
 
 webroot_dirs() {
   local -a out=()
@@ -61,11 +62,20 @@ while IFS= read -r d; do
     -printf '%p\t%s\t%T@\t%U\n' 2>/dev/null >>"$tmp"
 done < <(webroot_dirs; container_webroot_dirs)
 
-# First run: adopt the current tree as baseline, emit nothing (no noise).
+# Lượt đầu: nhận cây webroot hiện có làm baseline, KHÔNG báo NEW/CHANGED cho
+# từng file — một webroot sẵn có sẽ sinh hàng nghìn dòng "file NEW".
 # Manifest lưu khoá ỔN ĐỊNH (xem p2s_container_manifest_key): với file trong
 # container là "container:<cid>:<relpath>", không phải /proc/<pid>/root/...
 # nên restart container không làm toàn bộ webroot trông như "file NEW".
+#
+# KHÔNG `exit 0` sau khi ghi baseline: content scan bên dưới phải chạy cả ở
+# lượt đầu. Trước đây thoát ngay, nên webshell đã nằm sẵn trên đĩa trước khi
+# cài chỉ được báo ở batch THỨ HAI — trễ 5 phút so với lúc đáng lẽ phải biết,
+# và nếu supervisor không kịp chạy batch 2 thì shell đó chưa từng xuất hiện
+# trong bất kỳ alert nào.
+baseline_run=0
 if [[ ! -s $MANIFEST ]]; then
+  baseline_run=1
   {
     printf '# path\tsize\tmtime\towner\n'
     while IFS=$'\t' read -r path sz mt own; do
@@ -73,11 +83,11 @@ if [[ ! -s $MANIFEST ]]; then
       printf '%s\t%s\t%s\t%s\n' "$(p2s_container_manifest_key "$path")" "$sz" "$mt" "$own"
     done <"$tmp" | sort -u
   } >"$MANIFEST.tmp.$$" && mv -f -- "$MANIFEST.tmp.$$" "$MANIFEST"
-  rm -f -- "$tmp"
-  exit 0
 fi
 
-while IFS=$'\t' read -r path sz mt own; do
+# Diff NEW/CHANGED chỉ có nghĩa khi ĐÃ có baseline; lượt đầu bỏ qua để không
+# biến cả cây webroot thành "file NEW".
+while (( ! baseline_run )) && IFS=$'\t' read -r path sz mt own; do
   [[ -z $path ]] && continue
   key=$(p2s_container_manifest_key "$path")
   # Tên hiển thị trong alert: container:<tên>:/var/www/html/s.php
@@ -114,17 +124,35 @@ done <"$tmp"
 
 # Content scan: a webshell already present when the baseline was adopted is
 # never "NEW", so a diff-only plugin stays blind to it forever. Scan the code
-# itself every batch and report the CODE, not just the path, so the analyst
-# sees what the shell does without opening the file.
+# itself every batch — but BÁO MỘT LẦN cho mỗi nội dung shell, không phải mỗi
+# batch.
 #
-# Báo lại MỖI batch chừng nào file còn đó. Trước đây khối này dedup trên
-# path+size+mtime và ghi vĩnh viễn vào webroot.seen.tsv: một shell đứng yên
-# (webshell đã drop thì không ai sửa nữa) chỉ báo đúng một lần rồi câm mãi.
-# Hậu quả thực tế: batch sau mất impact=rce nên alert tụt từ CRITICAL xuống
-# MODERATE, và Telegram chỉ còn "Server đang bị khai thác php2shell" trong khi
-# server đã bị chiếm quyền. Trạng thái "đang có shell" là sự thật của batch
-# hiện tại, không phải sự kiện một lần — nó phải tồn tại cùng file.
+# VÌ SAO KHÔNG BÁO LẠI MỖI BATCH (bản trước làm vậy):
+# "Alert chỉ phục vụ cảnh báo, không phục vụ báo cáo trạng thái." Một shell đứng
+# yên trên đĩa không phải hành vi mới — không có ai vừa làm gì. Báo lại mỗi 5
+# phút biến 1 sự cố thành 48 tin giống nhau (đo được trên lab: 48 batch liên
+# tiếp, cùng một signature), và người trực ca sẽ tắt thông báo — đúng lúc sự cố
+# tiếp theo xảy ra thì không ai đọc.
+#
+# VÌ SAO KHÔNG PHẢI dedup path+size+mtime như webroot.seen.tsv cũ:
+# khoá cũ không phân biệt "cùng shell" với "shell bị thay bằng shell khác cùng
+# kích thước". Khoá ở đây là (path, đoạn code khớp): sửa nội dung, đổi hàm, đổi
+# biến nhận vào — đều là hành vi mới và phải báo lại. Shell bị xoá rồi drop lại
+# nguyên bản cũng báo lại, vì lần drop đó là hành vi mới.
+#
+# KHÔNG gửi tin "đã hết" khi shell biến mất: dọn dẹp không phải sự cố, và alert
+# không phải kênh báo cáo trạng thái. Dòng tương ứng chỉ đơn giản rời khỏi
+# SHELLS, im lặng.
+#
+# ĐÁNH ĐỔI ĐÃ BIẾT: batch không có hành vi mới thì không có hit P2S-056, nên
+# severity batch đó chỉ phản ánh các hit mới. Đó là hệ quả đúng của nghiệp vụ
+# "alert = cảnh báo hành vi", không phải mất tín hiệu: shell vẫn nằm trong
+# SHELLS và trong manifest, và nếu có hành vi mới thật (file mới, nội dung đổi,
+# request khai thác trong access log) thì batch đó có hit và lại CRITICAL.
+# Bản trước giữ CRITICAL bằng cách bắn một tin giống hệt mỗi 5 phút — đúng
+# severity nhưng sai hoàn toàn về mặt vận hành.
 : >"$SHELLS_NOW"
+: >"$SHELLS_DISP"
 while IFS=$'\t' read -r path _sz _mt _own; do
   [[ -n $path ]] || continue
   [[ $path == *.user.ini || $path == */.htaccess ]] && continue
@@ -135,17 +163,28 @@ while IFS=$'\t' read -r path _sz _mt _own; do
     | head -1)
   [[ -n $hit ]] || continue
   # Khoá ổn định cho webroot.shells.tsv, tên đọc được cho alert.
-  printf '%s\t%s\n' "$(p2s_container_manifest_key "$path")" "$hit" >>"$SHELLS_NOW"
+  key=$(p2s_container_manifest_key "$path")
+  printf '%s\t%s\n' "$key" "$hit" >>"$SHELLS_NOW"
+  # Đã báo cho đúng cặp (path, đoạn code) này rồi ⇒ không phải hành vi mới.
+  # So sánh bằng awk trên từng field TAB, không ghép chuỗi có tab vào pattern.
+  if [[ -s $SHELLS ]] && awk -F'\t' -v k="$key" -v h="$hit" \
+       '$1 == k && $2 == h { found = 1; exit } END { exit !found }' "$SHELLS"; then
+    printf '%s\t%s\n' "$key" "$hit" >>"$SHELLS_DISP"
+    continue
+  fi
   disp=$(p2s_container_display "$path")
   P2S_TS=$(utc_now); export P2S_TS
   emit_record webroot "$disp" 0 "" "" "" "" "" "" \
     "webroot webshell pattern: $disp contains '$hit'" "-"
+  printf '%s\t%s\n' "$key" "$hit" >>"$SHELLS_DISP"
 done <"$tmp"
 
-# webroot.shells.tsv = ảnh chụp các shell của batch này. File biến mất thì
-# dòng cũng biến mất, nên không có dedup nào sống lâu hơn sự thật trên đĩa.
-sort -u "$SHELLS_NOW" >"$SHELLS" 2>/dev/null || : >"$SHELLS"
-rm -f -- "$SHELLS_NOW"
+# SHELLS = tập shell đã báo và CÒN trên đĩa. Shell biến mất thì dòng rời khỏi
+# đây, nên nếu nó được drop lại sau này thì đó lại là hành vi mới và báo lại.
+# Không dòng nào được ghi thêm ngoài SHELLS_DISP, nên tập này không phình ra
+# theo thời gian và không giữ ký ức về file đã bị xoá.
+sort -u "$SHELLS_DISP" >"$SHELLS" 2>/dev/null || : >"$SHELLS"
+rm -f -- "$SHELLS_NOW" "$SHELLS_DISP"
 
 
 {

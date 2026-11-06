@@ -7,3 +7,4 @@
 {"id":"P2S-056","severity":"CRITICAL","source":["webroot"],"match":{"type":"regex","field":"msg","pcre":"(?i)(system|exec|passthru|shell_exec|popen|proc_open|assert|eval|create_function|call_user_func)\\s*\\(\\s*\\$_(REQUEST|GET|POST|COOKIE|SERVER)"},"impact":"rce"}
 {"id":"P2S-057","severity":"CRITICAL","source":["access_log"],"match":{"type":"regex","field":"status","pcre":"^2[0-9][0-9]$","and":[{"field":"uri","pcre":"(?i)(page|file|path|include|view|load|read|tpl|inc|doc|template|src|url)=(/|%2f)[a-z0-9_.%/-]{4,}"}]},"impact":"rce"}
 {"id":"P2S-058","severity":"HIGH","source":["sessions"],"match":{"type":"regex","field":"msg","pcre":"(?i)upload_progress"}}
+{"id":"P2S-090","severity":"HIGH","source":["health"],"match":{"type":"regex","field":"msg","pcre":"monitor degraded:"}}

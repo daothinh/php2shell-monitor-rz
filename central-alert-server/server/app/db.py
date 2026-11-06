@@ -75,8 +75,26 @@ CREATE TABLE IF NOT EXISTS alerts (
     messages INTEGER NOT NULL DEFAULT 0,   -- Telegram messages sent
     delivered INTEGER NOT NULL DEFAULT 0,  -- 1 = every message accepted
     received_at TEXT NOT NULL,
+    -- Envelope của thiết bị tại thời điểm alert: cần để dựng lại/gửi lại tin
+    -- (resend) mà không phải đoán từ đường dẫn evidence.
+    lan_ip TEXT, hostname TEXT, user TEXT, os TEXT, env TEXT,
     UNIQUE(device_id, batch_id)            -- agent retries must not duplicate
 );
+
+-- reported_events: event ĐÃ gửi Telegram, để batch sau không báo lại.
+-- Khoá là sha256(source|file|line|raw) chứ không phải (batch, id) vì chính
+-- nội dung sự kiện mới là thứ người trực ca không muốn đọc hai lần.
+CREATE TABLE IF NOT EXISTS reported_events (
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    ident     TEXT NOT NULL,
+    alert_id  INTEGER NOT NULL DEFAULT 0,
+    source    TEXT,
+    file      TEXT,
+    line      INTEGER NOT NULL DEFAULT 0,
+    sent_at   TEXT NOT NULL,
+    PRIMARY KEY (device_id, ident)
+);
+CREATE INDEX IF NOT EXISTS idx_reported_sent ON reported_events(sent_at);
 
 CREATE TABLE IF NOT EXISTS alert_hits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,6 +195,17 @@ def init_db(path: str) -> None:
             else:
                 conn.execute("DROP TABLE alerts_log")
         conn.executescript(SCHEMA)
+        # Envelope trên bảng alerts: thêm cột cho DB tạo trước bản vá.
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(alerts)")}
+        for col in ("lan_ip", "hostname", "user", "os", "env"):
+            if col not in have:
+                conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} TEXT")
+        # containers: JSON array tên container gây alert. Thiếu cột này thì alert
+        # đã lưu (và mọi tin gửi bù / gửi lại) MẤT dòng 🐳 Container — đường
+        # ingest gửi trực tiếp thì còn, nên lỗi chỉ hiện ở đúng những alert quan
+        # trọng nhất: alert bị hoãn rồi gửi bù khi evidence lên tới server.
+        if "containers" not in have:
+            conn.execute("ALTER TABLE alerts ADD COLUMN containers TEXT")
         # Migrate (một lần, idempotent): key duy nhất cũ trên projects ->
         # thành 1 row trong api_keys; từ đó mỗi lần pair cấp thêm key mới.
         conn.execute(
@@ -208,23 +237,57 @@ def norm_chat_id(s: str) -> str:
 
 # ---------------------------------------------------------------- projects
 
-def create_project(db_path: str, name: str, telegram_chat_id: Optional[str] = None) -> int:
-    """Project pending; telegram_chat_id khi có là CHAT ĐÍCH script yêu cầu ghép
-    (luồng chat-id pairing). Trạng thái pending cho tới khi chat đó /confirm.
+def create_project(db_path: str, name: str, telegram_chat_id: Optional[str] = None,
+                   device_label: str = "") -> int:
+    """Project pending; telegram_chat_id khi có là CHAT ĐÍCH script yêu cầu ghép.
 
-    Idempotent theo (tên, chat): pair lại cùng tên về cùng một chat TÁI DỤNG
-    row cũ bất kể trạng thái (pending/linked/disabled) — không bao giờ tạo row
-    trùng tên khiến /list hiện một dự án hai lần."""
+    Ba trường hợp, phân biệt bằng DEVICE:
+
+    1. Đúng cặp (tên, chat) đã có            -> tái dùng row (re-pair idempotent).
+    2. Cùng tên + CÙNG device, khác chat     -> CHUYỂN row sang chat mới, giữ
+       nguyên project_id nên toàn bộ lịch sử alert đi theo. Đây là "đổi nơi
+       nhận alert" (group <-> chat riêng) của cùng một máy.
+    3. Cùng tên + device KHÁC (hoặc không rõ) -> tạo row riêng.
+
+    Vì sao trường hợp 3 không gộp: hai khách hàng khác nhau hoàn toàn có thể
+    cùng đặt tên dự án "web" và cùng có hostname "web01". Gộp chúng lại sẽ đẩy
+    alert của khách này sang chat của khách kia — sự cố bảo mật, không phải bất
+    tiện. Không có bằng chứng "cùng một máy" thì không gộp.
+
+    Trước đây chỉ có trường hợp 1 và 3, nên đổi chat sinh row thứ hai cùng tên:
+    /list hiện dự án hai lần, lịch sử tách đôi.
+    """
     with _WRITE_LOCK, connect(db_path) as conn:
         if telegram_chat_id is not None:
+            chat = str(telegram_chat_id)
+            # 1. đúng cặp (tên, chat) đã có -> tái dùng
             row = conn.execute(
                 "SELECT id FROM projects"
                 " WHERE project_name = ? AND telegram_chat_id = ?"
                 " ORDER BY id LIMIT 1",
-                (name, str(telegram_chat_id)),
+                (name, chat),
             ).fetchone()
             if row is not None:
                 return int(row["id"])
+            # 2. cùng tên + CÙNG device, chat khác -> chuyển row sang chat mới.
+            dev = slug(device_label) if (device_label or "").strip() else ""
+            if dev:
+                row = conn.execute(
+                    "SELECT p.id FROM projects p"
+                    "  JOIN devices d ON d.project_id = p.id"
+                    " WHERE p.project_name = ? AND d.device_name = ?"
+                    " ORDER BY (p.status = 'linked') DESC, p.id LIMIT 1",
+                    (name, dev),
+                ).fetchone()
+                if row is not None:
+                    conn.execute(
+                        "UPDATE projects SET telegram_chat_id = ? WHERE id = ?",
+                        (chat, int(row["id"])),
+                    )
+                    log.info("chuyển dự án %s (thiết bị %s) sang chat %s — giữ"
+                             " nguyên lịch sử alert của row %s",
+                             name, dev, chat, row["id"])
+                    return int(row["id"])
         cur = conn.execute(
             "INSERT INTO projects (project_name, status, created_at, telegram_chat_id)"
             " VALUES (?, 'pending', ?, ?)",
@@ -504,8 +567,9 @@ def store_alert(
         cur = conn.execute(
             "INSERT OR IGNORE INTO alerts (project_id, device_id, batch_id, severity,"
             " hit_count, rules, window_start, window_end, evidence_file,"
-            " evidence_truncated, messages, delivered, received_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " evidence_truncated, messages, delivered, received_at,"
+            " lan_ip, hostname, user, os, env, containers)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 project_id,
                 device_id,
@@ -520,6 +584,13 @@ def store_alert(
                 int(messages),
                 1 if delivered else 0,
                 iso(),
+                alert.get("lan_ip") or None,
+                alert.get("hostname") or alert.get("host") or None,
+                alert.get("user") or None,
+                alert.get("os") or None,
+                alert.get("env") or None,
+                json.dumps(alert.get("containers") or [], ensure_ascii=False)
+                if alert.get("containers") else None,
             ),
         )
         if cur.rowcount == 0:
@@ -641,6 +712,226 @@ def stats(db_path: str, project_id: Optional[int] = None) -> list:
         return conn.execute(sql, args).fetchall()
 
 
+def chat_id_of_project(db_path: str, project_id: int) -> str:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT telegram_chat_id FROM projects WHERE id = ?",
+                           (int(project_id),)).fetchone()
+    return str(row["telegram_chat_id"] or "") if row else ""
+
+
+def alert_hits_rows(db_path: str, alert_id: int) -> list:
+    """Các hit đã lưu của alert, dạng dict (nguồn raw dự phòng khi mất file)."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT rule_id, severity, source, file, line, ip, method, uri,"
+            " status, ua, pid, raw, ts_utc FROM alert_hits"
+            " WHERE alert_id = ? AND raw IS NOT NULL AND raw <> '' ORDER BY id",
+            (int(alert_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def alerts_awaiting_raw(db_path: str, limit: int = 200,
+                        max_age_sec: int = 3600) -> list:
+    """Alert đã lưu nhưng CHƯA gửi Telegram (messages=0) vì thiếu raw event.
+
+    Đây là hàng đợi gửi bù: /ingest-evidence và vòng cleanup gọi lại, dựng
+    preview[] từ evidence mirror rồi gửi đúng một tin.
+
+    GIỚI HẠN TUỔI (max_age_sec, mặc định 1 giờ) là bắt buộc, không phải tối ưu:
+    một alert tồn đọng từ lâu — hàng đợi của bản cũ, DB phục hồi từ backup, hay
+    alert mà agent không bao giờ upload evidence — nếu không có trần thời gian
+    thì khi server được update, hàng đợi sẽ bắn lại toàn bộ sự kiện CŨ vào chat
+    của khách. Người trực ca nhận một loạt cảnh báo của tuần trước và mất niềm
+    tin vào kênh. Quá hạn thì alert vẫn nằm trong DB để tra cứu, nhưng KHÔNG
+    gửi: nghiệp vụ là cảnh báo sự kiện đang diễn ra, không phải phát lại lịch sử.
+    """
+    cut = iso(utcnow() - timedelta(seconds=int(max_age_sec)))
+    with connect(db_path) as conn:
+        return conn.execute(
+            "SELECT a.*, p.project_name, p.telegram_chat_id, d.device_name"
+            "  FROM alerts a"
+            "  JOIN projects p ON p.id = a.project_id"
+            "  JOIN devices d ON d.id = a.device_id"
+            " WHERE a.messages = 0 AND p.status = 'linked'"
+            "   AND p.telegram_chat_id IS NOT NULL AND p.telegram_chat_id <> ''"
+            "   AND a.received_at >= ?"
+            " ORDER BY a.id LIMIT ?",
+            (cut, int(limit)),
+        ).fetchall()
+
+
+def expire_stale_unsent(db_path: str, max_age_sec: int = 3600) -> int:
+    """Đánh dấu alert tồn đọng quá hạn là "đã xử lý" để không bao giờ gửi lại.
+
+    Đặt messages=2 (không phải 1) để phân biệt rõ trong DB:
+      messages=0 -> đang chờ gửi bù (còn trong cửa sổ)
+      messages=1 -> đã gửi (delivered cho biết Telegram có nhận không)
+      messages=2 -> hết hạn, cố ý KHÔNG gửi (alert cũ / agent không upload)
+    """
+    cut = iso(utcnow() - timedelta(seconds=int(max_age_sec)))
+    with _WRITE_LOCK, connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE alerts SET messages = 2 WHERE messages = 0 AND received_at < ?",
+            (cut,),
+        )
+        return int(cur.rowcount or 0)
+
+
+def mark_alert_sent(db_path: str, alert_id: int, delivered: bool,
+                    evidence_file: str = "") -> None:
+    """Ghi nhận đã gửi (hoặc gửi lỗi) cho alert đang chờ."""
+    with _WRITE_LOCK, connect(db_path) as conn:
+        conn.execute(
+            "UPDATE alerts SET messages = 1, delivered = ?,"
+            " evidence_file = COALESCE(NULLIF(?, ''), evidence_file)"
+            " WHERE id = ?",
+            (1 if delivered else 0, evidence_file or "", int(alert_id)),
+        )
+
+
+# ---------------------------------------------------- dedup event đã báo
+
+def reported_idents(db_path: str, device_id: int, idents: list,
+                    window_sec: int) -> set:
+    """Các ident trong `idents` đã được báo cho thiết bị này trong cửa sổ."""
+    if not idents:
+        return set()
+    cut = iso(utcnow() - timedelta(seconds=int(window_sec)))
+    out: set = set()
+    with connect(db_path) as conn:
+        # chia lô: SQLite giới hạn số tham số (999 mặc định)
+        for i in range(0, len(idents), 400):
+            part = idents[i:i + 400]
+            ph = ",".join("?" * len(part))
+            rows = conn.execute(
+                f"SELECT ident FROM reported_events WHERE device_id = ?"
+                f" AND sent_at >= ? AND ident IN ({ph})",
+                [int(device_id), cut] + list(part),
+            ).fetchall()
+            out.update(r["ident"] for r in rows)
+    return out
+
+
+def record_reported_events(db_path: str, rows: list) -> int:
+    """Ghi (device_id, ident, alert_id, source, file, line) vào reported_events."""
+    if not rows:
+        return 0
+    now = iso()
+    with _WRITE_LOCK, connect(db_path) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO reported_events"
+            " (device_id, ident, alert_id, source, file, line, sent_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            [(int(d), str(i), int(a), s, f, int(ln), now)
+             for (d, i, a, s, f, ln) in rows],
+        )
+    return len(rows)
+
+
+def prune_reported_events(db_path: str, window_sec: int) -> int:
+    """Xoá ident quá cửa sổ — bảng phải có trần, không phình mãi."""
+    cut = iso(utcnow() - timedelta(seconds=int(window_sec)))
+    with _WRITE_LOCK, connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM reported_events WHERE sent_at < ?", (cut,))
+        return int(cur.rowcount or 0)
+
+
+def mark_alert_suppressed(db_path: str, alert_id: int) -> None:
+    """Đánh dấu alert đã lưu nhưng CỐ Ý không gửi vì mọi event đã báo trước.
+
+    Dùng messages=2 (cùng giá trị với "hết hạn gửi bù"), khác hẳn messages=0
+    ("đang chờ gửi bù"). Nếu để 0, cleanup loop sẽ nhặt lại và gửi đúng cái vừa
+    bị chặn — biến dedup thành vô nghĩa.
+    """
+    with _WRITE_LOCK, connect(db_path) as conn:
+        conn.execute("UPDATE alerts SET messages = 2 WHERE id = ?",
+                     (int(alert_id),))
+
+
+def hits_present(db_path: str, alert_id: int) -> int:
+    """Số row alert_hits có raw THẬT (không phải row rác rule_id=NULL)."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM alert_hits"
+            " WHERE alert_id = ? AND raw IS NOT NULL AND raw <> ''",
+            (int(alert_id),),
+        ).fetchone()
+    return int(row["n"] or 0)
+
+
+def alert_id_for_device_batch(db_path: str, device_id: int,
+                              batch_id: str) -> Optional[int]:
+    """id của alert đã lưu cho (device, batch) — đúng khoá UNIQUE của bảng.
+
+    Dùng để chặn gửi trùng TRƯỚC khi gọi Telegram: agent retry sau lỗi mạng
+    không được sinh tin thứ hai cho cùng một batch.
+    """
+    if not batch_id:
+        return None
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT id FROM alerts WHERE device_id = ? AND batch_id = ?",
+            (int(device_id), str(batch_id)),
+        ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def alert_by_batch(db_path: str, project_id: int, batch_id: str) -> Optional[sqlite3.Row]:
+    with connect(db_path) as conn:
+        return conn.execute(
+            "SELECT a.*, d.device_name FROM alerts a JOIN devices d ON d.id = a.device_id"
+            " WHERE a.project_id = ? AND a.batch_id = ?",
+            (int(project_id), str(batch_id)),
+        ).fetchone()
+
+
+def backfill_hits(db_path: str, alert_id: int, records, cap: int = 2000) -> int:
+    """Nạp alert_hits từ raw event cho một alert đang KHÔNG có hit thật.
+
+    Alert do monitor <= 1.4.2 gửi lên mang evidence[] rỗng (raw đi kênh riêng),
+    nên trước bản vá DB chỉ có một row rác và /search mù hoàn toàn. Hàm này đọc
+    lại file evidence đã mirror và dựng các row thật — idempotent: alert đã có
+    raw thì không làm gì.
+
+    Trả về số row đã thêm. `cap` chặn một batch 363k dòng làm nghẽn DB; phần
+    vượt cap vẫn nằm nguyên trong file evidence (nguồn sự thật).
+    """
+    rows = []
+    for h in records:
+        if not isinstance(h, dict):
+            continue
+        rows.append(tuple(
+            [int(alert_id)] + [
+                int(h.get(f) or 0) if f == "line" else (h.get(f) or None)
+                for f in _HIT_FIELDS
+            ]
+        ))
+        if len(rows) >= cap:
+            break
+    if not rows:
+        return 0
+    with _WRITE_LOCK, connect(db_path) as conn:
+        have = conn.execute(
+            "SELECT COUNT(*) AS n FROM alert_hits"
+            " WHERE alert_id = ? AND raw IS NOT NULL AND raw <> ''",
+            (int(alert_id),),
+        ).fetchone()["n"]
+        if have:
+            return 0
+        conn.execute("DELETE FROM alert_hits WHERE alert_id = ? AND raw IS NULL",
+                     (int(alert_id),))
+        conn.executemany(
+            "INSERT INTO alert_hits (alert_id, rule_id, severity, source, file, line,"
+            " ip, method, uri, status, ua, pid, raw, ts_utc)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        conn.execute("UPDATE alerts SET evidence_truncated = 1 WHERE id = ?"
+                     " AND hit_count > ?", (int(alert_id), len(rows)))
+    return len(rows)
+
+
 # ---------------------------------------------------------------- retention
 
 def cleanup(db_path: str, reveal_ttl_sec: int, retention_days: int = 0) -> None:
@@ -660,3 +951,8 @@ def cleanup(db_path: str, reveal_ttl_sec: int, retention_days: int = 0) -> None:
         if retention_days > 0:
             cut = iso(now - timedelta(days=retention_days))
             conn.execute("DELETE FROM alerts WHERE received_at < ?", (cut,))
+        # reported_events: dọn theo retention (window dedup ngắn hơn nhiều nên
+        # dùng chung trần là đủ rộng rãi, không cần tham số riêng).
+        keep = retention_days if retention_days > 0 else 7
+        conn.execute("DELETE FROM reported_events WHERE sent_at < ?",
+                     (iso(now - timedelta(days=keep)),))

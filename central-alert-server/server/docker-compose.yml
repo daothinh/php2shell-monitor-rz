@@ -1,7 +1,7 @@
 services:
   alert-server:
     build: .
-    image: p2s/central-alert-server:1.0.0
+    image: p2s/central-alert-server:1.3.0
     container_name: p2s-central-alert
     restart: unless-stopped
     env_file: .env

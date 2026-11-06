@@ -549,12 +549,13 @@ T "re-pair: key bị từ chối -> gọi register lại" '"project_name":"test-
 T "re-pair: conf được ghi lại với key mới" "API_KEY=" "$(cat "$w2/conf/central.conf")"
 rm -f "$stub/unlinked"
 
-# test mode: gửi 1 alert INFO qua đúng API key đã lưu
-out=$(env "${PAIR_ENV[@]}" bash "$w2/engine/central.sh" test 2>&1)
-T "test: delivered >= 1 trong phản hồi" "delivered" "$out"
-T "test: dùng API key từ conf"          "X-API-Key: p2sk-test-key-42" "$(cat "$stub/ingest_key")"
-T "test: message alert thử nêu device"  "test-device" "$(cat "$stub/ingest_body")"
-T "test: payload là alert thử INFO"     '"severity":"INFO"' "$(cat "$stub/ingest_body")"
+# Lệnh test đã bỏ khỏi nghiệp vụ: alert test đi qua đúng khung CENTRAL SECURITY
+# ALERT nên người trực ca không phân biệt được với sự cố thật. Minh chứng
+# Telegram sống là tin GHÉP NỐI THÀNH CÔNG. central.sh phải chết rõ ràng chứ
+# không được gọi server hay tạo alert giả.
+out=$(env "${PAIR_ENV[@]}" bash "$w2/engine/central.sh" test 2>&1 || true)
+N "test: lệnh test đã bỏ, không gửi alert" "delivered" "$out"
+T "test: chết với hướng dẫn đúng" "central.sh" "$out"
 
 # agent đẩy alert khi dự án vừa bị /unlink: 401 KHÔNG được coi là gửi xong —
 # alert phải vào spool kèm cảnh báo đúng nguyên nhân (trước đây curl coi 401
@@ -815,46 +816,71 @@ else
   pass "locale: prune dưới C giữ nguyên code (thiếu src, bỏ qua)"
 fi
 
-# ------------------------------------- webshell phải báo LẠI mỗi batch
-# Lỗi thật: webroot_manifest.sh dedup trên path+size+mtime và ghi vĩnh viễn vào
-# webroot.seen.tsv. Webshell đã drop thì không ai sửa nữa -> file đứng yên ->
-# chỉ báo đúng MỘT lần rồi câm mãi. Batch sau mất impact=rce nên alert tụt
-# CRITICAL -> MODERATE, Telegram chỉ còn "Server đang bị khai thác php2shell"
-# trong khi server đã bị chiếm quyền. Đây là test cho HÀNH VI ĐÓ.
+# ------------------------------- webshell: báo MỘT lần, không spam mỗi batch
+# Nghiệp vụ: "Alert chỉ phục vụ cảnh báo, không phục vụ báo cáo trạng thái."
+# Shell đứng yên trên đĩa không phải hành vi mới. Bản trước emit lại mỗi batch
+# và tạo ra 48 tin Telegram giống nhau cho đúng một shell (đo trên lab) — người
+# trực ca sẽ tắt thông báo, đúng lúc sự cố thật tiếp theo xảy ra thì không ai
+# đọc.
+#
+# Dedup theo (path, đoạn code khớp), KHÔNG theo path+size+mtime: đổi hàm, đổi
+# biến nhận vào vẫn là hành vi mới và phải báo lại. File bị xoá thì dòng rời
+# khỏi state (im lặng — KHÔNG gửi tin "đã hết"), nên drop lại sau này báo lại.
 if [[ -f $SRC/plugins/webroot_manifest.sh ]]; then
   ws=$(mktemp -d)
-  mkdir -p "$ws/html" "$ws/state" "$ws/tmp"
+  mkdir -p "$ws/conf" "$ws/html"
+  printf 'PROJECT="test-project"\nDEVICE="test-device"\n' >"$ws/conf/device.conf"
+  # p2s_device_init suy ra P2S_STATE_DIR từ PROJECT/DEVICE, nên test phải đọc
+  # đúng đường dẫn đó thay vì một $ws/state do mình tự đặt.
+  wst="$ws/projects/test-project/devices/test-device/state"
+  # P2S_CONTAINER_DIR trỏ vào thư mục không tồn tại: test này kiểm tra webroot
+  # TRÊN HOST. Máy chạy test có container thật (lab DVWA) thì plugin đọc thêm
+  # webroot của container qua /proc/<pid>/root -> đếm ra 2 shell và test sai âm
+  # thầm. Test phải hermetic, không phụ thuộc máy đang chạy gì.
+  _wr() { P2S_CONTAINER_DIR=$ws/nodocker WORKDIR=$ws WEBROOTS=$ws/html \
+            bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null; }
+
   printf '<?php echo "P2S_WEBSHELL"; system($_REQUEST[0]); ?>\n' >"$ws/html/s.php"
-  # batch 1: baseline được chấp nhận, chưa báo gì
-  out1=$(WORKDIR=$ws P2S_STATE_DIR=$ws/state P2S_TMP_DIR=$ws/tmp \
-    WEBROOTS=$ws/html bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
-  # batch 2: file KHÔNG đổi (đúng thực tế: shell đã drop thì đứng yên)
-  out2=$(WORKDIR=$ws P2S_STATE_DIR=$ws/state P2S_TMP_DIR=$ws/tmp \
-    WEBROOTS=$ws/html bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
-  # batch 3: vẫn không đổi
-  out3=$(WORKDIR=$ws P2S_STATE_DIR=$ws/state P2S_TMP_DIR=$ws/tmp \
-    WEBROOTS=$ws/html bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
-  n2=$(printf '%s' "$out2" | grep -c . )
-  n3=$(printf '%s' "$out3" | grep -c . )
-  T "webshell: batch 2 vẫn báo lại" "1" "$n2"
-  T "webshell: batch 3 vẫn báo lại" "1" "$n3"
-  T "webshell: báo lại đúng path" "1" "$(printf '%s' "$out3" | grep -c 'html/s.php')"
-  T "webshell: nội dung shell nằm trong msg" "1" "$(printf '%s' "$out3" | grep -c 'system')"
-  # shell bị xoá -> không còn báo
+  # Lượt đầu: vừa nhận baseline vừa phải thấy shell có sẵn. Trước đây plugin
+  # `exit 0` ngay sau khi ghi baseline nên shell nằm sẵn trên đĩa chỉ được báo
+  # ở batch THỨ HAI — trễ 5 phút so với lúc đáng lẽ phải biết.
+  out1=$(_wr)
+  out2=$(_wr)
+  out3=$(_wr)
+  T "webshell: lượt đầu thấy shell có sẵn"       "1" "$(printf '%s' "$out1" | grep -c 'webshell pattern')"
+  T "webshell: batch 2 KHÔNG báo lại"            "0" "$(printf '%s' "$out2" | grep -c 'webshell pattern')"
+  T "webshell: batch 3 KHÔNG báo lại"            "0" "$(printf '%s' "$out3" | grep -c 'webshell pattern')"
+  T "webshell: state giữ đúng 1 dòng"            "1" "$(grep -c . "$wst/webroot.shells.tsv" 2>/dev/null || echo 0)"
+
+  # Nội dung đổi (dùng $_GET thay $_REQUEST) -> hành vi mới -> báo lại.
+  printf '<?php echo "P2S_WEBSHELL"; system($_GET["c"]); ?>\n' >"$ws/html/s.php"
+  out5=$(_wr)
+  T "webshell: nội dung đổi thì báo lại"         "1" "$(printf '%s' "$out5" | grep -c 'webshell pattern')"
+  T "webshell: báo đúng code mới"                "1" "$(printf '%s' "$out5" | grep -c 'system(\$_GET')"
+  T "webshell: rồi im tiếp"                      "0" "$(_wr | grep -c 'webshell pattern')"
+
+  # File biến mất -> im lặng, KHÔNG gửi tin "đã hết" (alert không phải kênh
+  # báo cáo trạng thái).
   rm -f "$ws/html/s.php"
-  out4=$(WORKDIR=$ws P2S_STATE_DIR=$ws/state P2S_TMP_DIR=$ws/tmp \
-    WEBROOTS=$ws/html bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
-  T "webshell: file biến mất thì hết báo" "0" "$(printf '%s' "$out4" | grep -c 'webshell')"
-  # state không được chứa file dedup vĩnh viễn kiểu cũ
-  T "webshell: không còn webroot.seen.tsv" "0" "$(ls "$ws/state" 2>/dev/null | grep -c 'seen')"
+  out7=$(_wr)
+  T "webshell: xoá shell không sinh tin nào"     "0" "$(printf '%s' "$out7" | grep -ci 'webshell\|đã hết\|resolved\|cleared')"
+  T "webshell: state rỗng sau khi xoá"           "0" "$(grep -c . "$wst/webroot.shells.tsv" 2>/dev/null || echo 0)"
+
+  # Drop lại nguyên bản -> hành vi mới -> báo lại.
+  printf '<?php echo "P2S_WEBSHELL"; system($_GET["c"]); ?>\n' >"$ws/html/s.php"
+  T "webshell: drop lại sau khi xoá thì báo lại" "1" "$(_wr | grep -c 'webshell pattern')"
+
+  # Không được quay lại kiểu dedup vĩnh viễn theo path+size+mtime.
+  T "webshell: không còn webroot.seen.tsv"       "0" "$(ls "$wst" 2>/dev/null | grep -c 'seen')"
   rm -rf -- "$ws"
 else
-  pass "webshell: batch 2 vẫn báo lại (thiếu src, bỏ qua)"
-  pass "webshell: batch 3 vẫn báo lại (thiếu src, bỏ qua)"
-  pass "webshell: báo lại đúng path (thiếu src, bỏ qua)"
-  pass "webshell: nội dung shell nằm trong msg (thiếu src, bỏ qua)"
-  pass "webshell: file biến mất thì hết báo (thiếu src, bỏ qua)"
-  pass "webshell: không còn webroot.seen.tsv (thiếu src, bỏ qua)"
+  for _t in "lượt đầu thấy shell có sẵn" "batch 2 KHÔNG báo lại" \
+            "batch 3 KHÔNG báo lại" "state giữ đúng 1 dòng" \
+            "nội dung đổi thì báo lại" "báo đúng code mới" "rồi im tiếp" \
+            "xoá shell không sinh tin nào" "state rỗng sau khi xoá" \
+            "drop lại sau khi xoá thì báo lại" "không còn webroot.seen.tsv"; do
+    pass "webshell: $_t (thiếu src, bỏ qua)"
+  done
 fi
 
 # ------------------------------- rule phải khớp path session TUỲ BIẾN
@@ -1077,8 +1103,11 @@ T "container: access log phát ra nguồn access_log" "yes" \
   "$(printf '%s' "$acc9" | grep -q 'access_log' && echo yes || echo no)"
 T "container: GIỮ query string page=" "yes" \
   "$(printf '%s' "$acc9" | grep -q 'page=/var/lib/php/sessions' && echo yes || echo no)"
-T "container: file hiển thị container:<tên>:<cid12>" "yes" \
-  "$(printf '%s' "$acc9" | grep -q 'container:web-one:aaaabbbbcccc' && echo yes || echo no)"
+# `file` phải mang ĐƯỜNG DẪN TUYỆT ĐỐI bên trong container (không phải cid12):
+# alert hiển thị nó dưới nhãn "Path", nên một chuỗi định danh là vô dụng.
+T "container: file là container:<tên>:<đường dẫn tuyệt đối>" "yes" \
+  "$(printf '%s' "$acc9" | grep -q 'container:web-one:/var/log/nginx/access.log' && echo yes || echo no)"
+N "container: file không còn là cid12 trần" "container:web-one:aaaabbbbcccc" "$acc9"
 T "container: bóc được request_length 15MB" "yes" \
   "$(printf '%s' "$acc9" | grep -q '15000556' && echo yes || echo no)"
 
@@ -1093,11 +1122,14 @@ out9=$(env WORKDIR="$ws9" P2S_STATE_DIR="$ws9/state" P2S_TMP_DIR="$ws9/tmp" \
 out9b=$(env WORKDIR="$ws9" P2S_STATE_DIR="$ws9/state" P2S_TMP_DIR="$ws9/tmp" \
   P2S_CONTAINER_ROOTFS_MAP="$ws9/map.tsv" P2S_SRC_DIR="$SRC" \
   bash "$SRC/plugins/webroot_manifest.sh" 2>/dev/null)
+# Hành vi mới: shell báo MỘT lần (lượt đầu), không báo lại batch thứ hai.
 T "container: webshell trong webroot container bị phát hiện" "yes" \
-  "$(printf '%s' "$out9b" | grep -q "system(\$_REQUEST" && echo yes || echo no)"
+  "$(printf '%s' "$out9" | grep -q "system(\$_REQUEST" && echo yes || echo no)"
 T "container: tên hiển thị container:<tên>:/path" "yes" \
-  "$(printf '%s' "$out9b" | grep -q 'container:web-one:/var/www/html/s.php' && echo yes || echo no)"
-T "container: không báo trùng 2 lần" "1" \
+  "$(printf '%s' "$out9" | grep -q 'container:web-one:/var/www/html/s.php' && echo yes || echo no)"
+T "container: shell báo đúng 1 lần ở lượt đầu" "1" \
+  "$(printf '%s' "$out9" | grep -c 'webshell pattern')"
+T "container: không báo lại lượt thứ hai" "0" \
   "$(printf '%s' "$out9b" | grep -c 'webshell pattern')"
 
 # Khoá offset/manifest phải ỔN ĐỊNH qua restart container (pid đổi, cid không).
@@ -1152,6 +1184,215 @@ done
 T "offset: dòng đầu mỗi batch nguyên vẹn (không cắt giữa dòng)" "0" "$bad"
 
 rm -rf -- "$w" "$w2" "$w6" "$w9" "$ws9" "$cb" "$cb2"
+
+# 5. Tham số vận hành trong conf/default.conf phải THẬT SỰ có tác dụng với
+#    setup. Trước đây main.sh không source default.conf nên mọi giá trị đặt ở
+#    đó (P2S_RETRO_TIMEOUT, RETRO_SINCE...) bị bỏ qua âm thầm — người vận
+#    hành tưởng đã cấu hình được.
+lab5=$(newlab)
+cat >>"$lab5/conf/default.conf" <<'CONF'
+P2S_RETRO_TIMEOUT=42
+RETRO_SINCE="2026-10-01T00:00:00Z"
+CONF
+vals=$(WORKDIR=$lab5 bash -c '
+source "'"$lab5"'/lib/common.sh"; source "'"$lab5"'/lib/paths.sh"
+set -a; source "$P2S_CONF_DIR/default.conf"; set +a
+printf "%s|%s" "$P2S_RETRO_TIMEOUT" "$RETRO_SINCE"')
+T "conf: P2S_RETRO_TIMEOUT có tác dụng" "42" "$vals"
+T "conf: RETRO_SINCE có tác dụng" "2026-10-01T00:00:00Z" "$vals"
+
+# 6. Version phải đọc được từ file VERSION trong payload — tin ghép nối hiển
+#    thị nó, nên agent phải khai đúng bản đang chạy lên server.
+printf '1.4.6\n' >"$lab5/VERSION"
+ver=$(WORKDIR=$lab5 bash -c 'source "'"$lab5"'/lib/common.sh"; printf %s "$P2S_VERSION"')
+T "version: đọc từ file VERSION" "1.4.6" "$ver"
+N "version: không phải 'dev' khi có file VERSION" "dev" "$ver"
+
+# 7. env phải THẮNG conf/default.conf. Trước đây các script source thẳng conf
+#    nên `NGINX_ACCESS=/tmp/x.log bash retro_hunt.sh` bị conf ghi đè thành rỗng:
+#    người chạy thấy "no hits" và tưởng tool hỏng, trong khi nó không hề đọc file
+#    mình chỉ định.
+vals=$(NGINX_ACCESS=/tmp/from-env WORKDIR=$lab5 bash -c '
+source "'"$lab5"'/lib/common.sh"
+p2s_source_conf "'"$lab5"'/conf/default.conf"
+printf %s "$NGINX_ACCESS"')
+T "env: biến môi trường không bị conf ghi đè" "/tmp/from-env" "$vals"
+
+vals=$(WORKDIR=$lab5 bash -c '
+source "'"$lab5"'/lib/common.sh"; p2s_source_conf "'"$lab5"'/conf/default.conf"; printf %s "$BATCH_INTERVAL"')
+T "env: không có env thì conf vẫn có tác dụng" "300" "$vals"
+
+# 8. Quét bù chạy NỀN (engine/catchup.sh). Cài đặt không được bắt operator
+#    chờ: trước đây main.sh chạy retro-hunt đồng bộ rồi chờ thêm tối đa 90s cho
+#    lượt quét đầu, nên trên máy có log lớn lệnh cài treo hàng phút và cuối
+#    cùng vẫn chỉ in "chưa xong trong 90s".
+lab8=$(newlab)
+cp -a "$SRC/discovery" "$lab8/" 2>/dev/null || true
+printf 'RETRO_SINCE=""\nP2S_RETRO_TIMEOUT=60\n' >>"$lab8/conf/default.conf"
+out=$(WORKDIR=$lab8 bash "$lab8/engine/catchup.sh" 2>&1)
+st8=$(cat "$lab8/projects/test-project/devices/test-device/run/catchup.status" 2>/dev/null)
+T "catchup: ghi trạng thái complete" "complete" "$st8"
+T "catchup: nêu kết quả retro"       "retro=no-hits" "$st8"
+T "catchup: nêu kết quả quét đầu"    "scan=ok" "$st8"
+# 2 dòng: retro-hunt cũng ghi một dòng "no-hits" (nó là một lượt quét riêng),
+# rồi lượt quét đầu ghi dòng thứ hai.
+T "catchup: tạo batch đầu tiên"      "2" "$(wc -l <"$lab8/projects/test-project/devices/test-device/run/batches.log" 2>/dev/null)"
+
+# 9. catchup giữ scan.lock và truyền fd 9 xuống: retro_hunt.sh + scan.sh phải
+#    nhận ra khoá đã có, KHÔNG được tự flock lại (flock tính theo
+#    open-file-description, nên lần thứ hai sẽ thất bại vì chính khoá của cha
+#    và lượt quét bù tự chặn nó).
+lab9=$(newlab)
+cp -a "$SRC/discovery" "$lab9/" 2>/dev/null || true
+mkdir -p "$lab9/projects/test-project/devices/test-device/run"
+out=$(L=$lab9 WORKDIR=$lab9 bash -c '
+  exec 9>"$L/projects/test-project/devices/test-device/run/scan.lock"
+  flock -w 5 9 || exit 9
+  bash "$L/engine/catchup.sh"
+' 2>&1)
+st9=$(cat "$lab9/projects/test-project/devices/test-device/run/catchup.status" 2>/dev/null)
+T "catchup: thừa hưởng lock -> retro vẫn chạy" "retro=no-hits" "$st9"
+T "catchup: thừa hưởng lock -> quét đầu vẫn chạy" "scan=ok" "$st9"
+
+# 10. status.sh phải hiện trạng thái quét bù — đây là chỗ duy nhất operator biết
+#     lượt quét log cũ đã xong hay chưa, vì cài đặt không còn chờ.
+sout=$(WORKDIR=$lab8 bash "$lab8/engine/status.sh" 2>/dev/null)
+T "status: có mục catchup"            "== catchup" "$sout"
+T "status: hiện kết quả quét bù"      "không có dấu vết trong log cũ" "$sout"
+
+# 11. Cài đặt KHÔNG được chờ quét log: không in dòng tiến trình quét và không
+#     còn tham số chờ nào trong conf.
+m=$(WORKDIR=$SRC bash -c 'bash '"$SRC"'/main.sh help 2>&1')
+N "usage: không còn mời chờ quét log" "Lượt quét đầu tiên" "$m"
+N "conf: không còn P2S_FIRST_SCAN_WAIT" "P2S_FIRST_SCAN_WAIT" \
+  "$(cat "$SRC/conf/default.conf")"
+
+# ------------------------------------------ readcap: trần byte + trần thời gian
+# Hai lỗi thật đã làm monitor mù, và cả hai đều im lặng:
+#   * /var/log/syslog 269 MB, offset 0 -> một batch đọc hết, vượt
+#     PLUGIN_TIMEOUT, offset không được lưu, batch sau đọc lại từ đầu;
+#   * access.log của nginx:alpine là symlink /dev/stdout -> `tail` đọc chính
+#     file mà plugin đang ghi ra, không bao giờ tới EOF, rc=124 mỗi batch.
+rc_lab=$(mktemp -d)
+printf 'l1\nl2\nl3\n' >"$rc_lab/small.log"
+{ printf 'hdr\n'; for i in $(seq 1 4000); do printf 'row-%04d-padding-padding-padding\n' "$i"; done; } >"$rc_lab/big.log"
+sz=$(stat -c '%s' "$rc_lab/big.log")
+
+rc_run() { # <file> <pos> <cap> <timeout>
+  env WORKDIR="$rc_lab" P2S_SRC_DIR="$SRC" bash -c '
+    source "$P2S_SRC_DIR/lib/readcap.sh"
+    p2s_read_chunk "$1" "$2" "$(stat -c%s "$1")" "$3" "$4" "$TMPD/c"
+    printf "%s|%s|%s|%s\n" "$P2S_RD_BASE" "$P2S_TRIM_BYTES" "$P2S_RD_JUMPED" "$P2S_RD_TIMEOUT"
+  ' _ "$1" "$2" "$3" "$4"
+}
+
+TMPD=$rc_lab; export TMPD
+got=$(rc_run "$rc_lab/small.log" 0 100000 5)
+T "readcap: file nhỏ đọc trọn" "0|9|0|0" "$got"
+
+# Dưới ngưỡng nhảy (64 MB) thì đọc TUẦN TỰ theo chunk, không bỏ lịch sử.
+got=$(rc_run "$rc_lab/big.log" 0 2000 5)
+base=${got%%|*}
+T "readcap: dưới ngưỡng -> đọc từ byte 0 (không nhảy)" "0" "$base"
+# Chunk 2000 byte phải cắt đúng ranh giới dòng.
+b2=$(rc_run "$rc_lab/big.log" 2000 2000 5 | cut -d'|' -f1)
+T "readcap: chunk sau nối tiếp đúng vị trí" "2000" "$b2"
+
+# Trên ngưỡng nhảy: file nhỏ hơn ngưỡng nên vẫn đọc từ 0.
+jump=$(env P2S_READ_JUMP_BYTES=1000 WORKDIR="$rc_lab" P2S_SRC_DIR="$SRC" bash -c '
+  source "$P2S_SRC_DIR/lib/readcap.sh"
+  p2s_read_chunk "$1" 0 "$(stat -c%s "$1")" 2000 5 "$TMPD/j"
+  printf "%s|%s" "$P2S_RD_JUMPED" "$((P2S_RD_BASE % 1))"' _ "$rc_lab/big.log" 2>/dev/null)
+T "readcap: vượt ngưỡng -> nhảy tới EOF-cap" "1|" "$jump"
+jbase=$(env P2S_READ_JUMP_BYTES=1000 WORKDIR="$rc_lab" P2S_SRC_DIR="$SRC" bash -c '
+  source "$P2S_SRC_DIR/lib/readcap.sh"
+  p2s_read_chunk "$1" 0 "$(stat -c%s "$1")" 2000 5 "$TMPD/j"
+  printf "%s" "$P2S_RD_BASE"' _ "$rc_lab/big.log" 2>/dev/null)
+T "readcap: base sau khi nhảy nằm trong file" "1" "$(( jbase > 0 && jbase < sz ? 1 : 0 ))"
+# base sau khi nhảy phải là ĐẦU một dòng: byte ngay trước là newline.
+prev=$(dd if="$rc_lab/big.log" bs=1 skip=$((jbase - 1)) count=1 2>/dev/null | od -An -c | tr -d ' ')
+T "readcap: base sau khi nhảy là đầu dòng" "\\n" "$prev"
+
+# Trần thời gian: nguồn không bao giờ EOF (fifo) phải bị cắt, không treo.
+mkfifo "$rc_lab/fifo"
+( sleep 30 >"$rc_lab/fifo" & ) 2>/dev/null
+t0=$(date +%s)
+tmo=$(env WORKDIR="$rc_lab" P2S_SRC_DIR="$SRC" bash -c '
+  source "$P2S_SRC_DIR/lib/readcap.sh"
+  p2s_read_chunk "$1" 0 1000000 1000 2 "$TMPD/f"
+  printf "%s" "$P2S_RD_TIMEOUT"' _ "$rc_lab/fifo" 2>/dev/null)
+el=$(( $(date +%s) - t0 ))
+pkill -f "sleep 30" 2>/dev/null || true
+T "readcap: chạm trần thời gian -> đánh dấu timeout" "1" "$tmo"
+T "readcap: trần thời gian có tác dụng (<10s)" "1" "$(( el < 10 ? 1 : 0 ))"
+
+# Phân loại đích symlink TRƯỚC khi đọc: đây là gốc của lỗi treo 120s.
+ln -sf /dev/stdout "$rc_lab/out.log"
+T "readcap: symlink /dev/stdout bị nhận diện" "stdout" \
+  "$(env WORKDIR="$rc_lab" P2S_SRC_DIR="$SRC" bash -c 'source "$P2S_SRC_DIR/lib/readcap.sh"; p2s_file_kind "$1"' _ "$rc_lab/out.log")"
+T "readcap: file thường -> regular" "regular" \
+  "$(env WORKDIR="$rc_lab" P2S_SRC_DIR="$SRC" bash -c 'source "$P2S_SRC_DIR/lib/readcap.sh"; p2s_file_kind "$1"' _ "$rc_lab/small.log")"
+
+# Plugin đọc file phải TỪ CHỐI symlink->/dev/stdout thay vì treo.
+sk_lab=$(newlab)
+mkdir -p "$sk_lab/fakeroot/var/log/nginx"
+ln -sf /dev/stdout "$sk_lab/fakeroot/var/log/nginx/access.log"
+printf 'aaaabbbbcccc\tstdout-ct\t%s/fakeroot\n' "$sk_lab" >"$sk_lab/map.tsv"
+t0=$(date +%s)
+env WORKDIR="$sk_lab" P2S_SRC_DIR="$SRC" P2S_CONTAINER_ROOTFS_MAP="$sk_lab/map.tsv" \
+  bash "$SRC/plugins/container_accesslog.sh" >/dev/null 2>&1
+el=$(( $(date +%s) - t0 ))
+T "container_accesslog: symlink /dev/stdout không treo (<10s)" "1" "$(( el < 10 ? 1 : 0 ))"
+
+rm -rf -- "$rc_lab" "$sk_lab"
+
+# ------------------------------------------------- health: monitor tự mù phải báo
+h_lab=$(newlab)
+for _k in 1 2 3; do
+  env WORKDIR="$h_lab" P2S_SRC_DIR="$SRC" P2S_HEALTH_STRIKES=3 bash -c \
+    'source "$P2S_SRC_DIR/lib/paths.sh"; source "$P2S_SRC_DIR/lib/health.sh";
+     p2s_device_init; p2s_health_note "plugin/x" degraded "bi cat"' 2>/dev/null
+done
+hst=$(awk -F'\t' '$1 == "plugin/x" { print $2 }' \
+  "$h_lab"/projects/*/devices/*/state/health.tsv 2>/dev/null)
+T "health: đếm đủ số lần liên tiếp" "3" "$hst"
+# health.events: "<utc> TAB <key> TAB <detail> TAB <strikes>" — mỗi sự kiện một dòng.
+T "health: tới ngưỡng thì sinh sự kiện" "1" \
+  "$(awk -F'\t' '$2 == "plugin/x"' "$h_lab"/projects/*/devices/*/state/health.events 2>/dev/null | wc -l | tr -d ' ')"
+# Sự kiện chỉ sinh MỘT lần cho mỗi chuỗi lỗi, không phải mỗi batch.
+for _k in 4 5 6; do
+  env WORKDIR="$h_lab" P2S_SRC_DIR="$SRC" P2S_HEALTH_STRIKES=3 bash -c \
+    'source "$P2S_SRC_DIR/lib/paths.sh"; source "$P2S_SRC_DIR/lib/health.sh";
+     p2s_device_init; p2s_health_note "plugin/x" degraded "bi cat"' 2>/dev/null
+done
+T "health: không lặp sự kiện mỗi batch" "1" \
+  "$(awk -F'\t' '$2 == "plugin/x"' "$h_lab"/projects/*/devices/*/state/health.events 2>/dev/null | wc -l | tr -d ' ')"
+# Hồi phục -> xoá bộ đếm, im lặng (không gửi tin "đã hết").
+env WORKDIR="$h_lab" P2S_SRC_DIR="$SRC" bash -c \
+  'source "$P2S_SRC_DIR/lib/paths.sh"; source "$P2S_SRC_DIR/lib/health.sh";
+   p2s_device_init; p2s_health_note "plugin/x" ok' 2>/dev/null
+# Sàn HIGH: "monitor đang mù" không được chìm vào INFO.
+# Record 14 field đúng contract stream: ts source file line ip method uri status
+# ua pid msg rule severity impact. Dùng printf với \t trong FORMAT (không phải
+# trong đối số) để ra TAB thật.
+hsev=$(awk 'BEGIN {
+    OFS = "\t"
+    print "2026-11-05T07:43:31Z", "health", "", 0, "", "", "", "", "", "", \
+          "monitor degraded: plugin/x - timeout", "P2S-090", "HIGH", ""
+  }' >"$h_lab/src.tsv"
+  awk -f "$SRC/lib/evidence.awk" -v outcounts="$h_lab/src.counts" \
+    "$h_lab/src.tsv" >/dev/null 2>&1
+  head -1 "$h_lab/src.counts" | cut -f2)
+T "health: alert sức khoẻ tối thiểu HIGH" "HIGH" "$hsev"
+
+# health.events đã được đẩy thành record stream -> rule P2S-090 bắt được.
+hstream=$(env WORKDIR="$h_lab" P2S_SRC_DIR="$SRC" bash -c \
+  'source "$P2S_SRC_DIR/lib/paths.sh"; source "$P2S_SRC_DIR/lib/stream.sh";
+   source "$P2S_SRC_DIR/lib/health.sh"; p2s_device_init; p2s_health_sweep' 2>/dev/null)
+T "health: sự kiện thành record stream" "monitor degraded: plugin/x" "$hstream"
+rm -rf -- "$h_lab"
+
+rm -rf -- "$lab5" "$lab8" "$lab9"
 
 echo ""
 echo "passed: $PASS  failed: $FAIL"

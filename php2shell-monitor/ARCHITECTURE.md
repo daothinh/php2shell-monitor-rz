@@ -18,6 +18,12 @@
    luôn nằm trong `evidence/<batch>.jsonl`.
 4. **Không có nguồn nào là bắt buộc**: plugin thiếu nguồn thì im lặng, rule thiếu
    capability thì tắt (ghi lý do vào status).
+5. **Alert = cảnh báo HÀNH VI, không phải báo cáo trạng thái.** Một điều kiện
+   đứng yên trên hệ thống (webshell đã nằm trên đĩa, file cấu hình đã bị sửa)
+   không phải hành vi mới — nó không sinh thêm tin mỗi batch. Ngược lại, khi
+   điều kiện đó biến mất cũng KHÔNG gửi tin "đã hết": dọn dẹp không phải sự cố.
+   Hệ quả là một sự cố = một tin, và người trực ca không tắt thông báo.
+   Xem `plugins/webroot_manifest.sh` (dedup theo path + đoạn code khớp).
 
 ## 2. Luồng một batch
 
@@ -149,7 +155,7 @@ Mỗi plugin: `source` → record. Không plugin nào được làm hỏng batch
 
 ## 8. CLI
 
-`once | run | status | stop | discover | retro | export | clean`
+`run | status | stop | discover | retro | export | clean`
 (xem `docs/OPERATIONS.md`).
 
 ## 8b. Cài đặt & vị trí
@@ -164,6 +170,107 @@ Mỗi plugin: `source` → record. Không plugin nào được làm hỏng batch
   `exec bash main.sh "$@"`.
 - Không cron, không systemd, không user, không `/etc`, không `/var`,
   không `/usr/local/bin`. Gỡ bằng `-- clean` (`rm -rf` chính `$WORKDIR`).
+
+## 8c. Quét bù lúc cài (`engine/catchup.sh`)
+
+Cài đặt phải trả kết quả ngay: ghép nối server, cấp API key, gửi tin Telegram.
+Quét log cũ trên máy thật có thể mất vài phút (hàng trăm MB, kể cả `.gz`), nên
+phần quét **không** nằm trên đường đồng bộ của installer.
+
+```
+main.sh (setup)
+  ├── pair                       # đồng bộ, bắt buộc xong mới báo thành công
+  ├── exec 9>scan.lock; flock    # khoá NGAY, trước khi supervisor tồn tại
+  ├── setsid catchup.sh &        # thừa hưởng fd 9 → giữ khoá suốt vòng đời
+  ├── supervisor.sh start
+  └── in "GHÉP NỐI THÀNH CÔNG"   # trả về sau ~7s
+```
+
+`catchup.sh` lần lượt:
+
+1. `discovery/retro_hunt.sh` — log đã rotate/gzip, sự cố **trước** khi cài.
+   Cửa sổ mặc định `00:00 UTC hôm nay` (= 07:00 VN); `RETRO_SINCE` để lùi xa.
+2. `engine/scan.sh` — lượt quét đầu tiên trên log hiện có (offset khởi đầu 0
+   nên đọc toàn bộ file đang có).
+
+Mỗi lượt có trần `P2S_RETRO_TIMEOUT` (600s). Trạng thái ghi vào
+`run/catchup.status` (`<utc> TAB <state> TAB <chi tiết>`), nhật ký ở
+`run/catchup.log`, và `status.sh` đọc đúng file đó — đây là chỗ duy nhất
+operator biết lượt quét bù đã xong hay chưa.
+
+**Vì sao phải giữ khoá xuyên tiến trình.** `flock` tính theo
+open-file-description, không theo inode: mở lại `scan.lock` rồi `flock -n` lần
+hai sẽ **thất bại vì chính khoá của cha**. `retro_hunt.sh` và `scan.sh` nhận
+`P2S_LOCK_HELD=1` + fd 9 còn mở thì bỏ qua bước lấy khoá; nếu không, lượt quét
+bù sẽ tự chặn nó và không batch nào chạy. Supervisor bật sau thấy lock bận nên
+bỏ batch đầu (`"scan already running; batch skipped"`), tick kế tiếp chạy sau
+`BATCH_INTERVAL` — nhờ vậy retro và batch 5 phút không bao giờ cùng xử lý một
+khoảng thời gian, tức không có alert thứ hai cho cùng sự kiện.
+
+## 8d. Trần đọc & sức khoẻ nguồn (1.4.12)
+
+Mọi plugin đọc file đều đi qua `lib/readcap.sh` chứ không `tail -c +N` trực tiếp:
+
+```
+p2s_read_chunk(file, pos, size, cap, tmo, chunk)
+  ├── p2s_file_kind    readlink TRƯỚC: symlink -> /dev/*|/proc/* = "stdout"
+  ├── p2s_read_new_bytes
+  │     ├── pos==0 && size>JDMP     -> start = size - cap   (nhảy, đánh dấu)
+  │     ├── timeout -k 2 <tmo> tail -c +N | head -c <cap>
+  │     └── nhảy giữa file          -> bỏ mảnh dòng đầu, dời base tới newline
+  └── p2s_trim_partial  bỏ dòng dở cuối (offset luôn dừng ở ranh giới dòng)
+```
+
+Ba lý do, mỗi lý do là một sự cố đã xảy ra:
+
+1. **`tail -c +1 file` đọc tới EOF.** `/var/log/syslog` 269 MB, offset 0 ⇒ một
+   batch đọc 269 MB, vượt `PLUGIN_TIMEOUT` trước khi kịp ghi offset ⇒ batch sau
+   đọc lại từ byte 0 ⇒ lặp vô hạn, `rc=124` mỗi batch, 0 dòng tới matcher.
+2. **Nguồn chặn không được giữ cả plugin.** `plugins.sh` chạy từng plugin với
+   một timeout; trần theo *nguồn* mới bảo đảm các nguồn xếp sau vẫn được đọc.
+3. **Symlink `/dev/stdout` phải bị loại trước khi mở.** nginx:alpine để
+   `/var/log/nginx/access.log -> /dev/stdout`; đọc qua `/proc/<pid>/root`, đích
+   tuyệt đối được giải theo namespace của host ⇒ `/proc/<pid-plugin>/fd/1`, và
+   `plugins.sh` redirect stdout vào file ⇒ `-f` đúng, `tail` đọc chính file đang
+   được ghi ⇒ không bao giờ EOF. Đo trên lab: 120 s/batch, 0 dòng, và container
+   ĐẦU TIÊN chặn luôn access log thật của các container sau.
+   Nội dung thật của stdout là `*-json.log` — `docker_logs` đã đọc nó.
+
+**Sức khoẻ (`lib/health.sh`)** — vì cả ba lỗi trên đều *im lặng*, "không có
+alert" không phân biệt được với "đang yên":
+
+```
+state/health.tsv     <khoá> <strikes> <since> <detail>      ("!" = đã báo)
+state/health.events  <utc> <khoá> <detail> <strikes>        (chưa đẩy lên)
+```
+
+`p2s_health_note` tăng strikes; tới `P2S_HEALTH_STRIKES` thì ghi sự kiện đúng
+MỘT lần cho mỗi chuỗi lỗi. `engine/scan.sh` gọi `p2s_health_sweep` để biến sự
+kiện thành record stream `source=health`, rule `P2S-090` bắt, và nó đi lên
+Telegram như mọi hit khác. Hồi phục ⇒ xoá bộ đếm, không gửi tin "đã hết".
+
+## 8e. Hợp đồng field `file` (bắt buộc: đường dẫn tuyệt đối)
+
+`file` trong stream record (và trong evidence JSONL, và trên tin Telegram dưới
+nhãn `Path`) phải là **đường dẫn tuyệt đối tới một file thật** — thứ người trực
+ca mở được để tra. Ba dạng được chấp nhận:
+
+| Dạng | Ví dụ | Ghi chú |
+|---|---|---|
+| file trên host | `/var/log/nginx/access.log` | |
+| procfs | `/proc/1234/cmdline` | đường dẫn thật, chỉ mất sau khi process chết |
+| trong container | `container:<tên>:/var/log/apache2/access.log` | phần sau dấu `:` cuối là đường dẫn tuyệt đối bên trong |
+| docker stdout | `docker:<tên>:<cid12>:/var/lib/docker/containers/<cid12>/<cid12>-json.log` | server rút gọn còn đường dẫn host khi hiển thị (dòng 🐳 đã nêu tên) |
+
+**Bị loại:** chuỗi mô tả như `journalctl -k`, `kernel`, `docker` — không có file
+nào để mở. Nguồn không có file thì để `file` **rỗng** và nêu `source`; server in
+`Nguồn: <source>` (nhãn khác "Path") thay vì đội lốt đường dẫn.
+
+Sự cố thật: `plugins/kernel.sh` từng gửi `"journalctl -k"` vào `file`, tin
+Telegram hiện `Path 1: journalctl -k`. Người nhận không biết mở gì, và không
+phân biệt được alert của máy nào khi một dự án có nhiều thiết bị. Giờ plugin dò
+`/var/log/journal/<machine-id>/system.journal` (rồi `/run/log/journal/...`) và
+xác nhận bằng `journalctl --file <f> -k -n 1` trước khi dùng.
 
 ## 9. Tích hợp central
 

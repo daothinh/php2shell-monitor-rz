@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import db
+from . import db, legacy
 from .config import Config
 from .security import AttemptGuard, gen_api_key, sha256_hex
 
@@ -96,6 +96,17 @@ def is_rce(alert: dict) -> bool:
     return bool(_alert_rule_ids(alert) & RCE_RULES)
 
 
+def has_raw(alert: dict) -> bool:
+    """Alert có raw event thật để hiển thị không.
+
+    BẤT BIẾN NGHIỆP VỤ: alert Telegram phải kèm raw (bằng chứng). Không có raw
+    thì KHÔNG gửi — một tin chỉ có "N events" mà không có dòng log nào khiến
+    sysadmin hiểu sai (không biết máy nào, file nào, request nào) và làm mất
+    niềm tin vào kênh cảnh báo. Nơi gọi phải hoãn, không được gửi.
+    """
+    return bool(_preview_groups(alert))
+
+
 def _sev(a: dict) -> str:
     s = str(a.get("severity") or "").upper()
     return s if s in _SEV_EMOJI else "INFO"
@@ -130,8 +141,18 @@ def _headline(alert: dict) -> str:
 TG_LIMIT = 4096
 
 # Mức tối thiểu của một dòng raw để còn đáng cắt mà hiện; dưới ngưỡng này thì
-# thà bỏ nhóm và báo "… +N nhóm" còn hơn hiện một mẩu vô nghĩa.
+# thà bỏ event và báo "… +N" còn hơn hiện một mẩu vô nghĩa.
 MIN_RAW_CHARS = 40
+
+# Trần hiển thị khối Event logs. Operator chốt: tối đa 5 path, tối đa 3 event
+# mỗi path; thêm trần tổng để một batch có 5 path vẫn không phình tin.
+PREVIEW_PATHS = 5
+PREVIEW_EVENTS_PER_PATH = 3
+PREVIEW_EVENTS_TOTAL = 15
+
+# Nhãn dòng cảnh báo. Trước đây là "Sự kiện"; operator đổi thành "Cảnh báo" vì
+# đây là tin cảnh báo an ninh, không phải bản kê sự kiện đã xảy ra.
+ALERT_LABEL = "Cảnh báo"
 
 _TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
 
@@ -145,12 +166,55 @@ def _esc(s: Any) -> str:
     return html.escape(str(s if s is not None else ""), quote=False)
 
 
+# ------------------------------------------------------------------ timeline
+# "Phần timeline được bôi đen và in đậm": Telegram HTML không có highlight, nên
+# biểu diễn bằng <b> đúng khoảng thời gian trong dòng log. Mọi định dạng timestamp
+# mà monitor đẩy lên đều phải khớp — access log CLF (có/không ngoặc), ISO của
+# journald/docker (có nano + offset), FPM, và syslog cổ điển.
+_TS_PATTERNS = (
+    # [05/Nov/2026:04:11:02 +0000]
+    re.compile(r"\[\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2}(?:\s+[+-]\d{4})?\]"),
+    # 05/Nov/2026:04:11:02 +0000   (nginx log_format không ngoặc)
+    re.compile(r"\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2}(?:\s+[+-]\d{4})?"),
+    # 2026-11-04T22:33:11.118859+07:00 / 2026-11-05T07:43:31Z
+    re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"),
+    # [05-Nov-2026 07:43:31 UTC]   (PHP-FPM)
+    re.compile(r"\[\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2}(?:\s+[A-Za-z]{2,5})?\]"),
+    # Nov  5 07:43:31   (syslog)
+    re.compile(r"\b[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\b"),
+)
+
+
+def _timeline_span(raw: str) -> Optional[tuple[int, int]]:
+    """Khoảng ký tự của mốc thời gian SỚM NHẤT trong dòng log (None nếu không có)."""
+    best: Optional[tuple[int, int]] = None
+    for pat in _TS_PATTERNS:
+        m = pat.search(raw)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), m.end())
+    return best
+
+
+def mark_timeline(raw: str) -> str:
+    """Escape raw và in đậm đúng phần mốc thời gian.
+
+    Escape phải làm SAU khi tách chuỗi (không phải trước): &lt; dài hơn < nên nếu
+    escape trước rồi mới cắt theo offset thì mốc thời gian bị lệch và có thể cắt
+    vào giữa một entity.
+    """
+    span = _timeline_span(raw)
+    if span is None:
+        return _esc(raw)
+    s, e = span
+    return f"{_esc(raw[:s])}<b>{_esc(raw[s:e])}</b>{_esc(raw[e:])}"
+
+
+# ------------------------------------------------------------------- events
 def _preview_groups(alert: dict) -> list[dict]:
     """Các nhóm event monitor đã gộp sẵn (alert["preview"]).
 
     Monitor gửi kèm tối đa ALERT_PREVIEW_MAX nhóm, đã de-dup và xếp nhóm
-    impact=rce lên đầu. Server chỉ render, không gộp lại: hai bên phải nhìn
-    cùng một tập để "… +N nhóm" khớp với những gì đã hiện.
+    impact=rce lên đầu. Server chỉ render, không gộp lại.
     """
     out = []
     for g in alert.get("preview") or []:
@@ -161,6 +225,7 @@ def _preview_groups(alert: dict) -> list[dict]:
             continue
         out.append({
             "raw": raw,
+            "source": str(g.get("source") or ""),
             "file": str(g.get("file") or ""),
             "line": int(g.get("line") or 0),
             "lines": int(g.get("lines") or 0),
@@ -171,89 +236,303 @@ def _preview_groups(alert: dict) -> list[dict]:
     return out
 
 
-def _path_line(idx: int, g: dict) -> str:
-    """Dòng đường dẫn file nguồn: nguyên văn, kèm số dòng + số dòng khác."""
-    path = g["file"] or "?"
-    if g["line"]:
-        path = f"{path}:{g['line']}"
-    extra = g["lines"] - 1
-    if extra > 0:
-        path += f" (+{extra})"
-    cnt = f"×{g['hits']} · " if g["hits"] > 1 else ""
-    return f"<b>{idx}.</b> {cnt}<code>{_esc(path)}</code>"
+def _event_identity(e: dict) -> tuple:
+    """Danh tính của MỘT event thật: nguồn + file + dòng + nội dung.
 
-
-def _raw_line(raw: str) -> str:
-    return f"   <code>{_esc(raw)}</code>"
-
-
-def _tail(more: int) -> str:
-    """Đuôi khối khi còn nhóm chưa hiện được — chỉ nêu số nhóm."""
-    return f"<i>… +{more} nhóm</i>" if more > 0 else ""
-
-
-def _fit_prefix(base: list[str], lines: list[str], path: str, tail: str,
-                raw: str, limit: int) -> Optional[str]:
-    """Tiền tố dài nhất của raw sao cho cả tin vẫn <= limit, đóng bằng '…'.
-
-    Binary search trên độ dài tiền tố: luôn hội tụ, và tính đúng chi phí escape
-    HTML (một raw chứa nhiều `&` sẽ dài ra sau khi escape).
+    Dùng để chặn "hit ảo": agent gửi lại cùng payload, hoặc cùng một dòng log
+    được đọc bởi hai plugin, sẽ có cùng danh tính và chỉ được đếm một lần. Hai
+    request giống nhau ở HAI dòng khác nhau vẫn là hai event (đúng bản chất).
     """
-    def fits(n: int) -> bool:
-        cut = raw[:n] + "…" if n < len(raw) else raw
-        text = "\n".join(list(base) + list(lines) + [path, _raw_line(cut)]
-                         + ([tail] if tail else []))
-        return parsed_len(text) <= limit
+    raw = str(e.get("raw") or "")
+    line = int(e.get("line") or 0)
+    if line > 0:
+        return (str(e.get("source") or ""), str(e.get("file") or ""), line, raw)
+    return (str(e.get("source") or ""), str(e.get("file") or ""), 0, raw)
 
-    if not fits(0):
-        return None
+
+def event_total(alert: dict, groups: Optional[list[dict]] = None) -> int:
+    """Tổng event THẬT SỰ server nhận được trong cửa sổ scan.
+
+    Thứ tự tin cậy (cao -> thấp):
+      1. `_event_total` do ingest/attach tính từ toàn bộ raw đã nhận (dedup);
+      2. `evidence[]` trong payload/DB: đếm theo danh tính, bỏ bản trùng;
+      3. `preview_meta` = "<hits>|<nhóm>" do monitor tính trên toàn file evidence;
+      4. `hits` counter của alert.
+    Không bao giờ in "0 events" khi alert có event: đó là lời nói dối về sự kiện
+    và từng làm người trực ca tưởng monitor không thấy gì.
+    """
+    if alert.get("_event_total") is not None:
+        try:
+            n = max(0, int(alert["_event_total"]))
+            # Mirror có thể BỊ CẮT (monitor cũ giới hạn evidence 500 dòng:
+            # alerts.evidence_truncated=1, đo thật có batch 88 707 hit / 500 dòng
+            # raw). Đếm trên mirror khi đó là báo thấp hơn sự thật, nên lấy con
+            # số lớn hơn giữa mirror và counter của monitor — không bao giờ nói
+            # ít event hơn những gì đã xảy ra.
+            hits = int(alert.get("hits") or alert.get("hit_count") or 0)
+            return max(n, hits)
+        except (TypeError, ValueError):
+            pass
+
+    ev = alert.get("evidence")
+    if isinstance(ev, list) and ev:
+        return len({_event_identity(e) for e in ev if isinstance(e, dict)})
+
+    groups = groups if groups is not None else _preview_groups(alert)
+    try:
+        meta = str(alert.get("preview_meta") or "")
+        if "|" in meta:
+            n = int(meta.split("|", 1)[0])
+            if n > 0:
+                return n
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        n = int(alert.get("hits") or alert.get("hit_count") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        n = len(groups)
+    return n
+
+
+def _path_of(g: dict) -> str:
+    """Khoá nhóm của một event: đường dẫn file, hoặc tên nguồn khi không có file.
+
+    Nhóm không có file (vd hit từ /proc — dữ liệu process, không thuộc file log
+    nào) thì khoá là tên source. Nó KHÔNG được in dưới nhãn "Path" (xem
+    _source_line): nhãn đó hứa một đường dẫn tuyệt đối.
+    """
+    return g["file"] or g["source"] or ""
+
+
+def group_by_path(groups: list[dict], max_paths: int = PREVIEW_PATHS,
+                  per_path: int = PREVIEW_EVENTS_PER_PATH,
+                  max_total: int = PREVIEW_EVENTS_TOTAL) -> list[dict]:
+    """Gom event theo path, chọn tối đa <max_paths> path tiêu biểu.
+
+    Tiêu biểu = có bằng chứng RCE trước, rồi tổng số lần khớp giảm dần, rồi lần
+    xuất hiện đầu. Trong mỗi path giữ tối đa <per_path> event cùng thứ tự đó.
+    Giữ nguyên thứ tự chọn để tin nhắn ổn định giữa các lần render cùng dữ liệu.
+    """
+    order: list[str] = []
+    buckets: dict[str, list[dict]] = {}
+    for g in groups:
+        path = _path_of(g)
+        if path not in buckets:
+            buckets[path] = []
+            order.append(path)
+        buckets[path].append(g)
+
+    ranked = sorted(
+        order,
+        key=lambda p: (
+            0 if any(g["rce"] for g in buckets[p]) else 1,
+            -sum(g["hits"] for g in buckets[p]),
+            order.index(p),
+        ),
+    )
+
+    out: list[dict] = []
+    used = 0
+    for path in ranked[:max_paths]:
+        evs = sorted(buckets[path], key=lambda g: (0 if g["rce"] else 1, -g["hits"]))
+        take = evs[:max(0, per_path)]
+        room = max_total - used
+        if room <= 0:
+            break
+        take = take[:room]
+        if not take:
+            continue
+        used += len(take)
+        out.append({
+            "path": path,
+            "source": next((g.get("source") for g in buckets[path] if g.get("source")), ""),
+            "events": take,
+            "hidden_events": len(evs) - len(take),
+            "hits": sum(g["hits"] for g in buckets[path]),
+        })
+    return out
+
+
+# Path phải là đường dẫn tuyệt đối của một FILE thật. Đây là validate ở tầng
+# hiển thị, không phải tầng phát hiện: monitor cũ từng gửi chuỗi mô tả
+# ("journalctl -k") vào field `file`, và người trực ca nhận alert không biết mở
+# file nào để tra. Không đạt -> KHÔNG in dòng "Path" giả, chỉ in nguồn thật.
+_ABS_PATH_RE = re.compile(r"^(/|container:[^:]+:|docker:[^:]+:)[^\s]")
+
+
+_DOCKER_ID_RE = re.compile(r"^docker:[^:]+:[0-9a-f]{12}:(/\S+)$")
+_CONTAINER_PATH_RE = re.compile(r"^container:[^:]+:(/\S+)$")
+
+
+def display_path(path: str) -> str:
+    """Chuẩn hoá giá trị `file` thành đường dẫn THẬT để in dưới nhãn "Path".
+
+    Gồm cả việc dịch các dạng cũ của monitor 1.4.2 (xem app/legacy.py):
+      docker:<tên>:<cid12>    -> /var/lib/docker/containers/<cid12>*/<cid12>*-json.log
+      container:<tên>:<cid12> -> cùng file json log (1.4.2 không ghi path trong)
+      journalctl -k           -> /var/log/journal/*/system.journal
+    Dạng mới đã có đường dẫn đầy đủ thì giữ nguyên.
+    """
+    return legacy.resolve_file(path)
+
+
+def is_valid_path(path: str) -> bool:
+    """`file` có dịch được thành đường dẫn tuyệt đối tới một file thật không?
+
+    Giá trị mô tả ("kernel", "docker", "syslog") KHÔNG hợp lệ: nhãn "Path" hứa
+    một đường dẫn, người trực ca sẽ đi tìm file không tồn tại. Dạng cũ của 1.4.2
+    thì được DỊCH (xem app/legacy.py) chứ không bị bỏ.
+    """
+    p = (path or "").strip()
+    if not p:
+        return False
+    if p.startswith("container:"):
+        # Dạng mới: container:<tên>:<path tuyệt đối bên trong container>.
+        if _CONTAINER_PATH_RE.match(p):
+            return True
+        # Dạng 1.4.2: container:<tên>:<cid12> — dịch sang json log của container.
+        return bool(legacy.cid12_of(p))
+    resolved = legacy.resolve_file(p)
+    if not resolved:
+        return False
+    return resolved.startswith("/") or bool(_CONTAINER_PATH_RE.match(resolved))
+
+
+def _path_line(path: str) -> str:
+    """Một dòng nhãn `Path: <code>/abs/path</code>` — không đánh số.
+
+    Operator bỏ số thứ tự: "Path 1/Path 2" không mang thông tin (thứ tự đã được
+    thể hiện bằng vị trí khối), còn số thứ tự làm người đọc tưởng đó là một
+    trường dữ liệu. Tên file mới là thứ cần đọc.
+    """
+    if not is_valid_path(path):
+        return ""
+    return f"<b>Path:</b> <code>{_esc(display_path(path))}</code>"
+
+
+def _source_line(source: str) -> str:
+    """Nhóm không có đường dẫn file: nêu NGUỒN, tách hẳn khỏi nhãn "Path".
+
+    Không được in "Path: kernel" hay "Path: journalctl -k": nhãn Path hứa một
+    đường dẫn tuyệt đối, và người trực ca sẽ đi tìm file không tồn tại. Nguồn là
+    khái niệm khác (procfs, journald, registry nội bộ) nên phải có nhãn khác.
+    """
+    src = (source or "").strip()
+    return f"<i>Nguồn: {_esc(src)}</i>" if src else ""
+
+
+def _event_line(g: dict) -> str:
+    """Một event trên một dòng; timeline in đậm; ×N khi nhóm đại diện nhiều lần."""
+    body = mark_timeline(g["raw"])
+    if g["hits"] > 1:
+        body += f" ×{g['hits']}"
+    return body
+
+
+def _tail(more_paths: int, more_events: int) -> str:
+    parts = []
+    if more_paths > 0:
+        parts.append(f"+{more_paths} path")
+    if more_events > 0:
+        parts.append(f"+{more_events} event")
+    return f"<i>… {' / '.join(parts)}</i>" if parts else ""
+
+
+def _fit_raw(raw: str, budget: int) -> str:
+    """Tiền tố dài nhất của raw (đã in đậm timeline) vừa <budget> ký tự hiển thị."""
+    if parsed_len(_event_line({"raw": raw, "hits": 1})) <= budget:
+        return mark_timeline(raw)
     lo, hi = 0, len(raw)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if fits(mid):
+        if parsed_len(mark_timeline(raw[:mid]) + "…") <= budget:
             lo = mid
         else:
             hi = mid - 1
-    return raw[:lo] + "…" if lo < len(raw) else raw
+    return mark_timeline(raw[:lo] + "…") if lo > 0 else ""
 
 
-def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
+def _container_list(alert: dict) -> list[str]:
+    """Tên container của alert, chịu được cả list lẫn chuỗi JSON, kèm cid12.
+
+    Hai việc, cả hai đều là lỗi thật đã thấy:
+
+    1. Cột `alerts.containers` là TEXT chứa JSON array, nên đường đọc lại từ DB
+       (gửi bù, resend) đưa vào một CHUỖI. Lặp qua chuỗi thì Python lặp từng KÝ
+       TỰ và tin in ra "[, ", d, r, i…" (alert 174).
+
+    2. Monitor 1.4.2 có lúc chỉ gửi tên trần ("drill-dwva"), không kèm cid12.
+       Operator cần cid12 để phân biệt hai container TRÙNG TÊN trên hai máy
+       khác nhau. cid12 lấy từ chính field `file` của các hit trong alert đó —
+       dữ liệu có thật, không suy đoán (xem app/legacy.py).
+    """
+    raw = alert.get("containers")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "[]")
+        except ValueError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    labels = [str(c).strip()[:64] for c in raw if str(c).strip()]
+
+    files = [str(g.get("file") or "") for g in (alert.get("preview") or [])
+             if isinstance(g, dict)]
+    files += [str(h.get("file") or "") for h in (alert.get("evidence") or [])
+              if isinstance(h, dict)]
+    return legacy.enrich_containers(labels, files)
+
+
+def format_alert(project_name: str, alert: dict, tz: ZoneInfo,
+                 max_paths: int = PREVIEW_PATHS,
+                 per_path: int = PREVIEW_EVENTS_PER_PATH,
+                 max_events: int = PREVIEW_EVENTS_TOTAL) -> str:
     """One batch alert -> ONE Telegram message, never split.
 
     🛡 CENTRAL SECURITY ALERT · 📅 thời điểm
-    ⚠️ Sự kiện (câu cố định)
+    ⚠️ Cảnh báo (câu cố định)
     📦 Dự án · 🖥 Môi trường/OS · 👤 User · 🏷 Hostname · 🌐 IP LAN · 🐳 Container
-    🧩 Event logs (N nhóm / M events) + raw line của từng nhóm
+    🧩 Event logs (x events) — x = số event THẬT server nhận (dedup, chống hit ảo)
+       Path 1: <file>  ->  blockquote các event đại diện, timeline in đậm
+       Path 2: ...
 
     Envelope là BẤT BIẾN: Môi trường/OS/User/Hostname/IP luôn hiện đủ để biết
-    server nào đang bị ảnh hưởng. Khi thiếu chỗ, CHỈ event logs co lại:
-      1. nhóm nào vừa nguyên văn thì nhận nguyên văn
-      2. nhóm kế tiếp bị cắt tiền tố + "…" để lấp hết chỗ còn lại
-      3. hết chỗ thì đóng bằng "… +N nhóm"
+    server nào đang bị ảnh hưởng. Khi thiếu chỗ, CHỈ khối Event logs co lại:
+      1. path/event nào vừa nguyên văn thì nhận nguyên văn
+      2. event kế tiếp bị cắt tiền tố + "…" để lấp hết chỗ còn lại
+      3. hết chỗ thì đóng bằng "… +N path / +M event"
     Không bao giờ sinh tin thứ hai, không bao giờ cắt mất dòng Môi trường/OS.
     """
     esc = _esc
     when = (_parse_ts(alert.get("ts_utc") or alert.get("ts") or alert.get("window_end"))
             or datetime.now(tz)).astimezone(tz)
 
-    total = int(alert.get("hits") or len(alert.get("preview") or [])
-                or len(alert.get("evidence") or []))
+    groups = _preview_groups(alert)
+    total = event_total(alert, groups)
 
     # "User" is the OS account the monitor runs as — the account that would own
     # any dropped shell. "Hostname" is what the machine calls itself. Both come
     # from the device envelope, so a renamed box or a service account is visible
     # straight from the alert.
-    user = str(alert.get("user") or "").strip()[:64] or "không rõ"
-    hostname = str(alert.get("hostname") or alert.get("host") or alert.get("device") or "?")[:64]
-    lan_ip = str(alert.get("lan_ip") or "").strip()[:64] or "không rõ"
-    env = str(alert.get("env") or "").strip()[:32] or "Không rõ"
-    os_name = str(alert.get("os") or "").strip()[:80] or "không rõ"
+    # Một quy ước duy nhất cho giá trị thiếu: "không rõ" ở MỌI dòng.
+    unknown = "không rõ"
+    user = str(alert.get("user") or "").strip()[:64] or unknown
+    hostname = (str(alert.get("hostname") or alert.get("host")
+                    or alert.get("device") or "").strip()[:64] or unknown)
+    lan_ip = str(alert.get("lan_ip") or "").strip()[:64] or unknown
+    env = str(alert.get("env") or "").strip()[:32] or unknown
+    os_name = str(alert.get("os") or "").strip()[:80] or unknown
 
     lines = [
         "🛡 <b>CENTRAL SECURITY ALERT</b>",
         f"📅 <i>{when:%d/%m/%Y} - {when:%H:%M}</i>",
         "",
-        f"⚠️ <b>Sự kiện:</b> {esc(_headline(alert))}",
+        f"⚠️ <b>{ALERT_LABEL}:</b> {esc(_headline(alert))}",
         "",
         f"📦 <b>Dự án:</b> <code>{esc(project_name[:64])}</code>",
         f"🖥 <b>Môi trường / OS:</b> <b>[{esc(env)}]</b> <code>{esc(os_name)}</code>",
@@ -263,70 +542,74 @@ def format_alert(project_name: str, alert: dict, tz: ZoneInfo) -> str:
 
     # Container nguồn của alert (monitor aggregate từ field file của từng hit:
     # docker:<tên> / container:<tên>) — không có nghĩa alert từ chính host.
-    containers = [str(c).strip()[:64] for c in (alert.get("containers") or [])
-                  if str(c).strip()][:5]
+    containers = _container_list(alert)[:5]
     if containers:
         lines.append(f"🐳 <b>Container:</b> <code>{esc(', '.join(containers))}</code>")
 
     lines.append(f"🌐 <b>IP LAN:</b> <code>{esc(lan_ip)}</code>")
 
-    groups = _preview_groups(alert)
-    if not groups:
-        # Agent cũ chưa gửi preview: nêu tên rule để tin nhắn vẫn có thông tin.
-        rules = alert.get("rules")
-        if isinstance(rules, str):
-            try:
-                rules = json.loads(rules or "[]")
-            except ValueError:
-                rules = []
-        if not isinstance(rules, list):
-            rules = []
-        names = ", ".join(str(r.get("rule_id")) for r in rules if isinstance(r, dict))
-        lines += ["", "🧩 <b>Event logs (0 nhóm / 0 events)</b>",
-                  f"<i>agent cũ chưa gửi raw event{': ' + esc(names) if names else ''}</i>"]
+    header = f"🧩 <b>Event logs ({total} event{'' if total == 1 else 's'})</b>"
+    blocks = group_by_path(groups, max_paths, per_path, max_events)
+
+    if not blocks:
+        # Không có preview[]: hoặc agent cũ (<= 1.4.2) hoặc ALERT_PREVIEW_MAX=0.
+        # Chỉ nêu đúng con số đã biết chắc — tổng event của batch. Không bịa
+        # "1 nhóm", không liệt kê mã rule (chi tiết ở GET /alerts/{id}).
+        lines += ["", header]
         return "\n".join(lines)
 
-    # tổng số nhóm thật (preview_meta = "<hits>|<unique>" do monitor tính)
-    uniq = len(groups)
-    try:
-        meta = str(alert.get("preview_meta") or "")
-        if "|" in meta:
-            uniq = max(uniq, int(meta.split("|", 1)[1]))
-    except (TypeError, ValueError):
-        pass
+    # Tổng số path/event THẬT để phần đuôi "… +N" nói đúng phần bị ẩn.
+    all_paths = len({_path_of(g) for g in groups})
+    hidden_paths = max(0, all_paths - len(blocks))
+    shown_events = sum(len(b["events"]) for b in blocks)
+    # Số event bị ẩn phải tính trên TỔNG event thật của batch, không phải trên số
+    # nhóm preview: một batch 88 707 event chỉ mang 8 nhóm preview, nên
+    # len(groups)-shown sẽ nói "+2 event" trong khi thực tế còn 88 200. Người
+    # trực ca đọc con số đó sẽ đánh giá sai quy mô.
+    hidden_events = max(0, max(total, len(groups)) - shown_events)
 
-    base = lines + ["", f"🧩 <b>Event logs ({uniq} nhóm / {total} events)</b>"]
+    def render(block_list: list[dict], tail: str) -> str:
+        out = list(lines) + ["", header]
+        for b in block_list:
+            label = _path_line(b["path"]) or ""
+            if not label:
+                label = _source_line(b.get("source") or "")
+            if label:
+                out.append(label)
+            out.append("<blockquote>" + "\n".join(
+                _event_line(g) for g in b["events"]) + "</blockquote>")
+        if tail:
+            out.append(tail)
+        return "\n".join(out)
 
-    body: list[str] = []
-    shown = 0
-    for idx, g in enumerate(groups, 1):
-        tail = _tail(uniq - idx)
-        path = _path_line(idx, g)
-        block = [path, _raw_line(g["raw"])]
+    text = render(blocks, _tail(hidden_paths, hidden_events))
+    if parsed_len(text) <= TG_LIMIT:
+        return text
 
-        if parsed_len("\n".join(base + body + block + ([tail] if tail else []))) <= TG_LIMIT:
-            body += block
-            shown = idx
-            continue
-
-        # Không vừa nguyên văn: lấp phần còn lại bằng tiền tố + "…".
-        cut = _fit_prefix(base, body, path, tail, g["raw"], TG_LIMIT)
-        if cut is not None and len(cut) > MIN_RAW_CHARS:
-            body += [path, _raw_line(cut)]
-            shown = idx
-        break
-
-    if shown == 0:
-        # Cứu hộ: ngay nhóm đầu cũng không vừa (raw khổng lồ) — vẫn phải 1 tin.
-        g = groups[0]
-        path = _path_line(1, g)
-        tail = _tail(uniq - 1)
-        cut = _fit_prefix(base, [], path, tail, g["raw"], TG_LIMIT) or "…"
-        body = [path, _raw_line(cut)]
-        shown = 1
-
-    tail = _tail(uniq - shown)
-    return "\n".join(base + body + ([tail] if tail else []))
+    # Quá 4096: bỏ dần event cuối cho tới khi vừa; event bị bỏ được tính vào đuôi.
+    work = [{"path": b["path"], "events": list(b["events"])} for b in blocks]
+    dropped = hidden_events
+    while True:
+        tail = _tail(hidden_paths, dropped)
+        text = render(work, tail)
+        if parsed_len(text) <= TG_LIMIT:
+            return text
+        # bỏ event cuối cùng còn lại
+        while work and not work[-1]["events"]:
+            work.pop()
+            hidden_paths += 1
+        if not work:
+            # Ngay khối đầu cũng không vừa: cắt tiền tố của raw duy nhất.
+            first = blocks[0]
+            label = _path_line(first["path"]) or _source_line(first.get("source") or "")
+            budget = TG_LIMIT - parsed_len("\n".join(
+                lines + ["", header, label, "<blockquote></blockquote>"])) - 8
+            cut = _fit_raw(first["events"][0]["raw"], max(0, budget))
+            body = [f"<blockquote>{cut}</blockquote>"] if cut else []
+            head2 = [h for h in (label,) if h]
+            return "\n".join(lines + ["", header] + head2 + body)
+        work[-1]["events"].pop()
+        dropped += 1
 
 
 class TelegramClient:

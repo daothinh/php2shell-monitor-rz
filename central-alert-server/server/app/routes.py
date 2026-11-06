@@ -1,6 +1,8 @@
 """API endpoints: pairing, ingest, ops (alerts/devices/stats/search), admin, health."""
+import asyncio
 import html
 import gzip
+import json
 import logging
 import re
 import secrets
@@ -11,7 +13,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from . import db, evidence
+from . import db, dedup, evidence, preview, telegram
 from .config import Config
 from .security import RateLimiter, gen_api_key, gen_pairing_code, sha256_hex
 from .telegram import TelegramClient, format_alert
@@ -31,6 +33,7 @@ class RegisterChatIdBody(BaseModel):
     project_name: str = Field(min_length=1, max_length=64)
     chat_id: str = Field(min_length=1, max_length=20)
     device: Optional[str] = Field(default=None, max_length=64)  # nhãn key (hostname)
+    monitor_version: Optional[str] = Field(default=None, max_length=32)
 
 
 class AdminLinkBody(BaseModel):
@@ -117,8 +120,10 @@ async def register_chatid(body: RegisterChatIdBody, request: Request):
     ok, retry = _limiter.allow(f"reg:{ip}", cfg.register_rate_per_hour, 3600)
     if not ok:
         raise HTTPException(429, f"Quá nhiều lượt đăng ký từ IP này; thử lại sau {retry}s")
+    # device_label để phân biệt "cùng máy đổi chat" với "hai khách trùng tên"
     project_id = db.create_project(cfg.database_path, body.project_name,
-                                   telegram_chat_id=chat_id)
+                                   telegram_chat_id=chat_id,
+                                   device_label=(body.device or ""))
     pair_ref = db.issue_pairing_code(cfg.database_path, project_id, cfg.pairing_ttl_sec,
                                      gen_pairing_code)
     label = (body.device or "").strip()[:64]
@@ -126,18 +131,39 @@ async def register_chatid(body: RegisterChatIdBody, request: Request):
     log.info("chat-id auto-pairing: project=%s chat=%s newly_linked=%s",
              project_id, chat_id, res["newly_linked"])
 
-    # Chỉ dự án MỚI được thông báo vào chat (1 tin/khách); thêm máy im lặng.
+    # Tin GHÉP NỐI THÀNH CÔNG — gửi ở MỌI lần cài, không chỉ dự án mới.
+    #
+    # Đây là minh chứng Telegram hoạt động, thay cho alert TEST-001 đã bỏ:
+    #   - alert TEST-001 đi qua đúng khung "CENTRAL SECURITY ALERT" nên người
+    #     trực ca không phân biệt được với sự cố thật, và bấm lại là thêm tin;
+    #   - tin ghép nối nói đúng bản chất: "máy này vừa được cài và đã nối được",
+    #     không có khung cảnh báo an ninh, không nằm trong bảng alerts.
+    #
+    # Vì sao KHÔNG chỉ gửi khi newly_linked: phần lớn khách đã triển khai từ
+    # trước, nên lần cài trên máy mới (hoặc cài lại) là re-pair — im lặng thì
+    # operator không có cách nào biết tuyến agent→server→Telegram đã thông.
+    # "Đã cài xong mà chat không có tin" chính là tín hiệu hỏng cần thấy.
     warning = ""
     tg = request.app.state.telegram
-    if res["newly_linked"] and tg is not None and hasattr(tg, "send_message"):
-        sent, err = await tg.send_message(
-            chat_id,
-            "✅ <b>Đã tự động ghép nối</b>\n"
-            f"📦 Dự án <b>{html.escape(body.project_name)}</b> vừa ghép với chat này"
-            " — mọi cảnh báo của dự án sẽ về đây (không cần làm gì thêm).\n"
-            "🚫 Không phải do bạn? Nhắn <code>/unlink "
-            f"{html.escape(body.project_name)}</code> để ngắt ngay.",
-        )
+    dev_label = (body.device or "").strip()
+    if tg is not None and hasattr(tg, "send_message"):
+        # Tin ngắn, đúng 4 dòng thông tin — không lời dẫn, không hướng dẫn.
+        # Bản monitor hiển thị ngay trong tin: khi khách có nhiều máy, đây là
+        # cách duy nhất biết máy nào đang chạy bản nào mà không phải SSH vào.
+        # Cài mới và cài đè bản update đều đi qua đúng endpoint này nên cả hai
+        # trường hợp đều thấy version hiện tại.
+        ver = (body.monitor_version or "").strip()[:32] or "không rõ"
+        # Khung cố định 3 dòng thông tin: dự án · thiết bị · version. Thiếu giá
+        # trị thì ghi "không rõ" chứ không bỏ dòng — tin giữ đúng một hình dạng
+        # để người đọc quét mắt theo cùng một vị trí mỗi lần.
+        lines = [
+            "✅ <b>GHÉP NỐI THÀNH CÔNG</b>",
+            "",
+            f"📦 <b>Dự án:</b> <code>{html.escape(body.project_name)}</code>",
+            f"🏷 <b>Thiết bị:</b> <code>{html.escape(dev_label or 'không rõ')}</code>",
+            f"🛠 <b>php2Shell-monitor:</b> <code>{html.escape(ver)}</code>",
+        ]
+        sent, err = await tg.send_message(chat_id, "\n".join(lines))
         if not sent:
             warning = (f"bot chưa nhắn được vào chat {chat_id} (chưa START): {err} —"
                        " dự án VẪN đã ghép và key đã cấp; hãy mở bot (hoặc thêm bot"
@@ -243,8 +269,23 @@ async def ingest_evidence(
     lines = data.count(b"\n")
     log.info("evidence %s/%s: %d dòng, %d bytes (gz %d)",
              project["project_name"], batch, lines, len(data), len(raw))
+
+    # Raw vừa lên -> gửi bù ngay các alert của dự án đang chờ vì thiếu bằng chứng.
+    # Đây là mắt xích giữ bất biến "alert phải có raw": alert tới trước evidence
+    # không bị mất, chỉ bị hoãn tới đúng lúc có raw.
+    flushed = 0
+    try:
+        flushed = await preview.flush_awaiting(cfg, cfg.database_path,
+                                               request.app.state.telegram,
+                                               _tz(request))
+    except Exception:  # noqa: BLE001 — không được làm hỏng việc nhận evidence
+        log.exception("gửi bù alert sau khi nhận evidence lỗi")
+    if flushed:
+        log.info("gửi bù %d alert đang chờ raw (sau evidence %s/%s)",
+                 flushed, project["project_name"], batch)
+
     return {"ok": True, "batch_id": batch, "events": lines,
-            "bytes": len(data), "file": str(path)}
+            "bytes": len(data), "file": str(path), "flushed_alerts": flushed}
 
 
 # ------------------------------------------------------------- ingest
@@ -256,6 +297,7 @@ class IngestBody(BaseModel):
     user: Optional[str] = Field(default=None, max_length=64)
     os: Optional[str] = Field(default=None, max_length=80)     # PRETTY_NAME, vd Ubuntu 24.04.1 LTS
     env: Optional[str] = Field(default=None, max_length=32)    # Docker Container / Container / Host
+    monitor_version: Optional[str] = Field(default=None, max_length=32)
     alerts: list[dict[str, Any]] = Field(min_length=1)
 
 
@@ -271,6 +313,34 @@ def _auth_project(request: Request, api_key: str) -> Any:
     if project is None:
         raise _key_rejection(cfg, api_key)
     return project
+
+
+# Thiết bị nào liên tiếp không có evidence mirror (monitor quá cũ, hoặc agent
+# không upload) thì thôi chờ: mỗi alert 2s × 50 alert/request sẽ làm nghẽn ingest.
+_NO_EVIDENCE_STREAK: dict[str, int] = {}
+_NO_EVIDENCE_GIVE_UP = 3
+
+
+async def _attach_preview_from_evidence(cfg: Config, project_name: str,
+                                        alert: dict, device_name: str) -> bool:
+    """Dựng preview[] từ evidence mirror của đúng batch, chờ file lên tới server.
+
+    Trả True khi gắn được. Idempotent và rẻ: file có ngay (đa số trường hợp, vì
+    agent upload evidence ngay sau alert) thì không sleep lần nào.
+    """
+    key = f"{project_name}/{device_name}"
+    wait = float(getattr(cfg, "preview_wait_sec", 0) or 0)
+    if _NO_EVIDENCE_STREAK.get(key, 0) >= _NO_EVIDENCE_GIVE_UP:
+        wait = 0.0
+    deadline = asyncio.get_event_loop().time() + max(wait, 0.0)
+    while True:
+        if preview.attach(cfg, project_name, alert):
+            _NO_EVIDENCE_STREAK.pop(key, None)
+            return True
+        if asyncio.get_event_loop().time() >= deadline:
+            _NO_EVIDENCE_STREAK[key] = _NO_EVIDENCE_STREAK.get(key, 0) + 1
+            return False
+        await asyncio.sleep(0.2)
 
 
 @router.post("/ingest-log")
@@ -295,7 +365,7 @@ async def ingest_log(
 
     tz = _tz(request)
     tg: TelegramClient = request.app.state.telegram
-    stored = duplicated = 0
+    stored = duplicated = deferred = 0
     messages = delivered = 0
     last_err = ""
     results: list[dict[str, Any]] = []
@@ -309,37 +379,152 @@ async def ingest_log(
         # 1. mirror the raw hits to disk first: never lose evidence to a DB error
         ev_file = evidence.write_evidence(cfg, project["project_name"], alert)
 
-        # 2. notify: exactly one compact message per alert
-        text = format_alert(project["project_name"], alert, tz)
-        sent, err = await tg.send_message(chat_id, text)
-        if sent:
-            delivered += 1
+        # 1b. Alert KHÔNG mang preview[] (monitor <= 1.4.2, hoặc
+        # ALERT_PREVIEW_MAX=0): dựng lại từ evidence mirror. Agent upload evidence
+        # ngay sau alert nên chờ tối đa preview_wait_sec để file kịp lên — nếu
+        # không, mọi alert từ máy chưa nâng cấp vẫn hiện "Event logs 0 nhóm".
+        from_evidence = False
+        if not alert.get("preview"):
+            from_evidence = await _attach_preview_from_evidence(
+                cfg, project["project_name"], alert, device_name)
+            # preview[] là raw line thật -> lưu luôn thành hit để /alerts/{id} và
+            # /search thấy được (normalize() đã chạy trước khi preview có mặt).
+            if from_evidence and not alert.get("evidence"):
+                alert["evidence"] = evidence.hits_from_preview(alert)
+            # Đường dẫn evidence thật trên server: alert tới trước file nên
+            # write_evidence() ở trên không ghi được gì — thiếu dòng này thì DB
+            # trỏ vào chuỗi rỗng và không ai biết raw của batch nằm ở đâu.
+            if from_evidence and not ev_file:
+                ev_file = str(alert.get("_evidence_mirror") or "")
+            # Không có file mirror (agent chưa upload) nhưng đã dựng được raw từ
+            # payload: ghi ra mirror để lần tra cứu sau có nguồn, và để
+            # evidence_file không rỗng.
+            if not ev_file:
+                ev_file = evidence.write_evidence(cfg, project["project_name"], alert)
+            if not from_evidence:
+                log.warning("alert không có raw event (thiếu preview[] và chưa có"
+                            " evidence mirror) project=%s device=%s batch=%s hits=%s"
+                            " — nâng cấp monitor lên >= 1.4.4",
+                            project["id"], device_name, alert.get("batch_id"),
+                            alert.get("hits"))
+
+        # 1b-bis. Con số hiển thị trên Telegram: số event THẬT server nhận được,
+        # không phải tổng bộ đếm rule của monitor. Monitor đếm hits theo rule nên
+        # một dòng log khớp 2 rule bị tính 2, và agent gửi lại payload sau khi mất
+        # mạng làm số đó phồng thêm — người trực ca đọc một con số không có thật.
+        # Ưu tiên đếm trên file evidence mirror (đủ mọi raw của batch); chưa có
+        # file thì đếm trên evidence[] đã dedup; không có gì thì để trống và
+        # format_alert rơi về preview_meta/hits.
+        if alert.get("_event_total") is None:
+            ev_path = ev_file or str(alert.get("_evidence_mirror") or "")
+            counted = preview.count_events(ev_path) if ev_path else 0
+            if counted:
+                alert["_event_total"] = counted
+
+        # 1c. CHỐNG TRÙNG TRƯỚC KHI GỬI.
+        # Agent gửi lại cùng payload khi mất mạng (spool retry) là chuyện bình
+        # thường. Nếu chỉ dựa vào INSERT OR IGNORE ở bước 3 thì alert đã tồn tại
+        # vẫn bị gửi Telegram lần nữa -> sysadmin nhận 2-3 tin cho cùng một sự
+        # kiện. Hỏi DB trước: batch này đã lưu thì không gửi, không ghi lại.
+        prev_id = db.alert_id_for_device_batch(cfg.database_path, device_id,
+                                               str(alert.get("batch_id") or ""))
+        if prev_id is not None:
+            duplicated += 1
+            log.info("bỏ qua alert trùng (đã gửi trước đó): project=%s device=%s"
+                     " batch=%s alert_id=%s", project["id"], device_name,
+                     alert.get("batch_id"), prev_id)
+            results.append({"batch_id": alert.get("batch_id"),
+                            "status": "duplicate", "alert_id": prev_id})
+            continue
+
+        # 2. notify — CHỈ KHI CÓ RAW.
+        # Nghiệp vụ: alert Telegram bắt buộc kèm raw event. Một tin chỉ có
+        # "N events" mà không có dòng log nào là thông tin không hành động được:
+        # sysadmin không biết máy nào / file nào / request nào, và lần sau sẽ bỏ
+        # qua cảnh báo. Không có raw thì KHÔNG gửi; alert vẫn được lưu và sẽ gửi
+        # bù ngay khi evidence lên (xem /ingest-evidence).
+        sent = False
+        suppressed = False
+        sent_groups: list[dict] = []
+        if not telegram.has_raw(alert):
+            deferred += 1
+            log.warning("HOÃN gửi Telegram: alert chưa có raw event "
+                        "(project=%s device=%s batch=%s hits=%s) — sẽ gửi bù khi"
+                        " evidence lên tới server",
+                        project["id"], device_name, alert.get("batch_id"),
+                        alert.get("hits"))
         else:
-            last_err = err
-            log.warning("gửi telegram thất bại project=%s device=%s: %s",
-                        project["id"], device_name, err)
-        messages += 1
+            # 2b. CHẶN ALERT LẶP: event đã báo cho thiết bị này trong cửa sổ dedup
+            # thì không hiện lại. Monitor <= 1.4.2 không dedup ở nguồn nên một
+            # webshell nằm yên trên đĩa sinh tin giống hệt nhau mỗi 5 phút (đo
+            # trên lab: 48 tin cho đúng một shell) — người trực ca sẽ tắt kênh.
+            all_groups = list(alert.get("preview") or [])
+            dropped = dedup.apply(cfg, cfg.database_path, device_id, alert)
+            if dropped and not (alert.get("preview") or []):
+                # Toàn bộ event của batch đã báo trước: không có gì mới để nói.
+                # Alert vẫn được lưu để tra cứu, nhưng KHÔNG gửi tin rỗng và
+                # KHÔNG vào hàng đợi gửi bù (nếu vào, cleanup sẽ gửi lại đúng
+                # cái vừa bị chặn).
+                suppressed = True
+                log.info("bỏ gửi: toàn bộ %d nhóm event đã báo trước"
+                         " (device=%s batch=%s)", dropped, device_id,
+                         alert.get("batch_id"))
+            else:
+                if dropped:
+                    log.info("gửi %d nhóm mới, bỏ %d nhóm đã báo trước"
+                             " (device=%s batch=%s)",
+                             len(alert.get("preview") or []), dropped,
+                             device_id, alert.get("batch_id"))
+                text = format_alert(project["project_name"], alert, tz)
+                sent, err = await tg.send_message(chat_id, text)
+                if sent:
+                    delivered += 1
+                    messages += 1
+                    sent_groups = list(alert.get("preview") or [])
+                else:
+                    # Telegram lỗi (mất mạng, token sai, 429 kéo dài): alert
+                    # KHÔNG được coi là đã gửi. Trước đây messages=1 ở đây nên
+                    # alert rơi khỏi hàng đợi và mất vĩnh viễn — sự kiện RCE xảy
+                    # ra mà không ai nhận được tin, không có cách nào gửi lại.
+                    deferred += 1
+                    last_err = err
+                    log.warning("gửi telegram thất bại, xếp hàng gửi bù:"
+                                " project=%s device=%s batch=%s: %s",
+                                project["id"], device_name,
+                                alert.get("batch_id"), err)
 
         # 3. persist (idempotent on (device, batch_id): agent retries are safe)
+        # messages = 1 chỉ khi THẬT SỰ đã gửi. Hoãn vì thiếu raw thì messages=0
+        # để hàng đợi gửi bù (/ingest-evidence, cleanup loop) nhặt lại.
         alert_id = db.store_alert(cfg.database_path, project["id"], device_id, alert,
-                                  ev_file, sent, 1)
+                                  ev_file, sent, 1 if sent else 0)
         if alert_id is None:
             duplicated += 1
             results.append({"batch_id": alert.get("batch_id"), "status": "duplicate"})
         else:
             stored += 1
+            if suppressed:
+                # messages=2 = cố ý không gửi. Khác hẳn messages=0 (đang chờ gửi
+                # bù): nếu để 0, cleanup loop sẽ gửi lại đúng tin vừa bị chặn.
+                db.mark_alert_suppressed(cfg.database_path, alert_id)
+            if sent_groups:
+                # Chỉ ghi nhận event ĐÃ THẬT SỰ tới chat: ghi trước thì một lần
+                # gửi lỗi sẽ vĩnh viễn chặn event đó ở các batch sau.
+                dedup.remember(cfg.database_path, device_id, alert_id, sent_groups)
             results.append({
                 "batch_id": alert.get("batch_id"),
-                "status": "stored",
+                "status": "suppressed" if suppressed else "stored",
                 "alert_id": alert_id,
                 "severity": alert["severity"],
                 "hits": alert["hits"],
+                "duplicate_events": int(alert.get("_duplicate_events") or 0),
                 "evidence_file": ev_file,
             })
 
     out: dict[str, Any] = {
         "accepted": stored,
         "duplicates": duplicated,
+        "deferred": deferred,
         "messages": messages,
         "delivered": delivered,
         "alerts": results,
@@ -423,6 +608,108 @@ def admin_link(body: AdminLinkBody, request: Request, x_admin_token: str = Heade
     log.info("admin link: project=%s chat=%s", res["project_id"], body.chat_id)
     return {"status": "linked", "project_id": res["project_id"],
             "project_name": res["project_name"]}
+
+
+@router.post("/alerts/{alert_id}/resend")
+async def resend_alert(alert_id: int, request: Request,
+                       x_admin_token: str = Header(default=""),
+                       x_read_token: str = Header(default="")):
+    """Gửi lại một alert đã lưu, dựng lại preview[] từ evidence mirror.
+
+    Dùng cho sự cố đã xảy ra: tin nhắn cũ đã tới chat với khối Event logs rỗng
+    (monitor <= 1.4.2), không sửa lại được. Endpoint đọc alert + file evidence
+    trên server rồi bắn một tin vào đúng chat của dự án.
+
+    Tin gửi lại giữ ĐÚNG khuôn alert thật: không nhãn, không chú thích, không
+    lộ chi tiết triển khai. Cái duy nhất phân biệt nó với tin đầu là thời điểm
+    Telegram gửi — giống hệt một alert bình thường khác giờ, đúng như người trực
+    ca cần. Việc "tin này là bản gửi lại" chỉ ghi ở log server, không lên chat.
+
+    Cần ALERT_ADMIN_TOKEN (hoặc read token): đây là thao tác ghi ra Telegram.
+    """
+    cfg = _cfg(request)
+    tok = x_admin_token or x_read_token
+    expected = cfg.admin_token or cfg.read_token
+    if not expected:
+        raise HTTPException(404, "không bật (thiếu ALERT_ADMIN_TOKEN)")
+    if not secrets.compare_digest(tok, expected):
+        raise HTTPException(403, "token sai")
+
+    detail = db.alert_detail(cfg.database_path, alert_id)
+    if detail is None:
+        raise HTTPException(404, "alert không tồn tại")
+    chat_id = db.chat_id_of_project(cfg.database_path, int(detail["project_id"]))
+    if not chat_id:
+        raise HTTPException(409, "dự án chưa có telegram_chat_id")
+
+    alert = dict(detail)
+    alert["rules"] = detail.get("rules") or []
+    # Envelope đã lưu cùng alert (bản vá sau sự cố): tin dựng lại phải nói đúng
+    # máy nào, không được hiện "Hostname: ?" / "IP LAN: không rõ".
+    for k in ("lan_ip", "hostname", "user", "os", "env"):
+        if detail.get(k):
+            alert[k] = detail[k]
+    # containers: cột JSON -> list, để tin gửi lại vẫn có dòng 🐳 Container
+    try:
+        _c = json.loads(detail.get("containers") or "[]")
+        alert["containers"] = [str(x) for x in _c] if isinstance(_c, list) else []
+    except (TypeError, ValueError):
+        alert["containers"] = []
+    alert["hits"] = detail.get("hit_count") or alert.get("hits")
+
+    # preview: ưu tiên file evidence trên mirror (đầy đủ nhất, mới nhất), không
+    # còn file thì dựng từ alert_hits đã lưu trong DB.
+    limit = int(cfg.preview_max or 8)
+    path = preview.find_evidence(cfg, detail["project_name"],
+                                 str(detail.get("batch_id") or ""),
+                                 str(detail.get("device_name") or ""))
+    if path is not None:
+        groups, total, _cut = preview.groups_from_jsonl(path, limit)
+        if groups:
+            alert["preview"] = groups
+            alert["preview_meta"] = f"{total}|{len(groups)}"
+            alert["_preview_source"] = "evidence"
+    if not alert.get("preview"):
+        groups, total = preview.groups_from_records(detail.get("evidence") or [], limit)
+        if groups:
+            alert["preview"] = groups
+            alert["preview_meta"] = f"{total}|{len(groups)}"
+            alert["_preview_source"] = "alert_hits"
+
+    # Cùng bất biến với đường ingest: không có raw thì không gửi. Ở đây trả lỗi
+    # rõ ràng thay vì hoãn, vì đây là thao tác thủ công — người gọi cần biết
+    # ngay là alert này không có bằng chứng để dựng lại.
+    if not telegram.has_raw(alert):
+        raise HTTPException(409, {
+            "code": "no_raw_evidence",
+            "message": "Alert không có raw event để dựng lại (evidence mirror đã"
+                       " bị xoá và alert_hits rỗng) — không gửi tin thiếu bằng chứng",
+        })
+
+    # Cùng bất biến số liệu như đường ingest: đếm event thật, dedup.
+    counted = preview.count_events(path) if path is not None else 0
+    if counted:
+        alert["_event_total"] = counted
+
+    # Resend là thao tác của operator nên KHÔNG chặn theo dedup (họ chủ động gửi
+    # lại để đối chiếu khung tin). Nhưng phải ghi nhận các event vừa gửi, nếu
+    # không lần resend sau lại thấy chúng là "mới" và dedup mất tác dụng.
+    _resend_groups = list(alert.get("preview") or [])
+
+    text = format_alert(detail["project_name"], alert, _tz(request))
+    tg: TelegramClient = request.app.state.telegram
+    sent, err = await tg.send_message(chat_id, text)
+    if not sent:
+        raise HTTPException(502, f"gửi Telegram lỗi: {err}")
+    if _resend_groups:
+        dedup.remember(cfg.database_path,
+                       int(detail.get("device_id") or 0), alert_id, _resend_groups)
+    log.info("resend alert_id=%s project=%s chat=%s (có preview=%s)",
+             alert_id, detail["project_name"], chat_id, bool(alert.get("preview")))
+    return {"ok": True, "alert_id": alert_id, "chat_id": chat_id,
+            "preview_groups": len(alert.get("preview") or []),
+            "preview_source": alert.get("_preview_source")
+                               or ("alert_hits" if alert.get("preview") else "none")}
 
 
 @router.get("/healthz")

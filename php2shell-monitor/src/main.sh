@@ -28,13 +28,13 @@ TRIỂN KHAI (một lệnh duy nhất):
   và thoát — không ghi đè conf, không cấp key mới. Ngoại lệ: nếu dự án đã
   bị /unlink trên bot (key bị thu hồi), đúng lệnh này TỰ ghép nối lại.
 
-  Muốn ĐỔI cấu hình: thêm --force (xoá ghép nối cũ, cấp API key mới).
+  CẬP NHẬT bản mới (bắt buộc --force): chạy lại installer với --force. Cài đè
+  mà không có --force thì installer giữ nguyên cấu hình cũ và KHÔNG gửi tin xác
+  nhận, nên không biết máy đã lên bản mới hay chưa.
     sudo php2shell-monitor.sh --force --project <tên> --chatid <id>
 
 Chế độ khác:
-  once       Chạy một batch ngay
   run        Bật supervisor nền
-  test       Gửi một alert thử
   status     Trạng thái thiết bị và batch gần nhất
   stop       Dừng supervisor
   discover   Rà host read-only
@@ -153,7 +153,6 @@ report_already_setup() {
  Thiết bị    :  ${ALREADY_DEV:-$(hostname 2>/dev/null || echo unknown)}
 
  Muốn xem trạng thái :  sudo php2shell-monitor.sh status
- Muốn gửi alert thử :  sudo php2shell-monitor.sh test
  Muốn dừng monitor   :  sudo php2shell-monitor.sh stop
 
  Muốn ĐỔI cấu hình (dự án / server / chat khác), thêm --force:
@@ -206,6 +205,18 @@ if [[ $mode != setup ]]; then
   p2s_device_init || die "không tạo được thư mục dữ liệu dưới $WORKDIR"
 fi
 
+# Nạp conf/default.conf cho các mode chạy trực tiếp từ main.sh (setup, retro,
+# run...). scan.sh và retro_hunt.sh tự source file này, nhưng setup thì không —
+# thiếu bước này thì mọi tham số vận hành đặt trong conf (P2S_RETRO_TIMEOUT,
+# RETRO_SINCE, PLUGINS_DISABLED...) bị bỏ qua âm thầm và
+# người vận hành tưởng đã cấu hình được. set -a để biến đi vào tiến trình con.
+if [[ -r $P2S_CONF_DIR/default.conf ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$P2S_CONF_DIR/default.conf"
+  set +a
+fi
+
 # jq là tuỳ chọn: rule pack đọc bằng lib/jsonl.awk nên thiếu jq vẫn phát hiện
 # bình thường. Ở đây chỉ cố cài thêm nếu host cho phép — không chặn lượt chạy.
 case $mode in
@@ -218,9 +229,81 @@ case $mode in
     bash "$WORKDIR/engine/central.sh" pair \
       --server "$opt_server" --chatid "$opt_chatid" || exit $?
 
-    # 1b) agent cũ (nếu có) còn giữ API key cũ trong bộ nhớ — kick để
-    # supervisor respawn nó với conf mới trong ≤AGENT_CHECK giây
+    # 1b) DỪNG supervisor + agent cũ TRƯỚC khi chạy tiếp.
+    #
+    # Đây là chỗ từng làm "đổi chat nhận alert" không có tác dụng. Đường dẫn
+    # dữ liệu phụ thuộc PROJECT:
+    #   projects/<PROJECT>/devices/<DEVICE>/run/supervisor.pid
+    # Khi --force đổi project (hoặc chỉ đổi chat mà tên dự án khác), kick-agent
+    # tìm pidfile ở thư mục của project MỚI — nó không thấy gì, nên supervisor
+    # và agent của project CŨ vẫn sống và tiếp tục gửi alert bằng API key cũ
+    # tới chat cũ. Người dùng đổi chat xong vẫn thấy alert về group.
+    #
+    # Dừng hẳn bằng pidfile cũ (đọc trước khi apply_project ghi conf mới) rồi
+    # mới khởi động lại ở bước 2.
+    _old_run=''
+    if [[ -r $WORKDIR/conf/device.conf ]]; then
+      _old_proj=$(sed -n 's/^PROJECT="\(.*\)"$/\1/p' "$WORKDIR/conf/device.conf" | head -1)
+      _old_dev=$(sed -n 's/^DEVICE="\(.*\)"$/\1/p' "$WORKDIR/conf/device.conf" | head -1)
+      if [[ -n $_old_proj && -n $_old_dev ]]; then
+        _old_run="$WORKDIR/projects/$_old_proj/devices/$_old_dev/run"
+      fi
+      unset _old_proj _old_dev
+    fi
+    if [[ -n $_old_run && -d $_old_run ]]; then
+      for _pf in "$_old_run/supervisor.pid" "$_old_run/agent/agent.pid"; do
+        [[ -r $_pf ]] || continue
+        _p=$(cat "$_pf" 2>/dev/null)
+        [[ $_p =~ ^[0-9]+$ ]] || continue
+        # chỉ kill tiến trình đúng là monitor của WORKDIR này (chống PID tái sử dụng)
+        _cmd=$(tr '\0' ' ' 2>/dev/null <"/proc/$_p/cmdline") || continue
+        [[ $_cmd == *"$WORKDIR"* ]] || continue
+        kill -TERM "$_p" 2>/dev/null || true
+        printf '  đã dừng tiến trình cũ (pid %s) của dự án trước\n' "$_p"
+      done
+      unset _pf _p _cmd
+      sleep 1
+    fi
+    unset _old_run
+    # agent cũ (nếu có) còn giữ API key cũ trong bộ nhớ — kick để supervisor
+    # respawn nó với conf mới trong ≤AGENT_CHECK giây (trường hợp cùng project)
     bash "$WORKDIR/engine/supervisor.sh" kick-agent >/dev/null 2>&1 || true
+
+    # 1c) QUÉT BÙ CHẠY NỀN: retro-hunt (log đã rotate/gzip) + lượt quét đầu tiên
+    # trên log hiện có.
+    #
+    # Vì sao KHÔNG chạy đồng bộ: cài đặt phải trả kết quả ngay — ghép nối
+    # server, cấp API key, gửi tin Telegram. Quét log cũ trên máy thật có thể
+    # mất vài phút (hàng trăm MB, kể cả .gz), nên bắt operator ngồi chờ trước
+    # màn hình chỉ để đọc "chưa xong trong 90s" là vô nghĩa: người dùng không
+    # biết được gì thêm, và tệ hơn là tưởng tool chưa chạy.
+    #
+    # Nền nhưng KHÔNG thả rông: catchup.sh giữ scan.lock suốt cả hai lượt và
+    # truyền fd 9 xuống cho retro_hunt.sh/scan.sh. Supervisor bật ở bước 2 thấy
+    # lock bận nên bỏ batch đầu, tick kế tiếp chạy sau BATCH_INTERVAL — không
+    # có chuyện batch 5 phút chen vào giữa retro và sinh alert thứ hai cho cùng
+    # một khoảng thời gian.
+    #
+    # Cửa sổ retro mặc định = 00:00 UTC hôm nay (= 07:00 giờ VN). Muốn phủ trọn
+    # ngày theo giờ VN thì đặt 17:00Z hôm trước; muốn sâu nhiều ngày thì lùi xa:
+    #   RETRO_SINCE=2026-11-02T17:00:00Z sudo php2shell-monitor.sh --project ...
+    mkdir -p -- "$P2S_DEVICE_RUN_DIR"
+    rm -f -- "$P2S_DEVICE_RUN_DIR/catchup.status"
+    if [[ -n ${RETRO_SINCE:-} ]]; then
+      export RETRO_SINCE
+    else
+      unset RETRO_SINCE
+    fi
+    # fd 9 giữ lock NGAY TẠI ĐÂY, trước khi supervisor tồn tại, để không có
+    # khoảng trống nào cho batch chen vào. Lock đi theo fd sang tiến trình con
+    # (fork xảy ra trước khi installer đóng fd của mình), nên catchup.sh thừa
+    # hưởng đúng ổ khoá đó và giữ nó suốt vòng đời — catchup tự kiểm bằng
+    # `flock -n 9` chứ không tin một biến môi trường.
+    exec 9>"$P2S_DEVICE_RUN_DIR/scan.lock"
+    flock -w 5 9 || true
+    setsid bash "$WORKDIR/engine/catchup.sh" \
+      >>"$P2S_DEVICE_RUN_DIR/catchup.log" 2>&1 </dev/null &
+    exec 9>&-
 
     # 2) start the supervisor; it spawns the forwarder itself. Output is shown
     #    only on failure — the pid line is not operator-facing.
@@ -229,7 +312,9 @@ case $mode in
       exit 1
     }
 
-    # 3) summary — operator-facing only, no server or chat details
+    # 3) summary — operator-facing only, no server or chat details.
+    #    Quét bù vẫn đang chạy nền; nói rõ điều đó thay vì để operator đoán,
+    #    nhưng không bắt chờ và không hứa một kết quả chưa có.
     cat <<EOF
 
 ✅ GHÉP NỐI THÀNH CÔNG
@@ -237,17 +322,36 @@ case $mode in
  Dự án     :  $PROJECT
  Thiết bị   :  $DEVICE
 
+ Quét log cũ: chạy nền, không cần chờ.
+
  Kiểm tra trạng thái:   sudo php2shell-monitor.sh status
 EOF
     ;;
   once)
+    # ĐÃ BỎ khỏi giao diện: supervisor chạy realtime (batch mỗi 5 phút, cộng
+    # lượt quét đầu ngay lúc cài) nên "once" không còn ý nghĩa nghiệp vụ.
+    # Giữ nhánh này để script cài đặt cũ của khách gọi vào không chết với
+    # "unknown mode" — hành vi y như trước.
     bash "$WORKDIR/engine/scan.sh"
     ;;
   run)
     bash "$WORKDIR/engine/supervisor.sh" start
     ;;
   test)
-    bash "$WORKDIR/engine/central.sh" test
+    # ĐÃ BỎ: alert TEST-001 đi qua đúng khung "CENTRAL SECURITY ALERT" nên
+    # người trực ca không phân biệt được với sự cố thật, và mỗi lần bấm lại
+    # sinh thêm một tin. Nghiệp vụ giờ là: ngay lúc cài, server gửi thông báo
+    # GHÉP NỐI THÀNH CÔNG vào chat — đó mới là minh chứng Telegram hoạt động.
+    # Giữ nhánh này để script cũ không chết; nó chỉ in hướng dẫn.
+    cat >&2 <<'EOF'
+Lệnh "test" đã bỏ.
+
+Minh chứng Telegram hoạt động là tin GHÉP NỐI THÀNH CÔNG mà server gửi vào
+chat ngay khi cài. Kiểm tra lại:
+  sudo php2shell-monitor.sh status
+  (hoặc xem tin nhắn trong chat Telegram của dự án)
+EOF
+    exit 2
     ;;
   status)
     bash "$WORKDIR/engine/status.sh"

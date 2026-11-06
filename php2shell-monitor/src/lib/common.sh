@@ -7,6 +7,20 @@ P2S_US=$'\x1f'
 export P2S_US
 
 P2S_PROG=${P2S_PROG:-php2shell-monitor}
+# Version của bản đang chạy. build.sh ghi file VERSION cạnh main.sh; nếu chạy
+# trực tiếp từ cây nguồn (không qua build) thì đọc ../VERSION. Fallback "dev"
+# chỉ dùng khi không xác định được — agent khai giá trị này lên server để tin
+# ghép nối nói đúng bản nào đang cài trên máy.
+if [[ -z ${P2S_VERSION:-} ]]; then
+  for _vf in "${WORKDIR:-/opt/php2shell-monitor}/VERSION" \
+             "$(dirname -- "${BASH_SOURCE[0]:-$0}")/../../VERSION"; do
+    if [[ -r $_vf ]]; then
+      P2S_VERSION=$(tr -d '[:space:]' <"$_vf")
+      break
+    fi
+  done
+  unset _vf
+fi
 P2S_VERSION=${P2S_VERSION:-dev}
 
 # Runtime layout. Code lives in WORKDIR; data lives in
@@ -118,4 +132,32 @@ env_label() {
   else
     printf 'Host'
   fi
+}
+
+# Source conf/default.conf nhưng KHÔNG đè biến đã có trong môi trường.
+# conf là giá trị mặc định của bản cài; env là ý định của người chạy lệnh ngay
+# lúc này (test, chẩn đoán, chạy one-off với log khác). Source thẳng sẽ khiến
+# `NGINX_ACCESS=/tmp/x.log bash retro_hunt.sh` bị conf ghi đè thành rỗng — người
+# chạy thấy "no hits" và tưởng tool hỏng, trong khi thực ra nó không hề đọc file
+# mình chỉ định.
+p2s_source_conf() { # [file]
+  local f=${1:-$WORKDIR/conf/default.conf}
+  [[ -r $f ]] || return 0
+  local _k _v _pre
+  while IFS='=' read -r _k _v; do
+    _k=${_k%%[[:space:]]*}
+    [[ -z $_k || $_k == \#* ]] && continue
+    [[ $_k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    # đã có trong môi trường thì giữ nguyên
+    if [[ -n ${!_k+x} ]]; then continue; fi
+    # bỏ nháy bao ngoài nếu có
+    _v=${_v%$'\r'}
+    case $_v in
+      \"*\") _v=${_v#\"}; _v=${_v%\"} ;;
+      \'*\') _v=${_v#\'}; _v=${_v%\'} ;;
+    esac
+    printf -v "$_k" '%s' "$_v"
+    export "${_k?}"
+  done <"$f"
+  return 0
 }

@@ -57,12 +57,14 @@ if [[ -d $DOCKER_LOG_DIR && -r $DOCKER_LOG_DIR ]]; then
     [[ $name == "$cid12" ]] && dlabel="docker:$name" || dlabel="docker:$name:$cid12"
 
     # batch_parse_awk: đọc phần byte mới, chạy awk MỘT lần, cập nhật offset.
-    # realfile override đường dẫn thật bằng "docker:<tên container>": alert phải
-    # chỉ được container nào, không phải chuỗi hash 64 ký tự. Offset vẫn khoá
-    # theo đường dẫn thật (bash giữ $jf), nên đổi tên container không làm mất
-    # tiến độ đọc.
+    #
+    # `realfile` phải là ĐƯỜNG DẪN TUYỆT ĐỐI = dlabel + ":" + $jf. Trước đây chỉ
+    # truyền "$dlabel" ("docker:<tên>") nên field `file` của record không phải
+    # đường dẫn: alert Telegram in nhãn "Path" kèm một cái tên, và người trực ca
+    # không mở được file nào. Offset vẫn khoá theo đường dẫn thật (bash giữ $jf),
+    # nên đổi tên container không làm mất tiến độ đọc.
     batch_parse_awk "$jf" access_log dockerlog.awk \
-      -v realfile="$dlabel" -v name="$name" \
+      -v realfile="$dlabel:$jf" -v name="$name" \
       -v accessre="$ACCESS_RE" -v markerre="$MARKER_RE"
   done
 fi
@@ -147,8 +149,12 @@ if (( ! found_json )); then
     done < <(docker logs --timestamps --since "$since" "$c" 2>&1)
 
     if [[ -s $raw ]]; then
+      # CLI fallback không có file: vẫn chỉ được đường dẫn json log THẬT của
+      # container (docker inspect .LogPath); không có thì để rỗng và nhãn Path
+      # sẽ tự bỏ, thay vì in một chuỗi mô tả.
+      _lp="/var/lib/docker/containers/$cid12/$cid12-json.log"
       awk -f "$DOCKERLOG_AWK" \
-          -v realfile="$dlabel" -v startline=0 -v name="$c" \
+          -v realfile="$dlabel:$_lp" -v startline=0 -v name="$c" \
           -v accessre="$ACCESS_RE" -v markerre="$MARKER_RE" \
           -v cli_ts=1 "$raw"
     fi

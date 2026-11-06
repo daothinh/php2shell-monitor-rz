@@ -21,7 +21,7 @@ source "$WORKDIR/lib/common.sh"
 source "$WORKDIR/lib/json.sh"
 source "$WORKDIR/lib/paths.sh"
 p2s_device_init || exit 0
-[[ -f $WORKDIR/conf/default.conf ]] && source "$WORKDIR/conf/default.conf"
+p2s_source_conf "$WORKDIR/conf/default.conf"
 
 MAX_EVIDENCE_INLINE=${MAX_EVIDENCE_INLINE:-0}
 # Số nhóm event nhét kèm alert để render Telegram. 0 = tắt.
@@ -103,25 +103,30 @@ _containers_json() {
   awk '
     {
       s = $0
+      # file = docker:<tên>:<cid12>:<đường dẫn>  |  container:<tên>:<đường dẫn>
       p = index(s, "\"file\":\"docker:")
-      if (p > 0) f = substr(s, p + 15)
-      else {
+      kind = "docker"; off = 15
+      if (p == 0) {
         p = index(s, "\"file\":\"container:")
-        if (p > 0) f = substr(s, p + 18)
-        else next
+        kind = "container"; off = 18
       }
+      if (p == 0) next
+      f = substr(s, p + off)
       q = index(f, "\""); if (q > 0) f = substr(f, 1, q - 1)
-      # bóc name rồi đoạn kế tiếp: 12 hex là cid12, còn lại (path...) bỏ qua
-      id = ""
+      # tách tên container (phần trước dấu ":" đầu tiên)
       c = index(f, ":")
-      if (c > 0) {
-        seg = substr(f, c + 1); f = substr(f, 1, c - 1)
-        c2 = index(seg, ":"); if (c2 > 0) seg = substr(seg, 1, c2 - 1)
-        if (length(seg) == 12 && seg ~ /^[0-9a-f]+$/) id = seg
-      }
-      disp = f
-      if (f != "" && !(f in seen)) { seen[f] = id; order[++n] = f }
-      else if (f in seen && seen[f] == "" && id != "") seen[f] = id
+      if (c == 0) next
+      name = substr(f, 1, c - 1)
+      rest = substr(f, c + 1)
+      id = ""
+      # Đoạn ngay sau tên có thể là cid12 (bản cũ) hoặc đường dẫn tuyệt đối (bản
+      # mới). Chỉ nhận khi đúng 12 hex — đường dẫn luôn bắt đầu bằng "/".
+      c2 = index(rest, ":")
+      seg = (c2 > 0) ? substr(rest, 1, c2 - 1) : rest
+      if (length(seg) == 12 && seg ~ /^[0-9a-f]+$/) id = seg
+      if (name == "") next
+      if (!(name in seen)) { seen[name] = id; order[++n] = name }
+      else if (seen[name] == "" && id != "") seen[name] = id
     }
     END {
       printf "["
@@ -167,6 +172,17 @@ if [[ ${ALERT_PREVIEW_MAX:-8} =~ ^[0-9]+$ ]] && (( ALERT_PREVIEW_MAX > 0 )); the
       -f "$WORKDIR/lib/preview.awk" "$EVIDENCE" | paste -sd, -)]"
     IFS=$'\t' read -r _pv_total _pv_uniq <"$meta_file" || true
     preview_meta="${_pv_total:-0}|${_pv_uniq:-0}"
+    # preview.awk hỏng/không có (bản cài thiếu file, awk lạ) thì đừng gửi alert
+    # KHÔNG có raw: server sẽ in "0 nhóm / 0 events" và operator mất dấu sự kiện.
+    # evidence JSONL đã đúng schema nhóm (rule_id/hits/severity/impact/file/
+    # line/raw) nên lấy thẳng N dòng đầu là một preview hợp lệ, chỉ là không gộp
+    # trùng và không ưu tiên nhóm rce.
+    if [[ $preview == '[]' ]]; then
+      preview="[$(head -n "$ALERT_PREVIEW_MAX" -- "$EVIDENCE" | paste -sd, -)]"
+      preview_meta="${total}|${total}"
+      printf '%s\tpreview.awk không sinh nhóm — dùng %s dòng evidence đầu\n' \
+        "$BATCH" "$ALERT_PREVIEW_MAX" >>"$P2S_DEVICE_RUN_DIR/batches.log"
+    fi
   fi
   rm -f -- "$meta_file"
 fi

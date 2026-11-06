@@ -29,6 +29,10 @@ trong `MANIFEST` bị xoá. Không tạo cron/systemd/file ngoài thư mục nà
    log gốc;
 4. lưu offset, ghi `run/batches.log`.
 
+**Alert là cảnh báo HÀNH VI, không phải báo cáo trạng thái.** Điều kiện đứng
+yên (webshell đã nằm trên đĩa, file đã bị sửa) không sinh thêm tin mỗi batch;
+khi điều kiện biến mất cũng không gửi tin "đã hết". Một sự cố = một tin.
+
 Không có batch nào bị bỏ: nếu một batch đang chạy, batch sau thấy lock và thoát
 (`scan already running; batch skipped`) — batch kế tiếp đọc bù phần log còn lại.
 
@@ -221,7 +225,15 @@ chỉ chạy khi capability tương ứng tồn tại.
 | `no-hits` liên tục nhưng log có tấn công | log không nằm ở đường dẫn mặc định | đặt `NGINX_ACCESS`/`FPM_LOG` trong `conf/default.conf`, chạy `-- once` |
 | Không thấy alert T2 | thiếu quyền đọc log FPM | chạy bằng root hoặc thêm user vào group đọc log |
 | Alert lặp cùng nội dung mỗi batch | offset không lưu được (workdir chỉ đọc) | kiểm tra quyền ghi `projects/<p>/devices/<d>/state` |
+| Tin Telegram hiện `Nguồn: kernel` thay vì `Path:` | máy không có file journal đọc được (`/var/log/journal/<id>/system.journal`) | `journalctl --file /var/log/journal/*/system.journal -k -n 1`; xem mục `health` của `status` |
+| `Path:` trỏ file không tồn tại | monitor cũ gửi chuỗi mô tả vào field `file` | nâng cấp monitor ≥ 1.4.13; server tự bỏ nhãn Path cho giá trị không phải đường dẫn |
+| Webshell có trên đĩa nhưng chỉ báo 1 lần rồi im | đúng thiết kế: không có hành vi mới thì không có tin mới | xem `state/webroot.shells.tsv` để biết shell nào đã báo |
 | `supervisor failed to start` | lock còn hoặc thiếu quyền | xem `run/supervisor.log` |
+| Một plugin `rc=124` mỗi batch | bị `PLUGIN_TIMEOUT` cắt: một nguồn chậm/không bao giờ EOF giữ cả plugin | `status` mục `health`; `plugins.err` có dòng `readcap: timeout` hoặc `-> /dev/stdout` |
+| `health` báo `da bao` cho `plugin/x` | monitor tự mù ≥ `P2S_HEALTH_STRIKES` batch — đã sinh alert P2S-090 | xử lý nguồn trong `plugins.err`, rồi `status` để xác nhận bộ đếm đã về 0 |
+| `access.log` container không được đọc | file là symlink `/dev/stdout` (nginx official/alpine) | đúng thiết kế: nội dung thật nằm ở `docker_logs` (`*-json.log`); `health` ghi nhận để không im lặng |
+| Log lớn (syslog 269 MB) không bao giờ quét xong | `P2S_READ_CAP_BYTES`/`P2S_READ_JUMP_BYTES` quá lớn so với đĩa | lần đầu vượt `P2S_READ_JUMP_BYTES` sẽ nhảy tới EOF-cap; giảm cap để batch ngắn hơn |
+| `readcap: ... bỏ qua phần đầu` | file lớn hơn `P2S_READ_JUMP_BYTES` và chưa có cursor | đúng thiết kế: lịch sử là việc của `retro` (`RETRO_SINCE`) |
 | Batch chạy quá lâu | log quá lớn / plugin treo | `PLUGIN_TIMEOUT`, `MAX_EVENTS_PER_BATCH` |
 
 ## 7. Bảo mật

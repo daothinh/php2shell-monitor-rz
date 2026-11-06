@@ -43,6 +43,25 @@ class Config:
     bot_attempts_window_sec: int = 600
     bot_mute_sec: int = 600
     display_tz: str = "Asia/Ho_Chi_Minh"
+    # Số nhóm event dựng lại từ evidence mirror khi alert KHÔNG mang preview[]
+    # (monitor <= 1.4.2). 0 = tắt. Phải khớp ALERT_PREVIEW_MAX của monitor để
+    # "… +N nhóm" trên tin nhắn không lệch giữa hai bản.
+    preview_max: int = 8
+    # Trần thời gian (giây) chờ file evidence của batch lên tới server trước khi
+    # render tin: agent upload evidence NGAY SAU alert, nên đọc sớm quá sẽ trượt.
+    preview_wait_sec: float = 2.0
+    # Cửa sổ gửi bù: alert chưa gửi được (thiếu raw / Telegram lỗi) chỉ được gửi
+    # bù trong khoảng này. Quá hạn thì giữ trong DB để tra cứu nhưng KHÔNG gửi —
+    # update server không được phát lại cảnh báo cũ vào chat của khách.
+    resend_window_sec: int = 3600
+    # Cửa sổ chặn event lặp: event đã gửi Telegram trong khoảng này thì không
+    # hiện lại. Lý do tồn tại: monitor <= 1.4.2 không dedup ở nguồn nên một
+    # webshell nằm yên trên đĩa sinh tin giống hệt nhau mỗi 5 phút (đo trên lab:
+    # 48 tin cho đúng một shell). 0 = tắt dedup.
+    dedup_window_sec: int = 604800        # 7 ngày
+    # Số event MỚI tối thiểu để còn gửi tin. Batch mà mọi event đều đã báo thì
+    # không có gì mới để nói — im lặng, không gửi "0 event".
+    dedup_min_events: int = 1
     extra_env: dict = field(default_factory=dict)
 
 
@@ -61,6 +80,11 @@ def load_config() -> Config:
         max_alerts_per_request=int(os.environ.get("ALERT_MAX_ALERTS_PER_REQUEST", "50")),
         ingest_rate_per_min=int(os.environ.get("ALERT_INGEST_RATE_PER_MIN", "120")),
         register_rate_per_hour=int(os.environ.get("ALERT_REGISTER_RATE_PER_HOUR", "30")),
+        preview_max=int(os.environ.get("ALERT_PREVIEW_MAX", "8")),
+        preview_wait_sec=float(os.environ.get("ALERT_PREVIEW_WAIT_SEC", "2")),
+        resend_window_sec=int(os.environ.get("ALERT_RESEND_WINDOW_SEC", "3600")),
+        dedup_window_sec=int(os.environ.get("ALERT_DEDUP_WINDOW_SEC", "604800")),
+        dedup_min_events=int(os.environ.get("ALERT_DEDUP_MIN_EVENTS", "1")),
     )
     if not cfg.bot_token:
         # Không có token: server vẫn chạy API, bot tắt (dev/kiểm thử nội bộ).

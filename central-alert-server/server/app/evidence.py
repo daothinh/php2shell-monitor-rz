@@ -54,6 +54,30 @@ def write_evidence(cfg: Config, project: str, alert: dict) -> str:
     return str(path)
 
 
+def hits_from_preview(a: dict) -> list[dict]:
+    """preview[] -> evidence[] (raw line thật, kèm số hit của nhóm).
+
+    preview[] LÀ raw line thật (file + line + raw) mà monitor gửi kèm alert —
+    dùng nó thay vì bịa, và đánh dấu evidence_truncated vì đó chỉ là ảnh chụp
+    (tối đa ALERT_PREVIEW_MAX nhóm), không phải toàn bộ batch.
+    """
+    prev = a.get("preview")
+    if not isinstance(prev, list):
+        return []
+    out = [{
+        "rule_id": g.get("rule_id"),
+        "severity": str(g.get("severity") or a.get("severity") or "INFO").upper(),
+        "source": g.get("source") or "",
+        "file": g.get("file") or "",
+        "line": g.get("line") or 0,
+        "raw": g.get("raw") or "",
+        "ts_utc": a.get("ts_utc") or a.get("ts") or "",
+    } for g in prev if isinstance(g, dict) and g.get("raw")]
+    if out:
+        a["evidence_truncated"] = True
+    return out
+
+
 def normalize(alert: dict, default_host: str = "", default_lan_ip: str = "",
               default_user: str = "", default_os: str = "",
               default_env: str = "") -> dict:
@@ -68,24 +92,24 @@ def normalize(alert: dict, default_host: str = "", default_lan_ip: str = "",
     if not a.get("batch_id"):
         a["batch_id"] = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     hits = a.get("evidence")
-    if not isinstance(hits, list) or not hits:
-        # legacy single-alert payload -> synthesize one hit from its own fields
-        raw = str(a.get("message") or a.get("notes") or "")
-        hits = [{
-            "rule_id": a.get("rule_id"),
-            "severity": a["severity"],
-            "source": a.get("source") or a.get("tier") or "",
-            "file": a.get("file") or "",
-            "line": a.get("line") or 0,
-            "ip": a.get("src_ip") or "",
-            "method": a.get("method") or "",
-            "uri": a.get("uri") or "",
-            "status": a.get("status") or "",
-            "ua": a.get("ua") or "",
-            "pid": a.get("pid") or "",
-            "raw": raw,
-            "ts_utc": a.get("ts_utc") or a.get("ts") or "",
-        }]
+    if not isinstance(hits, list):
+        hits = []
+    if not hits:
+        # evidence[] rỗng là BÌNH THƯỜNG với monitor hiện tại: MAX_EVIDENCE_INLINE=0
+        # nên raw line đi kênh riêng (/ingest-evidence), alert chỉ mang metadata.
+        # Trước đây chỗ này luôn bịa ra một "hit" từ các field top-level, nên mỗi
+        # batch 2465 hit lại lưu đúng 1 row alert_hits toàn NULL: /alerts/{id} và
+        # /search trả về một dòng rác, còn hit_count thật thì không có gì đối chiếu.
+        prev = a.get("preview")
+        if isinstance(prev, list) and prev:
+            hits = hits_from_preview(a)
+        # KHÔNG tổng hợp hit từ field top-level (rule_id/message/uri/file).
+        # Đó không phải raw event — nó là mô tả do client tự khai, và biến một
+        # payload không có bằng chứng thành "có raw" để lọt qua cổng gửi tin.
+        # Hệ quả thực tế: alert thử TEST-001 hiện lên chat với khung "CENTRAL
+        # SECURITY ALERT" + "Event logs (1 nhóm / 1 events)" y như sự cố thật.
+        # Không có raw thật thì để evidence[] rỗng: alert vào hàng đợi, chờ
+        # evidence mirror.
     a["evidence"] = hits
     a["hits"] = int(a.get("hits") or len(hits))
     if not a.get("rules"):
@@ -118,4 +142,5 @@ def device_of(alert: dict, body_host: str) -> str:
 
 __all__: list[Any] = [
     "device_label", "evidence_path", "write_evidence", "normalize", "device_of",
+    "hits_from_preview",
 ]

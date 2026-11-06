@@ -29,6 +29,11 @@ mkdir -p -- "$PAYLOAD"
 cp -a -- src/lib src/engine src/plugins src/rules src/discovery src/export "$PAYLOAD/"
 cp -a -- src/conf "$PAYLOAD/conf.default"
 cp -a -- src/main.sh src/bootstrap.sh "$PAYLOAD/"
+# Version phải đi cùng payload: common.sh đọc file này để agent khai đúng bản
+# đang chạy lên server (tin ghép nối hiển thị nó). Trước đây P2S_VERSION không
+# bao giờ được set nên mọi bản cài đều tự khai "dev" — không phân biệt được máy
+# nào đang chạy bản cũ khi cần đối chiếu.
+printf '%s\n' "$VERSION" >"$PAYLOAD/VERSION"
 # third-party notices
 mkdir -p -- "$PAYLOAD/third_party"
 [[ -d repos/php2shell-detection ]] && cp -a -- repos/php2shell-detection/LICENSE "$PAYLOAD/third_party/LICENSE.Lexsah" 2>/dev/null || true
